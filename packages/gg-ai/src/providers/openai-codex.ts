@@ -21,6 +21,7 @@ import {
 import { StreamResult } from "../utils/event-stream.js";
 import { providerDiag } from "../utils/diag.js";
 import { resolveToolSchema } from "../utils/zod-to-json-schema.js";
+import { makeStrictToolSchema, UnsupportedStrictSchemaError } from "../utils/strict-tool-schema.js";
 import { normalizePromptCacheKey } from "./prompt-cache-key.js";
 import {
   downgradeUnsupportedImages,
@@ -32,7 +33,11 @@ import { readSseStream } from "../utils/sse.js";
 import { extractRequestIdFromMessage } from "../utils/request-id.js";
 
 const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api";
-const CODEX_CLIENT_VERSION = "0.144.1";
+// Advertised Codex client version. The ChatGPT backend gates models on the
+// catalog's `minimal_client_version` (GPT-6 Sol/Luna need >= 0.155.0) and
+// rejects older clients with "requires a newer version of Codex". Track the
+// latest openai/codex `rust-v*` release when adding a model.
+const CODEX_CLIENT_VERSION = "0.155.1";
 // OpenAI's Codex CLI enables zstd request compression by default. Keep tiny
 // synthetic/API requests readable, but compress real agent payloads before they
 // hit the backend's finite Envoy retry buffer.
@@ -94,7 +99,7 @@ async function encodeCodexRequest(body: Record<string, unknown>): Promise<Encode
 }
 
 function usesResponsesLite(model: string): boolean {
-  return model.startsWith("gpt-5.6-");
+  return model.startsWith("gpt-5.6-") || model.startsWith("gpt-6-");
 }
 
 function outputTextKey(itemId: string | undefined, contentIndex: number | undefined): string {
@@ -125,7 +130,10 @@ export function streamOpenAICodex(options: StreamOptions): StreamResult {
   return new StreamResult(runStream(options), options.signal);
 }
 
-async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, StreamResponse> {
+async function* runStream(
+  options: StreamOptions,
+  retriedWithoutReasoning = false,
+): AsyncGenerator<StreamEvent, StreamResponse> {
   const baseUrl = (options.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
   const url = `${baseUrl}/codex/responses`;
 
@@ -163,11 +171,23 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
     body.temperature = options.temperature;
   }
   body.reasoning = {
+    // GPT-5.6/6 require at least low; older models still support thinking off.
+    // Apply the floor here for every caller, including one-off prompt rewrites.
     // `ultra` is a client orchestration preset, not a Codex API effort.
-    effort: options.thinking === "ultra" ? "max" : (options.thinking ?? "none"),
+    effort:
+      options.thinking === "ultra" ? "max" : (options.thinking ?? (responsesLite ? "low" : "none")),
     summary: "auto",
     ...(responsesLite ? { context: "all_turns" } : {}),
   };
+  // Catalog parity: every responses-lite model (gpt-6-astra/sol/luna and the
+  // older gpt-5.6-sol/terra/luna) declares `support_verbosity: true` with
+  // `default_verbosity: "low"` in openai/codex models.json, and the Codex CLI
+  // sends `text.verbosity` accordingly. Omitting it leaves the server default
+  // in place, which produces noticeably longer outputs — slower turns and
+  // heavier usage burn on exactly these deep-reasoning models.
+  if (responsesLite) {
+    body.text = { verbosity: "low" };
+  }
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -223,6 +243,36 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
       parsed.requestId ??
       readHeader(response.headers, "x-request-id", "openai-request-id", "x-oai-request-id");
 
+    // A rejected encrypted replay item poisons every ordinary retry. Retry once
+    // with visible conversation/tool history only, before any output is emitted.
+    // Never alter saved messages or bypass server verification of an opaque blob.
+    if (
+      !retriedWithoutReasoning &&
+      !options.signal?.aborted &&
+      response.status === 400 &&
+      (parsed.errorObj?.code === "invalid_encrypted_content" ||
+        /encrypted content.*could not be (?:verified|decrypted|parsed)/i.test(message)) &&
+      options.messages.some(
+        (msg) =>
+          msg.role === "assistant" &&
+          Array.isArray(msg.content) &&
+          msg.content.some((part) => part.type === "raw" && isEncryptedReasoning(part.data)),
+      )
+    ) {
+      providerDiag("codex_retry_without_encrypted_reasoning", { status: response.status });
+      const messages = options.messages.map((msg): Message =>
+        msg.role === "assistant" && Array.isArray(msg.content)
+          ? {
+              ...msg,
+              content: msg.content.filter(
+                (part) => !(part.type === "raw" && isEncryptedReasoning(part.data)),
+              ),
+            }
+          : msg,
+      );
+      return yield* runStream({ ...options, messages }, true);
+    }
+
     // ChatGPT-subscription usage-window exhaustion. The codex backend returns
     // HTTP 429 with a usage_limit_reached / usage_not_included / rate_limit_exceeded
     // code and a reset timestamp. Stop immediately with a clear message instead
@@ -231,18 +281,18 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
     if (usageLimit) throw usageLimit;
 
     let hint: string | undefined;
-    if (response.status === 400 && text.includes("not supported")) {
-      if (options.model === "gpt-5.5-pro") {
-        hint = "Use gpt-5.5 instead. OpenAI's Codex model catalog does not list gpt-5.5-pro.";
-      } else {
-        hint =
-          "This model is not available through Codex for the authenticated account. " +
-          "Switch to a model listed for OpenAI Codex via the model selector, or check your Codex usage limits.";
-      }
+    if (
+      response.status === 400 &&
+      message ===
+        `The '${options.model}' model is not supported when using Codex with a ChatGPT account.`
+    ) {
+      hint =
+        "This model is not available through your ChatGPT account. " +
+        "Switch to a model listed for OpenAI via the model selector, or check your ChatGPT usage limits.";
     } else if (response.status === 404 && text.includes("does not exist")) {
       hint =
-        "This model is not in the current OpenAI Codex catalog for this account. " +
-        "Switch to gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, or gpt-5.5 via the model selector.";
+        "This model is not in OpenAI's current catalog for your ChatGPT account. " +
+        "Switch to GPT-6 Astra, GPT-6 Sol, or GPT-6 Luna via the model selector.";
     }
 
     throw new ProviderError("openai", message, {
@@ -760,13 +810,23 @@ function toCodexInput(
 // ── Tool Conversion ────────────────────────────────────────
 
 function toCodexTools(tools: Tool[]): unknown[] {
-  return tools.map((tool) => ({
-    type: "function",
-    name: tool.name,
-    description: tool.description,
-    parameters: resolveToolSchema(tool),
-    strict: null,
-  }));
+  return tools.map((tool) => {
+    let parameters = resolveToolSchema(tool);
+    let strict: true | null = null;
+    try {
+      parameters = makeStrictToolSchema(parameters);
+      strict = true;
+    } catch (error) {
+      if (!(error instanceof UnsupportedStrictSchemaError)) throw error;
+    }
+    return {
+      type: "function",
+      name: tool.name,
+      description: tool.description,
+      parameters,
+      strict,
+    };
+  });
 }
 
 // HTTP error bodies may be JSON, useful plain text, or an HTML edge/proxy page.
@@ -838,8 +898,7 @@ function codexUsageLimitError(
 ): ProviderError | null {
   const code = String(errorObj?.code ?? errorObj?.type ?? "");
   const rateLimits = errorObj?.rate_limits as
-    | { primary?: { resets_at?: number }; secondary?: { resets_at?: number } }
-    | undefined;
+    { primary?: { resets_at?: number }; secondary?: { resets_at?: number } } | undefined;
   const resetsAtRaw =
     (typeof errorObj?.resets_at === "number" ? (errorObj.resets_at as number) : undefined) ??
     rateLimits?.primary?.resets_at ??

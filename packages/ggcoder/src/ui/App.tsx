@@ -195,15 +195,7 @@ export {
 } from "./item-helpers.js";
 
 /** Tools that get aggregated into a single compact group when possible. */
-const AGGREGATABLE_TOOLS = new Set([
-  "read",
-  "grep",
-  "find",
-  "ls",
-  "mcp__kencode-search__searchCode",
-  "mcp__kencode-search__referenceSources",
-  "mcp__kencode-search__discoverRepos",
-]);
+const AGGREGATABLE_TOOLS = new Set(["read", "grep", "find", "ls", "steroids"]);
 
 const RUNNING_INDICATOR_ANIMATION_MS = 1_200;
 
@@ -702,8 +694,8 @@ export function App(props: AppProps) {
 
   // Derive credentials for the current provider + model. Almost always keyed
   // by provider id, but a model can prefer one storage key and fall back to
-  // another (e.g. Xiaomi's mimo-v2.5-pro-ultraspeed is API-Credits-only,
-  // while mimo-v2.5-pro prefers the Token Plan but falls back to API Credits
+  // another (e.g. Xiaomi's mimo-v2.6-pro-ultraspeed is API-Credits-only,
+  // while mimo-v2.6-pro prefers the Token Plan but falls back to API Credits
   // when only that's configured) — see getAuthStorageKeys().
   const currentCreds = getAuthStorageKeys(currentProvider, currentModel)
     .map((key) => props.credentialsByProvider?.[key])
@@ -1820,6 +1812,7 @@ export function App(props: AppProps) {
         // Verification gate: code was edited but no test/typecheck/lint/build
         // completed since the last edit — demand it once, then let the run stop.
         if (verificationGateEnabledRef.current) {
+          const verificationReason = verificationGateRef.current.pendingReason();
           const verificationFollowUp = verificationGateRef.current.followUp();
           if (verificationFollowUp) {
             // Say why the run is continuing past its apparent end, or the extra
@@ -1828,7 +1821,12 @@ export function App(props: AppProps) {
               ...prev,
               {
                 kind: "ideal_hook",
-                text: VERIFICATION_HOOK_NOTICE_TEXT,
+                text:
+                  verificationReason === "tamper"
+                    ? "Hook engaged — reviewing changes to tests and checks."
+                    : verificationReason === "recheck"
+                      ? "Hook engaged — re-checking the changes made after verification."
+                      : VERIFICATION_HOOK_NOTICE_TEXT,
                 tone: "review",
                 id: getId(),
               },
@@ -2359,8 +2357,8 @@ export function App(props: AppProps) {
           // Reconnect MCP servers ONLY when the resolved server set actually
           // changes. GLM is the only provider with a different set (Z.AI
           // servers), so a switch that doesn't involve GLM on either side
-          // keeps the identical set — tearing down a live stdio child (e.g.
-          // kencode-search) and re-spawning `npx` there only risks a failed
+          // keeps the identical set — tearing down a live stdio child and
+          // re-spawning `npx` there only risks a failed
           // re-spawn that would silently drop the tools.
           const glmInvolved = newProvider === "glm" || prevProvider === "glm";
           if (props.mcpManager && glmInvolved) {

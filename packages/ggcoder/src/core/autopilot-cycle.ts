@@ -10,10 +10,9 @@
  *    reviews the PLAN itself — approve (auto-accept + implement, then the next
  *    round work-reviews the implementation), send revision feedback, or hand a
  *    genuine user-level decision to the human. Verdict mapping for plans:
- *    `all_clear` ⇒ approve, and `ignore` ALSO maps to approve — "nothing to
- *    object to" on a plan means it's sound (autopilot has no user blocker for
- *    plans by design). Unparseable output still stops as HUMAN upstream (the
- *    verdict parser returns HUMAN for garbage) — never a blind loop.
+ *    Only `all_clear` approves. `ignore` stops for a human instead of granting
+ *    implicit permission to implement. Unparseable output also stops as HUMAN
+ *    upstream (the verdict parser returns HUMAN for garbage).
  *  - WORK branch: the classic review of a finished turn (ALL_CLEAR / IGNORE /
  *    HUMAN / PROMPT), unchanged.
  *
@@ -21,7 +20,7 @@
  * plan) still halts as HUMAN — Ken must never prompt into a read-only
  * plan-mode session.
  */
-import type { AutopilotVerdict } from "./autopilot-verdict.js";
+import { CORPUS_UNVERIFIED_REASON, type AutopilotVerdict } from "./autopilot-verdict.js";
 
 /** Reason shown in the Ken bubble when the build session is still INSIDE plan
  *  mode (enter_plan without exit_plan) when the cycle checks in — there is no
@@ -75,7 +74,7 @@ export function buildPlanRevisionPrompt(feedback: string): string {
 
 /** SSE frame types the cycle can emit (matched by the webview). */
 export type AutopilotCycleEmit =
-  | { type: "autopilot_done"; data: Record<string, never> }
+  | { type: "autopilot_done"; data: { reason?: string } }
   | { type: "autopilot_ignored"; data: Record<string, never> }
   | { type: "autopilot_human"; data: { reason: string } }
   | { type: "autopilot_capped"; data: { rounds: number } }
@@ -88,6 +87,8 @@ export interface AutopilotCycleDeps {
   maxRounds: number;
   /** True once /cancel fires — checked between every step. */
   isCancelled: () => boolean;
+  /** Host evidence, independent of Ken's verdict and reminder budgets. */
+  verificationProblem: () => string | null;
   /** Live plan-mode state of the BUILD session. */
   isPlanMode: () => boolean;
   /** True while a submitted plan (exit_plan) awaits a verdict. */
@@ -104,7 +105,7 @@ export interface AutopilotCycleDeps {
   /** Auto-accept the pending plan (fresh session + approved-plan prompt).
    *  Resolves false when the plan generation went stale (a user Accept/Reject
    *  raced the review and won) — the cycle stops silently. */
-  acceptPlan: () => Promise<boolean>;
+  acceptPlan: (reason?: string) => Promise<boolean>;
   /** Run the "plan approved — implement it now" prompt on the fresh session. */
   runImplement: () => Promise<void>;
   /** Feed a PROMPT verdict's body to GG Coder as an injected run. */
@@ -129,13 +130,19 @@ export interface AutopilotCycleDeps {
  *  - rounds exhausted          → autopilot_capped
  */
 export async function driveAutopilotCycle(deps: AutopilotCycleDeps): Promise<void> {
-  if (deps.isCancelled()) return;
+  const stopIfUnverified = () => {
+    const reason = deps.verificationProblem();
+    if (!reason) return false;
+    deps.emit({ type: "autopilot_human", data: { reason } });
+    return true;
+  };
+  if (deps.isCancelled() || stopIfUnverified()) return;
   await deps.resetReviewer();
   for (let round = 1; round <= deps.maxRounds; round++) {
-    if (deps.isCancelled()) return;
+    if (deps.isCancelled() || stopIfUnverified()) return;
     if (deps.planPending()) {
       const verdict = await deps.reviewPlan();
-      if (!verdict || deps.isCancelled()) return;
+      if (!verdict || deps.isCancelled() || stopIfUnverified()) return;
       if (verdict.kind === "human") {
         deps.emit({ type: "autopilot_human", data: { reason: verdict.reason } });
         return;
@@ -151,10 +158,21 @@ export async function driveAutopilotCycle(deps: AutopilotCycleDeps): Promise<voi
         await deps.runPrompt(body);
         continue;
       }
-      // all_clear — and ignore mapped to approve ("nothing to object to" on a
-      // plan means it's sound; plans never get a silent-ignore user blocker).
-      const ok = await deps.acceptPlan();
-      if (!ok) return; // generation went stale — the user's manual action won
+      // Only an explicit approval can authorize implementation of a plan.
+      if (verdict.kind !== "all_clear") {
+        deps.emit({
+          type: "autopilot_human",
+          data: {
+            reason: "Ken did not explicitly approve the plan. Review it before implementation.",
+          },
+        });
+        return;
+      }
+      const reason = verdict.evidenceLimitation ? CORPUS_UNVERIFIED_REASON : undefined;
+      const ok = await deps.acceptPlan(reason);
+      // Acceptance awaits session/plan setup. A cancellation during that await
+      // must win before we dispatch any implementation, even if setup succeeded.
+      if (!ok || deps.isCancelled()) return;
       await deps.runImplement();
       // Next round: normal work review of the implementation.
       continue;
@@ -167,9 +185,12 @@ export async function driveAutopilotCycle(deps: AutopilotCycleDeps): Promise<voi
       return;
     }
     const verdict = await deps.review();
-    if (!verdict || deps.isCancelled()) return;
+    if (!verdict || deps.isCancelled() || stopIfUnverified()) return;
     if (verdict.kind === "all_clear") {
-      deps.emit({ type: "autopilot_done", data: {} });
+      deps.emit({
+        type: "autopilot_done",
+        data: verdict.evidenceLimitation ? { reason: CORPUS_UNVERIFIED_REASON } : {},
+      });
       return;
     }
     if (verdict.kind === "ignore") {

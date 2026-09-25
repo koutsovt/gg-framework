@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -7,6 +8,7 @@ import { getToolOutputRoot } from "./overflow.js";
 import { ProcessManager } from "../core/process-manager.js";
 import { AgentNotificationQueue } from "../core/agent-notifications.js";
 import { resolveShell } from "../core/shell.js";
+import { localOperations } from "./operations.js";
 import { existsSync } from "node:fs";
 import { useFakeHome } from "../test-support/fake-home.js";
 
@@ -20,8 +22,42 @@ beforeEach(async () => {
 
 afterEach(async () => {
   restoreHome?.();
-  await fs.rm(tmpHome, { recursive: true, force: true });
+  // maxRetries: Windows releases a dead child's inherited log handle slightly
+  // after the process itself is gone, which surfaces here as EBUSY.
+  await fs.rm(tmpHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
+
+/**
+ * A background command that lives briefly and exists everywhere. `sleep` is a
+ * coreutils binary, not a shell builtin, so it is not guaranteed on the Windows
+ * shells `resolveShell` may pick; node is, because the test runner is node.
+ */
+const BRIEF_BACKGROUND_COMMAND = `node -e "setTimeout(() => {}, 500)"`;
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `shutdownAll()` only signals the process tree and returns. The child can
+ * still hold its log file under `tmpHome` open for a moment after that, and
+ * afterEach's recursive rm then fails with EBUSY on Windows. Wait for the OS to
+ * actually reap what this test started.
+ */
+async function shutdownAndWait(manager: ProcessManager): Promise<void> {
+  const pids = manager.list().map((proc) => proc.pid);
+  manager.shutdownAll();
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (!pids.some(isProcessAlive)) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Background processes still alive after shutdown: ${pids.join(", ")}`);
+}
 
 async function listSavedOutputs(): Promise<string[]> {
   const root = getToolOutputRoot();
@@ -74,6 +110,20 @@ describe("renderBashOutput", () => {
 });
 
 describe("createBashTool shell snapshot", () => {
+  it("rejects when the shell cannot be spawned instead of returning a successful result", async () => {
+    const tool = createBashTool(tmpHome, new ProcessManager(), {
+      ...localOperations,
+      spawn: (_file, _args, options) => spawn(path.join(tmpHome, "missing-shell"), [], options),
+    });
+
+    await expect(
+      tool.execute(
+        { command: "echo never-ran" },
+        { signal: new AbortController().signal, toolCallId: "spawn-error" },
+      ),
+    ).rejects.toThrow(/Failed to spawn/);
+  });
+
   it("describes cmd.exe semantics when resolution falls back to cmd", () => {
     const tool = createBashTool(tmpHome, new ProcessManager(), undefined, undefined, {
       platform: "win32",
@@ -153,7 +203,7 @@ describe("wake-condition validation", () => {
     const tool = createBashTool(tmpHome, manager);
     const result = await tool.execute(
       {
-        command: "sleep 1",
+        command: BRIEF_BACKGROUND_COMMAND,
         run_in_background: true,
         wake: { pattern: "READY", silence_seconds: 30 },
       },
@@ -161,7 +211,7 @@ describe("wake-condition validation", () => {
     );
     expect(String(result)).toContain("Wake rules armed");
     expect(String(result)).toContain("silence 30s");
-    await manager.shutdownAll();
+    await shutdownAndWait(manager);
   });
 
   it("does not promise a wake when no notification path exists", async () => {
@@ -169,12 +219,12 @@ describe("wake-condition validation", () => {
     const manager = new ProcessManager({ bgDir: `${tmpHome}/bg-noqueue` });
     const tool = createBashTool(tmpHome, manager);
     const result = await tool.execute(
-      { command: "sleep 1", run_in_background: true, wake: { pattern: "READY" } },
+      { command: BRIEF_BACKGROUND_COMMAND, run_in_background: true, wake: { pattern: "READY" } },
       { signal: new AbortController().signal, toolCallId: "wake-4" },
     );
     expect(String(result)).toContain("NOT armed");
     expect(String(result)).toContain("Poll task_output");
-    await manager.shutdownAll();
+    await shutdownAndWait(manager);
   });
 });
 
@@ -220,6 +270,25 @@ describe("network allowlist guard", () => {
  * at a file that doesn't exist (the bare-`bash` ENOENT class of bug) or arg
  * quoting that the shell rejects.
  */
+describe.skipIf(process.platform === "win32")("createBashTool on a real POSIX shell", () => {
+  const ctx = (id: string) => ({ signal: new AbortController().signal, toolCallId: id });
+
+  // pipefail is what lets the verification gate count `check | tail` as
+  // evidence: without it a red suite piped through tail exits 0 and reads green.
+  it("reports the failing pipeline stage's exit code, not the limiter's", async () => {
+    const tool = createBashTool(tmpHome, new ProcessManager());
+    const out = String(await tool.execute({ command: "false | tail -1" }, ctx("posix-pipefail")));
+    expect(out).toContain("Exit code: 1");
+  });
+
+  it("still exits 0 for a passing command piped through a limiter", async () => {
+    const tool = createBashTool(tmpHome, new ProcessManager());
+    const out = String(await tool.execute({ command: "echo ok | tail -1" }, ctx("posix-pipe-ok")));
+    expect(out).toContain("ok");
+    expect(out).toContain("Exit code: 0");
+  });
+});
+
 describe.skipIf(process.platform !== "win32")("createBashTool on real Windows", () => {
   const ctx = (id: string) => ({ signal: new AbortController().signal, toolCallId: id });
 
@@ -324,4 +393,48 @@ describe.skipIf(process.platform !== "win32")("createBashTool on real Windows", 
       throw new Error(`grandchild ${pid} survived the timeout kill`);
     }
   }, 40_000);
+});
+
+describe("guessed-sleep guard", () => {
+  it("redirects a bare sleep to task_output while a background process runs", async () => {
+    const processManager = new ProcessManager();
+    const tool = createBashTool(tmpHome, processManager);
+    const started = await processManager.start(BRIEF_BACKGROUND_COMMAND, tmpHome);
+
+    const result = await tool.execute(
+      { command: "sleep 30" },
+      { signal: new AbortController().signal, toolCallId: "nap-1" },
+    );
+
+    expect(String(result)).toContain("wait_ms");
+    expect(String(result)).toContain(started.id);
+    processManager.shutdownAll();
+  });
+
+  it("allows a sleep when nothing is running in the background", async () => {
+    const tool = createBashTool(tmpHome, new ProcessManager());
+
+    const result = await tool.execute(
+      { command: "sleep 0.1" },
+      { signal: new AbortController().signal, toolCallId: "nap-2" },
+    );
+
+    expect(String(result)).not.toContain("wait_ms");
+  });
+
+  // Letting a just-started dev server settle before curling it is legitimate:
+  // no exit is ever coming, so there is nothing for wait_ms to return.
+  it("allows a brief settle sleep even while a background process runs", async () => {
+    const processManager = new ProcessManager();
+    const tool = createBashTool(tmpHome, processManager);
+    await processManager.start(BRIEF_BACKGROUND_COMMAND, tmpHome);
+
+    const result = await tool.execute(
+      { command: "sleep 1" },
+      { signal: new AbortController().signal, toolCallId: "nap-3" },
+    );
+
+    expect(String(result)).not.toContain("wait_ms");
+    processManager.shutdownAll();
+  });
 });

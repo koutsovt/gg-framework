@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { stripBom } from "../utils/text.js";
+import { parseFrontmatter } from "./frontmatter.js";
 import { log } from "./logger.js";
 import { BUILTIN_TOOL_NAMES } from "../tools/prompt-hints.js";
 import { BUNDLED_AGENTS } from "./bundled-agents.js";
@@ -36,9 +37,8 @@ export interface AgentDefinition {
  *
  * A session with an allow-list connects MCP servers ONLY when they're named in
  * `allowedMcpServers` (see `AgentSession.connectMcpServers`). Without this,
- * every named agent silently got zero MCP tools — even one that explicitly
- * listed `mcp__kencode-search__searchCode` — so agents fell back to training
- * data instead of real public code.
+ * every named agent silently got zero MCP tools, even one that explicitly
+ * listed an `mcp__<server>__*` tool.
  */
 export function mcpServersForAgent(tools: readonly string[]): string[] {
   const servers = new Set<string>();
@@ -165,44 +165,20 @@ async function loadAgentsFromDir(
  */
 export function parseAgentFile(rawInput: string, source: "global" | "project"): AgentDefinition {
   // A BOM before `---` would otherwise silently kill frontmatter parsing.
-  const raw = stripBom(rawInput);
-  let name = "";
-  let description = "";
-  let tools: string[] = [];
-  let model: AgentModelPreference | undefined;
-  let context: "project" | "none" | undefined;
-  let systemPrompt = raw;
-
-  if (raw.startsWith("---")) {
-    const endIndex = raw.indexOf("---", 3);
-    if (endIndex !== -1) {
-      const frontmatter = raw.slice(3, endIndex).trim();
-      systemPrompt = raw.slice(endIndex + 3).trim();
-
-      for (const line of frontmatter.split("\n")) {
-        const colonIndex = line.indexOf(":");
-        if (colonIndex === -1) continue;
-        const key = line.slice(0, colonIndex).trim().toLowerCase();
-        const value = line.slice(colonIndex + 1).trim();
-
-        if (key === "name") name = value;
-        else if (key === "description") description = value;
-        else if (key === "tools") {
-          tools = value
-            .split(",")
-            .map((t) => t.trim())
-            .filter(Boolean);
-        } else if (key === "model") {
-          if (value) model = value;
-        } else if (key === "context") {
-          const normalized = value.toLowerCase();
-          if (normalized === "project" || normalized === "none") context = normalized;
-        }
-        // Unknown keys are ignored on purpose: agent files stay
-        // forward-compatible with fields a newer ggcoder understands.
-      }
-    }
-  }
+  const { fields, body: systemPrompt } = parseFrontmatter(stripBom(rawInput));
+  // Unknown keys are ignored on purpose: agent files stay forward-compatible
+  // with fields a newer ggcoder understands.
+  const name = fields.name ?? "";
+  const description = fields.description ?? "";
+  const tools = (fields.tools ?? "")
+    .replace(/^\[|\]$/g, "")
+    .split(",")
+    .map((t) => t.trim().replace(/^["']|["']$/g, ""))
+    .filter(Boolean);
+  const model: AgentModelPreference | undefined = fields.model || undefined;
+  const normalizedContext = fields.context?.toLowerCase();
+  const context =
+    normalizedContext === "project" || normalizedContext === "none" ? normalizedContext : undefined;
 
   return { name, description, tools, model, context, systemPrompt, source };
 }

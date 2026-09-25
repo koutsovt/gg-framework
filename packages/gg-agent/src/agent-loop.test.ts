@@ -451,7 +451,7 @@ describe("agentLoop", () => {
 
     await collectLoop([{ role: "user", content: "test" }], {
       provider: "openai",
-      model: "gpt-5.6-luna",
+      model: "gpt-6-luna",
       transportSessionId: "transport-session",
       promptCacheKey: "shared-cache-family",
       toolChoice: "none",
@@ -1414,6 +1414,88 @@ describe("agentLoop", () => {
     expect(assistantTexts).not.toContain(tiny);
   }, 30_000);
 
+  it("cancels identical calls in one response but permits the same call next turn", async () => {
+    const args = z.object({ path: z.string(), flags: z.object({ a: z.number(), b: z.number() }) });
+    const execute = vi.fn(async () => "ran");
+    const tool: AgentTool<typeof args> = {
+      name: "change",
+      description: "change a file",
+      parameters: args,
+      execute,
+      executionMode: "sequential",
+    };
+    const response = (
+      content: { type: "tool_call"; id: string; name: string; args: object }[],
+    ) => ({
+      [Symbol.asyncIterator]: async function* () {
+        yield* [];
+      },
+      response: Promise.resolve({
+        message: { role: "assistant" as const, content },
+        stopReason: "tool_use",
+        usage: { inputTokens: 30, outputTokens: 10 },
+      }),
+    });
+    mockStream
+      .mockReturnValueOnce(
+        response([
+          {
+            type: "tool_call",
+            id: "a",
+            name: "change",
+            args: { path: "one", flags: { a: 1, b: 2 } },
+          },
+          {
+            type: "tool_call",
+            id: "b",
+            name: "change",
+            args: { flags: { b: 2, a: 1 }, path: "one" },
+          },
+          {
+            type: "tool_call",
+            id: "c",
+            name: "change",
+            args: { path: "two", flags: { a: 1, b: 2 } },
+          },
+          {
+            type: "tool_call",
+            id: "d",
+            name: "change",
+            args: { path: "one", flags: { a: 1, b: 2 } },
+          },
+        ]) as unknown as ReturnType<typeof stream>,
+      )
+      .mockReturnValueOnce(
+        response([
+          {
+            type: "tool_call",
+            id: "e",
+            name: "change",
+            args: { path: "one", flags: { a: 1, b: 2 } },
+          },
+        ]) as unknown as ReturnType<typeof stream>,
+      )
+      .mockReturnValueOnce(mockOkResult("done") as unknown as ReturnType<typeof stream>);
+
+    const messages: Message[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "change" },
+    ];
+    const { events } = await collectLoop(messages, {
+      provider: "anthropic",
+      model: "test",
+      tools: [tool],
+    });
+
+    expect(execute).toHaveBeenCalledTimes(4);
+    const cancelled = events.find(
+      (event) => event.type === "tool_call_end" && event.toolCallId === "b",
+    );
+    expect(cancelled).toMatchObject({ isError: true });
+    expect(messages.filter((message) => message.role === "tool")).toHaveLength(2);
+    expect(JSON.stringify(messages)).toContain("this call was not executed");
+  });
+
   it("runs parallel tools concurrently by default", async () => {
     const firstStarted = deferred();
     const releaseFirst = deferred();
@@ -1534,6 +1616,97 @@ describe("agentLoop", () => {
     );
 
     expect(calls).toEqual(["mutate:start", "mutate:end", "read_after"]);
+  });
+
+  it("tells a dispatched-then-aborted call apart from one that never started", async () => {
+    const controller = new AbortController();
+    mockStream.mockReturnValueOnce({
+      [Symbol.asyncIterator]: async function* () {
+        yield* [];
+      },
+      response: Promise.resolve({
+        message: {
+          role: "assistant" as const,
+          content: [
+            { type: "tool_call" as const, id: "t1", name: "deploy", args: {} },
+            { type: "tool_call" as const, id: "t2", name: "notify", args: {} },
+          ],
+        },
+        stopReason: "tool_use",
+        usage: { inputTokens: 10, outputTokens: 5 },
+      }),
+    } as unknown as ReturnType<typeof stream>);
+
+    // Sequential: `notify` cannot start until `deploy` returns, and the abort
+    // lands first — so `deploy` ran (outcome unknown) and `notify` never did.
+    const deployTool: AgentTool<typeof emptyParams> = {
+      name: "deploy",
+      description: "long-running effect",
+      parameters: emptyParams,
+      executionMode: "sequential",
+      async execute(_args, ctx) {
+        controller.abort();
+        await new Promise((_resolve, reject) => {
+          ctx.signal.addEventListener(
+            "abort",
+            () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+            { once: true },
+          );
+        });
+        return "unreachable";
+      },
+    };
+    const notifyTool: AgentTool<typeof emptyParams> = {
+      name: "notify",
+      description: "never reached",
+      parameters: emptyParams,
+      executionMode: "sequential",
+      execute: () => Promise.resolve("sent"),
+    };
+
+    const messages: Message[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "test" },
+    ];
+    await collectLoop(messages, {
+      provider: "anthropic",
+      model: "test",
+      tools: [deployTool, notifyTool],
+      signal: controller.signal,
+    });
+
+    const results = messages.find((m) => m.role === "tool")?.content as ToolResult[];
+    const deployResult = results.find((r) => r.toolCallId === "t1")?.content as string;
+    const notifyResult = results.find((r) => r.toolCallId === "t2")?.content as string;
+
+    // Dispatched: the model must not assume it did nothing and repeat it.
+    expect(deployResult).toContain("UNKNOWN");
+    expect(deployResult).toContain("deploy");
+    expect(deployResult).not.toContain("Safe to retry");
+    // Never dispatched: retrying is free and correct.
+    expect(notifyResult).toContain("Safe to retry");
+    expect(notifyResult).toContain("notify");
+  });
+
+  it("labels a tool call orphaned by restore as unknown, not as never-ran", async () => {
+    // A transcript that stops between the call and its result — what a crash,
+    // a compaction or a session restore leaves behind.
+    const messages: Message[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "ship it" },
+      {
+        role: "assistant",
+        content: [{ type: "tool_call" as const, id: "t9", name: "migrate", args: {} }],
+      },
+      { role: "user", content: "continue" },
+    ];
+    mockStream.mockReturnValueOnce(mockOkResult("done") as unknown as ReturnType<typeof stream>);
+
+    await collectLoop(messages, { provider: "anthropic", model: "test", tools: [] });
+
+    const results = messages.find((m) => m.role === "tool")?.content as ToolResult[];
+    expect(results[0]?.content).toContain("UNKNOWN");
+    expect(results[0]?.content).toContain("migrate");
   });
 
   it("redacts successful tool output before events and provider context", async () => {
@@ -2575,5 +2748,127 @@ describe("invalid tool argument attempt counter", () => {
     // `edit` payloads sent as strings.
     expect(events.some((e) => e.type === "error")).toBe(true);
     expect(events.some((e) => e.type === "retry")).toBe(false);
+  });
+});
+
+/**
+ * Providers with strict ("structured outputs") tool schemas must list every
+ * property as required and mark optionals nullable, so the model emits
+ * explicit `null` for fields it would otherwise omit. Zod's `.optional()`
+ * accepts an absent key but rejects `null` — without stripping, every strict
+ * tool call with an omitted optional would burn an invalid-args retry.
+ */
+describe("null arguments from strict sampling", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  const params = z.object({
+    path: z.string(),
+    offset: z.number().optional(),
+    edits: z.array(z.object({ old_text: z.string(), anchor: z.string().optional() })).optional(),
+  });
+
+  function callWith(args: Record<string, unknown>) {
+    return {
+      [Symbol.asyncIterator]: async function* () {
+        yield* [];
+      },
+      response: Promise.resolve({
+        message: {
+          role: "assistant" as const,
+          content: [{ type: "tool_call" as const, id: "t1", name: "ed", args }],
+        },
+        stopReason: "tool_use" as const,
+        usage: { inputTokens: 10, outputTokens: 5 },
+      }),
+    } as unknown as ReturnType<typeof stream>;
+  }
+
+  it("strips nulls so optionals validate, including nested ones", async () => {
+    const received: unknown[] = [];
+    const tool: AgentTool<typeof params> = {
+      name: "ed",
+      description: "edit",
+      parameters: params,
+      async execute(args) {
+        received.push(args);
+        return "ok";
+      },
+    };
+    mockStream
+      .mockReturnValueOnce(
+        callWith({
+          path: "a.ts",
+          offset: null,
+          edits: [{ old_text: "x", anchor: null }],
+        }),
+      )
+      .mockReturnValueOnce(mockOkResult("done") as unknown as ReturnType<typeof stream>);
+
+    const { events } = await collectLoop([{ role: "user", content: "test" }], {
+      provider: "anthropic",
+      model: "test",
+      tools: [tool],
+    });
+
+    expect(received).toEqual([{ path: "a.ts", edits: [{ old_text: "x" }] }]);
+    const end = events.find((e) => e.type === "tool_call_end") as unknown as Record<
+      string,
+      unknown
+    >;
+    expect(end?.isError).toBeFalsy();
+    expect(end?.invalidArgAttempt).toBeUndefined();
+  });
+
+  it("keeps nulls for MCP-style passthrough tools (rawInputSchema)", async () => {
+    const passthrough = z.record(z.string(), z.unknown());
+    const received: unknown[] = [];
+    const tool: AgentTool<typeof passthrough> = {
+      name: "ed",
+      description: "mcp",
+      parameters: passthrough,
+      rawInputSchema: { type: "object", properties: { cursor: { type: "string" } } },
+      async execute(args) {
+        received.push(args);
+        return "ok";
+      },
+    };
+    mockStream
+      .mockReturnValueOnce(callWith({ cursor: null }))
+      .mockReturnValueOnce(mockOkResult("done") as unknown as ReturnType<typeof stream>);
+
+    await collectLoop([{ role: "user", content: "test" }], {
+      provider: "anthropic",
+      model: "test",
+      tools: [tool],
+    });
+
+    expect(received).toEqual([{ cursor: null }]);
+  });
+
+  it("keeps a null that validates: required nullable fields are never stripped", async () => {
+    const nullableParams = z.object({ cursor: z.string().nullable() });
+    const received: unknown[] = [];
+    const tool: AgentTool<typeof nullableParams> = {
+      name: "ed",
+      description: "nullable",
+      parameters: nullableParams,
+      async execute(args) {
+        received.push(args);
+        return "ok";
+      },
+    };
+    mockStream
+      .mockReturnValueOnce(callWith({ cursor: null }))
+      .mockReturnValueOnce(mockOkResult("done") as unknown as ReturnType<typeof stream>);
+
+    await collectLoop([{ role: "user", content: "test" }], {
+      provider: "anthropic",
+      model: "test",
+      tools: [tool],
+    });
+
+    expect(received).toEqual([{ cursor: null }]);
   });
 });

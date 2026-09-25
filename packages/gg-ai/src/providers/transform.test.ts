@@ -7,10 +7,12 @@ import {
   toAnthropicThinking,
   toAnthropicTools,
   toOpenAIMessages,
+  toOpenAITools,
   toGlmReasoningEffort,
   toLocalReasoningEffort,
   toOpenAIReasoningEffort,
 } from "./transform.js";
+import { supportsStrictToolSampling } from "../utils/strict-tool-schema.js";
 import type { Message, Tool } from "../types.js";
 
 const exampleTools: Tool[] = [
@@ -625,8 +627,8 @@ describe("OpenAI transform", () => {
 describe("toAnthropicThinking", () => {
   // Opus 4.8 is no longer in ggcoder's model picker, but gg-ai is a standalone
   // library and Anthropic still serves that ID — keep the wire format correct.
-  it("passes Anthropic adaptive effort levels through for Opus 5 (and legacy 4.8)", () => {
-    for (const model of ["claude-opus-5", "claude-opus-4-8"]) {
+  it("passes Anthropic adaptive effort levels through for Opus 5.5 / 5 (and legacy 4.8)", () => {
+    for (const model of ["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"]) {
       for (const level of ["low", "medium", "high", "xhigh", "max"] as const) {
         const result = toAnthropicThinking(level, MAX_TOKENS, model);
         expect(result.outputConfig).toEqual({ effort: level });
@@ -644,8 +646,8 @@ describe("toAnthropicThinking", () => {
     });
   });
 
-  it("treats Fable 5 and Mythos 5 as adaptive thinking models (max, xhigh clamps to high)", () => {
-    for (const model of ["claude-fable-5", "claude-mythos-5"]) {
+  it("treats the Fable and Mythos line as adaptive thinking models (max, xhigh clamps to high)", () => {
+    for (const model of ["claude-fable-5-1", "claude-fable-5", "claude-mythos-5"]) {
       const result = toAnthropicThinking("max", MAX_TOKENS, model);
       expect(result.outputConfig).toEqual({ effort: "max" });
       expect((result.thinking as { type: string }).type).toBe("adaptive");
@@ -676,7 +678,7 @@ describe("toAnthropicThinking", () => {
 describe("toOpenAIReasoningEffort", () => {
   it("clamps client-only max and ultra levels to OpenAI's xhigh effort", () => {
     expect(toOpenAIReasoningEffort("max", "gpt-5.5")).toBe("xhigh");
-    expect(toOpenAIReasoningEffort("ultra", "gpt-5.6-sol")).toBe("xhigh");
+    expect(toOpenAIReasoningEffort("ultra", "gpt-6-sol")).toBe("xhigh");
   });
 });
 
@@ -734,6 +736,65 @@ describe("video content transforms", () => {
 
   it("keeps video untouched when the model supports it", () => {
     expect(downgradeUnsupportedVideos(videoMessage, true)).toEqual(videoMessage);
+  });
+});
+
+describe("toOpenAITools strict sampling", () => {
+  it("marks strictifiable tools strict and rewrites their parameters", () => {
+    const tools: Tool[] = [
+      {
+        name: "read_file",
+        description: "Read a file.",
+        parameters: z.object({ filePath: z.string(), offset: z.number().optional() }),
+      },
+    ];
+    const [first] = toOpenAITools(tools, { strict: true });
+    if (first?.type !== "function") throw new Error("Expected a function tool");
+    const wire = first.function;
+    expect(wire.strict).toBe(true);
+    const params = wire.parameters;
+    expect(params).toHaveProperty("required", ["filePath", "offset"]);
+    expect(params).toHaveProperty("additionalProperties", false);
+    expect(params).toHaveProperty("properties.offset", {
+      anyOf: [{ type: "number" }, { type: "null" }],
+    });
+  });
+
+  it("silently falls back to the unmodified schema when strict is impossible", () => {
+    const raw = {
+      type: "object",
+      properties: { mode: { oneOf: [{ type: "string" }, { type: "number" }] } },
+      required: ["mode"],
+    };
+    const tools: Tool[] = [
+      {
+        name: "mcp_tool",
+        description: "From an MCP server.",
+        parameters: z.record(z.string(), z.unknown()),
+        rawInputSchema: raw,
+      },
+    ];
+    const [first] = toOpenAITools(tools, { strict: true });
+    const wire = (first as { function: { strict?: boolean; parameters: Record<string, unknown> } })
+      .function;
+    expect(wire.strict).toBeUndefined();
+    expect(wire.parameters).toEqual(raw);
+  });
+
+  it("leaves the wire format untouched when strict is not requested", () => {
+    const [first] = toOpenAITools(exampleTools);
+    const wire = (first as { function: { parameters: Record<string, unknown> } }).function;
+    expect(wire).not.toHaveProperty("strict");
+    expect(wire.parameters).toEqual(expect.objectContaining({ type: "object" }));
+  });
+});
+
+describe("supportsStrictToolSampling", () => {
+  it("enables strict tools only for the provider that documents them", () => {
+    expect(supportsStrictToolSampling("openai")).toBe(true);
+    expect(supportsStrictToolSampling("deepseek")).toBe(false);
+    expect(supportsStrictToolSampling("glm")).toBe(false);
+    expect(supportsStrictToolSampling("moonshot")).toBe(false);
   });
 });
 

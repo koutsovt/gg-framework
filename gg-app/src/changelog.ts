@@ -22,6 +22,447 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.70.3",
+    date: "2026-09-23",
+    items: [
+      "Your network rules stay in charge even while a page is loading. I made `web fetch` and `web search` stop when you block their destination, instead of letting an already-started request slip through.",
+      "No more accidental double moves. If the AI repeats the exact same `tool call` in one response, I run it once, but I still let it retry when your task actually changes.",
+      "A command that never started now says so. I fixed `shell` launch failures so you and the AI see the error right away instead of a result that looks successful.",
+    ],
+  },
+  {
+    version: "0.70.2",
+    date: "2026-09-23",
+    items: [
+      "GG Coder feels alive now. Your messages rise into the chat, tool steps slide in as they run, popups and menus fade away instead of vanishing, and every screen change glides with a soft `crossfade`. Hit `Show full output` on a long code block and it grows open smoothly instead of jumping.",
+      "Reviewing a plan is a proper moment now. The `YOUR PLAN` banner draws itself in line by line, your plan rises in underneath, and a stray Enter can never approve it by accident. It's fully keyboard friendly, so Tab stays right where your decision is.",
+      "Errors wait for you now. They stay on screen until you close them, and any notice holds still while you hover it, so nothing important slips past while you're looking away.",
+      "A calmer, cleaner look. The top bar keeps `/commit` as the one standout action, Ken's replies read in easy normal text with his signature teal stripe, and your project list is tidier with neat, lined-up times.",
+    ],
+  },
+  {
+    version: "0.70.1",
+    date: "2026-09-23",
+    items: [
+      "Every button now tells you what it does. I built slick new `tooltips` across the whole app that actually show up on Mac, pop in instantly as you glide between buttons, and never appear when you didn't ask for them.",
+      "GG Coder got a serious polish pass. Faint grey text is crisper and easier on the eyes, menus and popups now float in smoothly, and keyboard users get a clear `focus ring` so you always know where you are. Got `Reduce Motion` switched on? I calm every animation down for you now.",
+      "Squeeze your windows as small as you like. At narrow sizes the header buttons neatly wrap instead of sliding off the edge, your issue and PR counts stay fully readable, and the logo shrinks to fit.",
+    ],
+  },
+  {
+    version: "0.70.0",
+    date: "2026-09-23",
+    items: [
+      "OpenAI's brand new `GPT-6 Sol` and `GPT-6 Luna` just landed. Sol is your new OpenAI default, a serious coder that climbs all the way to `ultra` effort, and Luna is the lightning-fast, dirt-cheap sidekick I now hand your helper agents. Both read screenshots and remember a huge amount of your project at once.",
+      "Your secrets are safer than ever. I hide API keys and passwords from the AI, and now I also make sure it can never accidentally overwrite a real key in your files with the hidden placeholder it was shown. Your `.env` stays exactly as you left it.",
+    ],
+  },
+  {
+    version: "0.69.0",
+    date: "2026-09-23",
+    items: [
+      "`Claude Opus 5.5` just landed and I made it the flagship Anthropic pick. Anthropic built it for exactly the long coding sessions we live in, it thinks adaptively at every effort level up to `max`, and it dropped `20%` off the price at `$4/$20` per million tokens. Pick it in the model menu and it just works.",
+    ],
+  },
+  {
+    version: "0.68.0",
+    date: "2026-09-22",
+    items: [
+      "`Grok 4.7` is here and it's your new default on xAI. xAI built it for exactly what we do: hours of coding, agents that don't wander, and deep research. Same huge `500K` context and price as before, plus a new extra-deep `xhigh` thinking mode for the gnarliest problems.",
+      "Xiaomi's whole `MiMo-V2.6` family just landed. `MiMo-V2.6-Pro` now reads screenshots and watches video clips right alongside your code, the bargain `MiMo-V2.6-Flash` quietly handles the quick lookups so your bill stays tiny, and `UltraSpeed` returns when you want raw pace.",
+    ],
+  },
+  {
+    version: "0.67.1",
+    date: "2026-09-22",
+    items: [
+      "Long sessions just stay fast now. I taught the engine to slim a conversation down on a smart per-model budget before it ever gets heavy, so that sluggish crawl an hour into a big task is gone. A task that took `60 minutes` now finishes in around `10`.",
+      "No more phantom stalls on big prompts. The engine used to give up after `45 seconds` and restart from scratch; now it waits as long as the work actually needs, so you see far fewer random pauses and retries mid-task.",
+    ],
+  },
+  {
+    version: "0.67.0",
+    date: "2026-09-22",
+    items: [
+      "Ask for UI and get the real thing. Your agent can now browse `Bklit` and `Kokonutui` for actual components, pull their genuine source into your project, and wire up imports and dependencies for you. No more invented lookalikes. I watched it nail `6 out of 6` fresh builds in testing with the real library code, verbatim.",
+      "Animations that behave like an adult. New `Motion` guidance means the agent builds with real animation APIs, honors your `reduced motion` preference, and cleans up its own animation drivers on unmount. Smooth where it should be, still where you need it.",
+    ],
+  },
+  {
+    version: "0.66.4",
+    date: "2026-09-21",
+    items: [
+      "Less clutter, more care in the interfaces your agent builds. I tightened the `UI skill` to cut repetitive descriptions, reuse consistent controls, and check `keyboard focus` and `dropdowns` through real interactions instead of relying on screenshots alone.",
+    ],
+  },
+  {
+    version: "0.66.3",
+    date: "2026-09-21",
+    items: [
+      "Your agent's scratch files should keep work moving, not hold it up. I fixed temporary-file handling across `macOS`, `Linux`, and `Windows`, so your agent can read, write, and edit its scratch files without getting tripped up by the wrong folder.",
+    ],
+  },
+  {
+    version: "0.66.2",
+    date: "2026-09-21",
+    items: [
+      "Your pictures no longer get left behind in connected editors. I fixed missing `screenshots` and `generated images` in `ACP` connections, so you can see them as they arrive and when you reopen a saved chat.",
+    ],
+  },
+  {
+    version: "0.66.1",
+    date: "2026-09-20",
+    items: [
+      "Your `activity bar` now tells the story of the request you just made, not the last one. I separated earlier check warnings from fresh answers, gave research and background work clearer finish messages, and stopped blocked checks from leaving you waiting on a review that won't start.",
+    ],
+  },
+  {
+    version: "0.66.0",
+    date: "2026-09-20",
+    items: [
+      "Know what's happening without reading the whole chat. I rebuilt the `activity bar` with short, color-coded statuses and smooth transitions, so `Needs you` and `Not verified` stand out even after the work stops.",
+      "I tightened `Ken` and `Autopilot` reviews around what you actually asked for. Your latest decisions stay in focus, and reviews check for unfinished work without chasing endless optional improvements.",
+      "Your `slash commands` now listen to what you ask this time. I fixed custom instructions getting lost behind template defaults, so your chosen scope and format take priority.",
+    ],
+  },
+  {
+    version: "0.65.2",
+    date: "2026-09-19",
+    items: [
+      "Deep-thinking models just got dramatically faster out of the gate. New chats on models like `GPT-6 Astra` no longer start at maximum reasoning, and `plan mode` caps its deep thinking, so you get answers sooner and burn far less of your usage.",
+      "Your next message no longer waits for housekeeping. I moved context compaction into the background so it tidies up while you read the answer, which keeps long conversations snappy instead of pausing your next prompt.",
+    ],
+  },
+  {
+    version: "0.65.1",
+    date: "2026-09-16",
+    items: [
+      "Get the answer without digging through a checklist. I rewrote how `GG Coder` replies so you get a clear takeaway first, followed by a natural explanation that fits your question or coding task.",
+      "Changed your mind about a queued message? I fixed `queue cancellation` so older updates stay out of your way and cancelling one of two identical messages removes the right one. Your chat stays in step with what is actually waiting to run.",
+    ],
+  },
+  {
+    version: "0.65.0",
+    date: "2026-09-15",
+    items: [
+      "Your buttons, your style. I added `GG UI` under `Settings > Effects` so you can switch between the metallic finish and the original look, with your choice remembered across restarts and windows. I also fixed those doubled edges when you zoom, so the shine stays neatly on your buttons.",
+    ],
+  },
+  {
+    version: "0.64.5",
+    date: "2026-09-15",
+    items: [
+      "I fixed the desktop effects that went missing after the last update. Your input's animated glow is back, and the metal finish on `Send`, `Enhance?`, and your New and Commit buttons follows their rounded edges instead of spilling into square corners.",
+    ],
+  },
+  {
+    version: "0.64.4",
+    date: "2026-09-15",
+    items: [
+      "You can spot active work at a glance now. I gave `Agent is working…` and `Ken` animated orbs and shimmering labels, plus a moving glow around your input and `Stop` button while the action happens.",
+      "I gave `Send`, `Enhance?`, and your New and Commit actions a liquid-metal finish. Your New and Commit buttons keep their familiar colors, with a little extra shine where you reach most.",
+    ],
+  },
+  {
+    version: "0.64.3",
+    date: "2026-09-15",
+    items: [
+      "I refreshed `GG Coder`'s AI and voice engines and trimmed the code it ships with. Your desktop app and command-line tools get the same updated engine, with no new workflows to learn.",
+    ],
+  },
+  {
+    version: "0.64.2",
+    date: "2026-09-14",
+    items: [
+      "A little housekeeping for your `GG Coder`. I refreshed the desktop foundations in this update, with no new buttons or workflows for you to learn.",
+    ],
+  },
+  {
+    version: "0.64.1",
+    date: "2026-09-13",
+    items: [
+      "Your `OpenAI` chats now get a second chance when the dreaded `encrypted content` error strikes. I added an automatic recovery attempt that keeps your messages and tool results intact, so you can get back to building without starting over.",
+    ],
+  },
+  {
+    version: "0.64.0",
+    date: "2026-09-12",
+    items: [
+      "Your existing projects now get a dedicated `refactoring` skill. I built in guidance for small, test-checked changes and older code without tests, so you can ask for a cleanup with clearer safeguards around what already works.",
+      "Tell GG Coder what matters before shrinking a long conversation. I added `/compact [focus]` so you can name the decisions or topics you want the summary to prioritize, instead of leaving that choice entirely to the agent.",
+    ],
+  },
+  {
+    version: "0.63.4",
+    date: "2026-09-12",
+    items: [
+      "Long sessions just got smarter about the code you're fixing. When your tests fail, the agent now keeps every failing test name in its memory even after the conversation gets compacted, and drops each one the moment it goes green. No more lost bugs resurfacing or chasing failures you already fixed. In my measurements that's `100%` of failing tests remembered where the old memory lost `1 in 6`.",
+    ],
+  },
+  {
+    version: "0.63.3",
+    date: "2026-09-11",
+    items: [
+      "I fixed a sneaky edit bug that could corrupt your code. Global `replace_all` edits now replace each match exactly once, so you stop seeing duplicate properties or half-finished changes that leave the agent chasing `TypeScript` errors it created itself. Fewer repair loops, cleaner diffs, faster finishes.",
+      "Your chat stays clean while the agent works. I pulled the raw post-edit diagnostic dumps out of the conversation, so edits that check out no longer spray gray error walls mid-reply. The agent still sees every real problem and fixes it, you just read the result instead of the noise.",
+    ],
+  },
+  {
+    version: "0.63.2",
+    date: "2026-09-11",
+    items: [
+      "Know where you stand without reading the whole reply. I made your agent lead with a clear status like `DONE`, `NOT FIXED`, or `NEEDS APPROVAL`, followed by what you need to do next. Finished work, remaining limits, and updates still waiting to ship no longer get buried.",
+      "I cut another source of repeat `verification` interruptions. Your agent now keeps credit for completed checks when a follow-up command leaves your code untouched, without treating that follow-up as proof of fresh checks.",
+      "No more chasing an image setting that cannot deliver. I made `Flare` and `Sunburst` explain up front that `transparent backgrounds` are currently unavailable through your ChatGPT connection, instead of retrying the same failed request or quietly giving you an opaque image.",
+    ],
+  },
+  {
+    version: "0.63.1",
+    date: "2026-09-11",
+    items: [
+      "I cut the repeat interruptions from `verification` and `Autopilot`, so your agent can keep moving instead of proving the same work again. Background checks and builds that leave your code unchanged now get the credit they earned, while real errors still get caught. Progress notices show what is actually happening, without pretending every edit is the finish line.",
+    ],
+  },
+  {
+    version: "0.63.0",
+    date: "2026-09-09",
+    items: [
+      "Your image toolbox just leveled up. I added `GPT Image 2.5 Flare` for fast creation and `Sunburst` for precise edits, plus `transparent backgrounds` so you can make artwork ready to drop into your project.",
+      "Your words, sharpened without changing the mission. I tuned the `Prompt Enhancer` to keep your questions, details, and boundaries intact while respecting your selected model's settings. If a rewrite comes back empty or cut short, your original draft stays safe.",
+      "Less stop-start while your agent codes. I moved `edit checks` into the background and streamlined `verification` follow-ups, so you get smoother progress and a final answer about your task, not a detour about the checks.",
+      "No more waiting for a running preview to shut down. I fixed `dev-server readiness` waits so your agent can check the page when it is ready and leave the server running for you.",
+    ],
+  },
+  {
+    version: "0.62.1",
+    date: "2026-09-08",
+    items: [
+      "Stay in your flow across windows and the `CLI`. I fixed a sneaky login glitch that could leave one session using an old login after another refreshed it, so you get fewer surprise interruptions.",
+      "A little less baggage every time you open `GG Coder`. I moved `What's new` out of your workspace's startup load and stopped hidden input animations from ticking away, so the app does less busywork while you focus elsewhere.",
+    ],
+  },
+  {
+    version: "0.62.0",
+    date: "2026-09-07",
+    items: [
+      "Big coding jobs now get a fresh pair of eyes. I gave `Ideal` an independent reviewer that reads your changes without the original agent's excuses, then sends real issues back for another pass before you get the final answer.",
+      "Less spinning, more progress. I upgraded `loop detection` to spot failed retries even when the agent keeps changing the wording, so it can try a genuinely different approach. Your next prompt gets a clean slate, not yesterday's warning.",
+      "Ask a question and get an answer, not a surprise testing detour. I stopped unfinished checks from dragging `Hook engaged` into your question-only turns, and made verification explain exactly why a check did not count.",
+    ],
+  },
+  {
+    version: "0.61.2",
+    date: "2026-09-07",
+    items: [
+      "I killed the phantom `Hook engaged` interruptions. Ask a plain question right after opening the app and your answer now streams untouched, because verified work stays verified and checks piped through `tail` finally count as proof.",
+      "A red test suite can never dress up as green again. Every command now runs with `pipefail`, so piping tests through `tail` still surfaces the failure and the agent has to actually fix it.",
+      "No more endless `a check failed` loops. One stale failure no longer blocks every later green run: any fresh passing check on newer code clears the slate.",
+      "Follow-up re-checks now answer in `one line`, not a wall. After a tiny change the agent confirms with a short delta instead of re-printing the whole checklist you already read.",
+    ],
+  },
+  {
+    version: "0.61.1",
+    date: "2026-09-06",
+    items: [
+      "Your `CI` chip now tells the whole story at a glance. While jobs run it shimmers with quiet suspense, then settles to calm `green` on a pass or honest `red` the moment something breaks. No more guessing.",
+      "Agents on `OpenAI` got sharper hands. I made every tool call ship in a strictly validated shape, so fewer calls bounce back with malformed arguments. That means fewer retries and less waiting for you.",
+    ],
+  },
+  {
+    version: "0.61.0",
+    date: "2026-09-06",
+    items: [
+      "Stop hopping between tabs to see if your build passed. I brought live `CI` counts into your title bar: green clears after `10 seconds`, red stays until you dismiss it, and one click opens `GitHub Actions`.",
+      "Passing tests should count, not cause a scare. I fixed checks that start with `git status` and stopped unfinished verification from masquerading as an app crash. You get `Unverified` when more checking is needed, not a bogus bug report.",
+    ],
+  },
+  {
+    version: "0.60.1",
+    date: "2026-09-06",
+    items: [
+      "A green light should mean something. I tightened `Autopilot` so failed or unfinished checks stay `Unverified`, even after you reopen a chat.",
+      "No more vanishing caveats. I kept `Steroids` review warnings in your chat history, so you can see when a review lacked a real-code cross-check.",
+    ],
+  },
+  {
+    version: "0.60.0",
+    date: "2026-09-05",
+    items: [
+      "More models for you to try. I added `Gemini 3.8 Flash`, `Gemini 3.5 Flash Lite`, and experimental `DeepSeek V4 Flash Vision` to the picker. The new Gemini options still depend on Google enabling access for your account, so your working default stays put.",
+      "Show `Qwen3.6-Plus` what you mean. I unlocked image and video input through `OpenRouter`, so you can bring screenshots and clips into the conversation instead of describing everything by hand.",
+      "Your thinking controls now do what they promise. I lined up `DeepSeek` with its real reasoning levels and unlocked `max` for `Fugu Ultra`, so you can choose how hard they work on your problem.",
+      "Long local chats have a better safety net. I made GG Coder respect the memory you actually gave `Ollama` or `LM Studio`, not the model's advertised maximum, so it can summarize before your loaded model runs out of room.",
+    ],
+  },
+  {
+    version: "0.59.1",
+    date: "2026-09-05",
+    items: [
+      "The `Prompt Enhancer` is back on `GPT-6 Astra` and the whole `GPT-5.6` family. OpenAI's newest models refuse to run with thinking fully off, which was bouncing the enhancer and blanking the screen. I gave them a proper reasoning floor, and if anything ever fails again your draft stays put with a clear message instead of a white window.",
+      "`Autopilot` on the new OpenAI models works again too, same fix. And the misleading warning that your ChatGPT account could not use a model is gone: I only show it when OpenAI actually says so.",
+    ],
+  },
+  {
+    version: "0.59.0",
+    date: "2026-09-05",
+    items: [
+      "`GPT-6 Astra` actually runs now. OpenAI quietly gates Astra behind a newer client handshake, so the first build got bounced with a cryptic error. I upgraded the handshake, and Astra answers on your ChatGPT login with the full reasoning dial up to `ultra`. I also retired `GPT-5.5` from the picker so your OpenAI list is just the current lineup.",
+      "Error messages finally talk to you like an app, not a terminal. Every provider hint now tells you to use the model selector or update GG Coder, never to upgrade some CLI you have never seen. The `AI Providers` sign-in page lists the real models for every provider too, Astra and Fable 5.1 included.",
+      "Two chats compacting at the same moment on Windows could trip over each other. I fixed the lock so they take turns cleanly, and a real permission problem now surfaces instead of hanging forever.",
+    ],
+  },
+  {
+    version: "0.58.0",
+    date: "2026-09-05",
+    items: [
+      "`GPT-6 Astra` is here, the day OpenAI shipped it. Pick it from the model selector with your ChatGPT login and you get OpenAI's most capable model yet, with a `1M` token memory and the full reasoning dial from low all the way up to `ultra`, where it proactively splits big jobs across helper agents and runs them in parallel. I wired it into the same caching and streaming path as the 5.6 family, so it feels instant from the first message. Astra is still rolling out on OpenAI's side, so if your account is not in yet, GG Coder tells you plainly and points you at what works today.",
+    ],
+  },
+  {
+    version: "0.57.5",
+    date: "2026-09-04",
+    items: [
+      "Squashed a crash that could take the whole app down. If GG Coder tried to run a command in the background and the program behind it was not installed, the failure escaped and killed everything instead of being reported. Now it just tells you the command could not start and carries on like nothing happened.",
+    ],
+  },
+  {
+    version: "0.57.4",
+    date: "2026-09-04",
+    items: [
+      "No more watching GG Coder nap. When it starts a build, a test run or an install in the background, it used to guess how long that would take and just sleep, sometimes a full `30 seconds` after the job already finished. Now it waits on the real finish line and picks straight back up the moment your command is done, so long jobs feel dramatically snappier and it can no longer talk itself into an idle loop.",
+    ],
+  },
+  {
+    version: "0.57.3",
+    date: "2026-09-03",
+    items: [
+      "Every question GG Coder asks you now fits neatly in its card. Long options used to spill off the right edge of the chat and get cut in half, so you were picking between answers you could not fully read. Now they wrap cleanly, the `Recommended` tag stays pinned where it belongs, and nothing hides past the edge no matter how narrow your window is.",
+      "I refreshed the engine room under the app and made the Windows build tell me the truth when something goes wrong. You get the same GG Coder, on fresher parts, with one more class of startup crash caught before it can ever reach you.",
+    ],
+  },
+  {
+    version: "0.57.2",
+    date: "2026-09-03",
+    items: [
+      "GG Coder now builds from proof, not memory. Before it plans or writes anything nontrivial, it checks `Agent Steroids`, your local library of real, current open-source code, and copies the patterns that actually ship. If your library has no match, it goes and finds the right repos, asks you once, indexes them, and then builds from what it read. I ran it `16` times back to back on `GLM-5.3` to make sure it never skips this step. And if you have not installed Steroids yet, it will tell you exactly where the button is.",
+    ],
+  },
+  {
+    version: "0.57.1",
+    date: "2026-09-03",
+    items: [
+      "Your Mac can breathe again. A user sent me a profile showing GG Coder's graphics process chewing `468%` CPU with `7` windows open, and I found the culprit: the ambient glow behind every window was being re-blurred by hand on every single repaint, cursor blink included. I rebuilt the glow so it costs almost nothing, keeps its soft look, and still shifts colour per window. Same vibe, a fraction of the power.",
+    ],
+  },
+  {
+    version: "0.57.0",
+    date: "2026-09-02",
+    items: [
+      "Your agent stops writing last year's code. I plugged in `Agent Steroids`: a corpus of real, current open-source repos on your own disk that it reads before it writes, offline and with no rate limits. Hit the new `Steroids` button on Home to install it in one click, then run `/steroids` and I profile your project, hunt down the repos that match it, and index only the ones you pick.",
+      "GG Coder now knows which platform CLIs you already have. It spots `31` tools like `railway`, `vercel` and `gh` in your project and drives them for logs, deploys and env vars instead of sending you off to a dashboard.",
+      "Background windows finally sit still. Every decorative animation and canvas loop pauses the moment a window loses focus, so a stack of open projects no longer burns CPU and battery while you work in one of them.",
+    ],
+  },
+  {
+    version: "0.56.0",
+    date: "2026-09-02",
+    items: [
+      "`Claude Fable 5.1` just landed and it is yours right now. Anthropic's newest and sharpest model, with a `1 million` token memory and thinking that dials itself up when the problem gets hard. Pick it in the model selector and go.",
+      "The connect screen finally tells you the truth about what you are signing into. Every provider now lists the exact models you get, so `Z.AI` shows its Flash sibling and `OpenRouter` names the model it actually runs instead of hiding behind a label.",
+    ],
+  },
+  {
+    version: "0.55.5",
+    date: "2026-09-02",
+    items: [
+      "Every question I ask you now looks the same: one clean stack of options, whatever I am asking. No chips on one question and rows on the next, no stray `Something else` link, no send button to hunt for. Answer in any order, change an early pick while you think about the rest, and the last answer sends it.",
+      "Flipping `Autopilot` on and off finally feels as good as it sounds. The blocky sign and the flat black slab behind it are gone, replaced by one calm glowing line over your chat, and I muted the loud toggle chimes.",
+      "Your files stay exactly where you put them. A repo can no longer hide a shortcut in a folder and trick me into writing outside your project, into things like `~/.ssh` or your shell config. If something does get blocked, I now tell you precisely which path redirected where.",
+      "Hand me a new folder mid-chat and I actually know about it. `/add-dir` used to go unheard in my sessions, so I would turn around and refuse to work in the very folder you just gave me.",
+    ],
+  },
+  {
+    version: "0.55.4",
+    date: "2026-08-31",
+    items: [
+      "No more double answers. When I double-check my own work before replying, my rough first draft used to slip onto the screen and sit there right above the polished one. Now you only ever see the final answer, and I stop repeating the same `reviewing` notice over and over while I dig through the files.",
+    ],
+  },
+  {
+    version: "0.55.3",
+    date: "2026-08-29",
+    items: [
+      "You can now ignore my question and just tell me what you actually want. Typing your own reply instead of tapping an option used to leave me frozen for up to `10 minutes` before I even read it. Now your message reaches me instantly, the question card clears itself out of the way, and the chat holds perfectly still while it goes.",
+    ],
+  },
+  {
+    version: "0.55.2",
+    date: "2026-08-29",
+    items: [
+      "My questions are clickable again. I had started slipping them back into the reply as a line of text, so you were stuck typing out an answer to something that should take one tap. Now every question I end on, even a casual `want me to also do this?`, opens the real question band with the options ready to pick.",
+    ],
+  },
+  {
+    version: "0.55.1",
+    date: "2026-08-29",
+    items: [
+      "Your chat box finally sits still. Type all the way to the edge of the first line and it used to bounce up and down on every keystroke, yanking the text out from under your eyes. I taught it to make up its mind once and hold, so writing long prompts is calm again.",
+      "The bar along the bottom feels smoother to use. Hovering `Thinking` or a model name no longer slaps an underline on it. The text just warms up brightly under your cursor and stays exactly where it is, so nothing twitches while you aim.",
+    ],
+  },
+  {
+    version: "0.55.0",
+    date: "2026-08-29",
+    items: [
+      "I can finally just ask you a question. When I hit a real fork in the road, a question band opens right inside the reply with the options laid out, and I wait on your call instead of guessing and getting it wrong. Click an option, press its number, or hit `Something else` and type your own answer straight into the composer. No more coming back to find I picked the thing you did not want.",
+      "GG Coder got a new look. Deeper, near black surfaces, a soft periwinkle accent, and a gentle glow that shifts with every window so no two ever feel like the same template. The glow also breathes while I work, so you can tell I am busy from across the room without reading a word.",
+      "The composer feels like a real writing space now. `Send` lives in its own round button that becomes stop the instant I start running, and the box grows with your draft instead of jumping around under your cursor. I also dropped the bundled fonts for the ones your system already loves, so there is less to ship and less to load.",
+    ],
+  },
+  {
+    version: "0.54.0",
+    date: "2026-08-28",
+    items: [
+      "My replies flow onto the screen now instead of stuttering. Text used to land in whatever clumps the network delivered, so it read like a typewriter with hiccups. I set my own steady pace and softly fade in each word as it arrives, so watching me work feels smooth no matter how fast the model bursts.",
+      "`GLM-5.3-Flash` just joined the lineup. It reads your images natively, keeps the full `1M` context and the top thinking ceiling, and costs about a twentieth of GLM-5.3 with triple the plan quota. I quietly route background work like scouting and summaries through it too, so your GLM sessions stretch much further.",
+    ],
+  },
+  {
+    version: "0.53.12",
+    date: "2026-08-27",
+    items: [
+      "No new buttons this time, just fresher foundations. I updated the core libraries GG Coder runs on, including `tokio` and `serde`, so the app stays current and steady underneath you while I build the next batch.",
+    ],
+  },
+  {
+    version: "0.53.11",
+    date: "2026-08-26",
+    items: [
+      "Open a monster file and the app just shrugs. Reading something enormous could eat all the memory and take down every window at once, wiping out sessions that had nothing to do with it. I cap reads at `20 MB` now and hand back a clean answer instead, so one oversized log never costs you your work.",
+      "Hitting stop is genuinely safe now. If you cancelled mid run, I used to report every unfinished step as though it never happened, so a `git push` that had already gone through could quietly fire a second time. I can finally tell never started apart from outcome unknown, and I say which one it was instead of guessing.",
+      "A crash costs you far less. When the app went down mid save, the half written line used to swallow your next message with it, so you came back to find your own words missing from the `history`. I stitch that torn line back up on the way in, so the only thing lost is the one that was actually interrupted.",
+      "Sneaky files cannot trick me into reading what you never opened. A `symlink` swapped in at the last instant could point me at something private sitting well outside your project. I refuse those at the door now, and I proved it by running the attack on myself first.",
+      "Settings is leaner. I pulled the `Agent plugins` section out while it gets rebuilt properly, so there is one less half finished thing in your way.",
+    ],
+  },
+  {
+    version: "0.53.10",
+    date: "2026-08-26",
+    items: [
+      "Typing a long prompt is dead steady now. The thread used to twitch up and drift back down on every line that wrapped, exactly the kind of tiny wobble that pulls you out of your thoughts. I made the chat settle in one smooth motion, so the newest message just sits there while you write.",
+      "Start a fresh chat and it actually looks fresh. New sessions were opening with the last run's `token` count and timing still sitting under the box, like you had already asked something. That ghost is gone.",
+      "You can trust a green check again. If I ever touch a test, a `tsconfig`, or a lint rule while fixing something, I now have to say so outright instead of letting a rigged check pass as proof. I locked my own instructions behind a snapshot too, so nothing about how I think shifts between releases without you seeing it.",
+    ],
+  },
+  {
+    version: "0.53.9",
+    date: "2026-08-25",
+    items: [
+      "Write a long, multi-line prompt and your chat stays exactly where it should. Past the `3rd` line break the input box used to creep up and cover the newest messages, so you lost sight of the reply you were answering. Now the thread glides up with every line you add, no matter how long the prompt gets.",
+      "Dropping images and videos into chat now works on `Windows` too. Those attachments were quietly vanishing before they ever reached the model. They land properly now, so you get a real answer instead of silence.",
+    ],
+  },
+  {
     version: "0.53.8",
     date: "2026-08-24",
     items: [

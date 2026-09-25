@@ -1,5 +1,285 @@
 # @kenkaiiii/gg-agent
 
+## 5.64.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.64.1
+
+## 5.64.0
+
+### Patch Changes
+
+- Updated dependencies [4800b0f]
+  - @kenkaiiii/gg-ai@5.64.0
+
+## 5.63.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.63.0
+
+## 5.62.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.62.0
+
+## 5.61.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.61.1
+
+## 5.61.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.61.0
+
+## 5.60.9
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.9
+
+## 5.60.8
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.8
+
+## 5.60.7
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.7
+
+## 5.60.6
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.6
+
+## 5.60.5
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.5
+
+## 5.60.4
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.4
+
+## 5.60.3
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.3
+
+## 5.60.2
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.2
+
+## 5.60.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.1
+
+## 5.60.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.0
+
+## 5.59.4
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.59.4
+
+## 5.59.3
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.59.3
+
+## 5.59.2
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.59.2
+
+## 5.59.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.59.1
+
+## 5.59.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.59.0
+
+## 5.58.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.58.1
+
+## 5.58.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.58.0
+
+## 5.57.2
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.57.2
+
+## 5.57.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.57.1
+
+## 5.57.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.57.0
+
+## 5.56.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.56.1
+
+## 5.56.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.56.0
+
+## 5.55.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.55.1
+
+## 5.55.0
+
+### Patch Changes
+
+- Updated dependencies [7ade77f]
+  - @kenkaiiii/gg-ai@5.55.0
+
+## 5.54.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.54.1
+
+## 5.54.0
+
+### Patch Changes
+
+- Updated dependencies [7ad7339]
+  - @kenkaiiii/gg-ai@5.54.0
+
+## 5.53.3
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.53.3
+
+## 5.53.2
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.53.2
+
+## 5.53.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.53.1
+
+## 5.53.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.53.0
+
+## 5.52.0
+
+### Patch Changes
+
+- Updated dependencies [17ca096]
+  - @kenkaiiii/gg-ai@5.52.0
+
+## 5.51.4
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.51.4
+
+## 5.51.3
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.51.3
+
+## 5.51.2
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.51.2
+
+## 5.51.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.51.1
+
+## 5.51.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.51.0
+
+## 5.50.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.50.0
+
+## 5.49.11
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.49.11
+
+## 5.49.10
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.49.10
+
+## 5.49.9
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.49.9
+
 ## 5.49.8
 
 ### Patch Changes

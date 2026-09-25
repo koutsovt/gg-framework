@@ -138,10 +138,7 @@ export interface CompiledSetup {
 /** A single rejection reason. */
 export interface Rejection {
   readonly rule:
-    | "unbound_parameter"
-    | "discretion_word"
-    | "underspecified_reference"
-    | "missing_invalidation";
+    "unbound_parameter" | "discretion_word" | "underspecified_reference" | "missing_invalidation";
   /** Human-readable message. */
   readonly message: string;
   /** The path/field that caused the rejection. */
@@ -151,5 +148,4 @@ export interface Rejection {
 }
 
 export type CompileResult =
-  | CompiledSetup
-  | { readonly _tag: "Rejected"; readonly rejections: readonly Rejection[] };
+  CompiledSetup | { readonly _tag: "Rejected"; readonly rejections: readonly Rejection[] };

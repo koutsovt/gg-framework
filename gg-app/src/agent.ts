@@ -92,12 +92,7 @@ export type WorkspaceMode = "code" | "chat";
 export type ChatAgentId = "general" | "therapist" | "research";
 
 export type MemoryCategory =
-  | "identity"
-  | "preference"
-  | "project"
-  | "relationship"
-  | "health"
-  | "other";
+  "identity" | "preference" | "project" | "relationship" | "health" | "other";
 
 export interface Memory {
   id: string;
@@ -115,12 +110,7 @@ export interface MemorySnapshot {
 }
 
 export type JiwaCategory =
-  | "identity"
-  | "voice"
-  | "interaction"
-  | "boundaries"
-  | "workflow"
-  | "other";
+  "identity" | "voice" | "interaction" | "boundaries" | "workflow" | "other";
 
 export interface JiwaEntry {
   id: string;
@@ -135,6 +125,18 @@ export interface JiwaSnapshot {
   jiwa: JiwaEntry[];
   softLimit: number;
   hardLimit: number;
+}
+
+/** Title-bar progress only; never substitutes for the agent's verification gate. */
+export interface GitHubCI {
+  key: string;
+  url: string;
+  total: number;
+  completed: number;
+  failed: number;
+  active: boolean;
+  conclusion: "success" | "failure" | "cancelled" | null;
+  stale?: boolean;
 }
 
 export interface AgentState {
@@ -167,6 +169,8 @@ export interface AgentState {
   gitHubPRs?: number | null;
   /** Web URL of the project's GitHub origin repo (title-bar chip links). */
   gitHubRepoUrl?: string | null;
+  /** GitHub Actions for the current commit; null when no runs are available. */
+  gitHubCI?: GitHubCI | null;
   /** Extra workspace roots added with /add-dir. Absent on older sidecars. */
   additionalRoots?: string[];
   /** True when the active model can accept native video input. */
@@ -401,8 +405,7 @@ export async function getSubscriptionUsage(
  * difference via a tooltip. Mirrors the sidecar's PromptSegment.
  */
 export type PromptSegment =
-  | { kind: "text"; text: string }
-  | { kind: "term"; text: string; original: string; note?: string };
+  { kind: "text"; text: string } | { kind: "term"; text: string; original: string; note?: string };
 
 export interface EnhanceResult {
   /** The plain rewritten prompt — exactly what gets sent to the agent. */
@@ -418,7 +421,46 @@ export interface EnhanceResult {
  */
 export async function enhancePrompt(text: string): Promise<EnhanceResult> {
   await waitForReady();
-  return invoke<EnhanceResult>("agent_enhance_prompt", { text });
+  const result = await invoke<unknown>("agent_enhance_prompt", { text });
+  if (
+    result &&
+    typeof result === "object" &&
+    "error" in result &&
+    typeof result.error === "string"
+  ) {
+    throw new Error(result.error);
+  }
+  // IPC types are not runtime validation: an error payload or empty rewrite must
+  // reach the caller's catch, never replace the draft or enter the animation.
+  if (
+    !result ||
+    typeof result !== "object" ||
+    "error" in result ||
+    !("enhanced" in result) ||
+    typeof result.enhanced !== "string" ||
+    !result.enhanced.trim() ||
+    !("segments" in result) ||
+    !Array.isArray(result.segments) ||
+    !result.segments.every(isPromptSegment)
+  ) {
+    throw new Error("Invalid prompt enhancement response");
+  }
+  return { enhanced: result.enhanced, segments: result.segments };
+}
+
+function isPromptSegment(value: unknown): value is PromptSegment {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    "text" in value &&
+    typeof value.text === "string" &&
+    "kind" in value &&
+    (value.kind === "text" ||
+      (value.kind === "term" &&
+        "original" in value &&
+        typeof value.original === "string" &&
+        (!("note" in value) || value.note === undefined || typeof value.note === "string")))
+  );
 }
 
 export async function openUrl(url: string): Promise<void> {
@@ -853,6 +895,26 @@ export async function mcpElicit(
   await invoke("agent_mcp_elicit", { id, action, content: content ?? null });
 }
 
+export type { AskOption, AskQuestion, AskUserPrompt } from "./ask-user";
+export { isAskUserPrompt } from "./ask-user";
+
+/**
+ * Answer (or dismiss) an `ask_user` question band. `answers` maps question id
+ * to the picked value — or values, for a multi-select.
+ *
+ * The tool call, and therefore the whole turn, is blocked until this lands, so
+ * every dismissal path must call it. The sidecar only auto-cancels after a
+ * multi-minute timeout.
+ */
+export async function answerAskUser(
+  id: string,
+  action: "answer" | "cancel",
+  answers?: Record<string, string | string[]>,
+): Promise<void> {
+  await waitForReady();
+  await invoke("agent_ask_user", { id, action, answers: answers ?? null });
+}
+
 /**
  * Disconnect a provider (clear stored credentials). Handled NATIVELY in Rust
  * (removes the provider from ~/.gg/auth.json, including a dual-auth provider's
@@ -927,18 +989,17 @@ export interface QueuedMessage {
 /**
  * Cancel one pending queued message by id.
  *
- * Returns the remaining queue, or null if the call itself failed. A `cancelled:
- * false` from the sidecar is NOT a failure: it means the agent consumed the
- * message between the row rendering and the click landing, so the caller should
- * simply reconcile to the returned list.
+ * Returns the explicit cancellation verdict, or null on transport failure.
+ * Queue state is owned exclusively by ordered sidecar events: the HTTP response
+ * may arrive after newer enqueue/drain events and must never replace their state.
  */
-export async function cancelQueued(id: string): Promise<QueuedMessage[] | null> {
+export async function cancelQueued(id: string): Promise<boolean | null> {
   try {
     const res = await invoke<{ cancelled?: boolean; queued?: QueuedMessage[] }>(
       "agent_cancel_queued",
       { id },
     );
-    return res.queued ?? [];
+    return res.cancelled === true;
   } catch (e) {
     await logError(`agent_cancel_queued failed: ${String(e)}`);
     return null;
@@ -1659,6 +1720,42 @@ export async function startServe(): Promise<void> {
 export async function stopServe(): Promise<void> {
   await waitForReady();
   await invoke("agent_serve_stop");
+}
+
+// ── Agent Steroids (local code corpus) ────────────────────────
+
+export interface SteroidsStatus {
+  installed: boolean;
+  /** Installed, runs, and the corpus holds at least one repo. */
+  connected: boolean;
+  version?: string;
+  repos?: number;
+  documents?: number;
+  path?: string;
+  error?: string;
+}
+
+/** Probe the `steroids` CLI. Never throws — an unreachable sidecar reads as "not installed". */
+export async function getSteroidsStatus(): Promise<SteroidsStatus> {
+  try {
+    return await invoke<SteroidsStatus>("agent_steroids_status");
+  } catch (e) {
+    await logError(`agent_steroids_status failed: ${String(e)}`);
+    return { installed: false, connected: false };
+  }
+}
+
+/** Download + verify + install the `steroids` binary. Throws with a user-facing message. */
+export async function installSteroids(): Promise<SteroidsStatus> {
+  await waitForReady();
+  return await invoke<SteroidsStatus>("agent_steroids_install");
+}
+
+/** Fires after an install completes in ANY window. */
+export function onSteroidsChange(cb: (status: SteroidsStatus) => void): () => void {
+  return subscribe((e) => {
+    if (e.type === "steroids_change") cb(e.data as SteroidsStatus);
+  });
 }
 
 // ── MCP server management (mirrors `ggcoder mcp`) ────────────

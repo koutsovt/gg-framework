@@ -16,6 +16,9 @@ import { Badge } from "./Badge";
  */
 const HIGHLIGHT_TERMS = [
   "MiMo-V2.5-Pro-UltraSpeed",
+  "GPT-6 Astra",
+  "GPT-6 Sol",
+  "GPT-6 Luna",
   "GPT-5.6 Ultra",
   "GPT-5.6",
   "GPT-5.5",
@@ -25,11 +28,12 @@ const HIGHLIGHT_TERMS = [
   "Gemini 3.5 Flash",
   "Gemini 3.1 Pro",
   "Claude Sonnet 5",
+  "Claude Fable 5.1",
   "Claude Fable 5",
   "Sakana Fugu",
   "Fugu Ultra",
   "Radio Paradise",
-  "Kencode search",
+  "Steroids",
   "Prompt Enhancer",
   "Send to GG Coder",
   "Grant Permissions",

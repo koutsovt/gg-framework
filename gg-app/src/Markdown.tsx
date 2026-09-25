@@ -8,10 +8,18 @@ import { openProjectPath, sendPrompt } from "./agent";
 import { codeLanguage, codeNodeText } from "./markdown-prompt";
 import { collapsedCode, shouldCollapseCode, visibleBlockCount } from "./collapse";
 import { marked } from "marked";
+import { rehypeAnimateWords } from "./rehype-animate-words";
+import { useAnimatedHeight } from "./animated-height";
 import "highlight.js/styles/github-dark.css";
 
 interface Props {
   children: string;
+  /**
+   * True while this text is actively streaming in: the trailing block wraps
+   * its words in spans that fade in on mount. Off by default, and dropped
+   * again once the stream settles, so finished prose carries no extra DOM.
+   */
+  animate?: boolean;
 }
 
 function isExternalHref(href: string): boolean {
@@ -183,6 +191,8 @@ function CodeBlock({ children }: { children?: React.ReactNode }): React.ReactEle
   const preRef = useRef<HTMLPreElement>(null);
   const [copied, setCopied] = useState(false);
   const [expanded, setExpanded] = useState(false);
+  const blockRef = useRef<HTMLDivElement>(null);
+  const captureHeight = useAnimatedHeight(blockRef, expanded);
 
   // Raw text drives both the copy fallback and the fold decision. The rendered
   // `children` is the highlighted tree; while folded we deliberately do NOT
@@ -209,7 +219,7 @@ function CodeBlock({ children }: { children?: React.ReactNode }): React.ReactEle
   }, [text]);
 
   return (
-    <div className={`code-block${folded ? " folded" : ""}`}>
+    <div ref={blockRef} className={`code-block${folded ? " folded" : ""}`}>
       <button
         type="button"
         className="code-copy"
@@ -229,7 +239,14 @@ function CodeBlock({ children }: { children?: React.ReactNode }): React.ReactEle
         {folded ? preview : children}
       </pre>
       {collapsible && (
-        <button type="button" className="code-expand" onClick={() => setExpanded(!expanded)}>
+        <button
+          type="button"
+          className="code-expand"
+          onClick={() => {
+            captureHeight();
+            setExpanded(!expanded);
+          }}
+        >
           {folded ? `Show full output (${hiddenLines} more lines)` : "Show less"}
         </button>
       )}
@@ -271,20 +288,25 @@ function isPromptBlockComplete(raw: string): boolean {
   return /`{3,}\s*$/.test(body);
 }
 
+const ANIMATED_PLUGINS = [rehypeHighlight, rehypeAnimateWords];
+const PLUGINS = [rehypeHighlight];
+
 const MemoizedMarkdownBlock = memo(
   function MarkdownBlock({
     content,
     promptReady,
+    animate,
   }: {
     content: string;
     promptReady: boolean;
+    animate: boolean;
   }): React.ReactElement {
     const normalized = content.replace(/\\n/g, "\n").replace(/^\n+|\n+$/g, "");
     return (
       <PromptReadyContext.Provider value={promptReady}>
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
-          rehypePlugins={[rehypeHighlight]}
+          rehypePlugins={animate ? ANIMATED_PLUGINS : PLUGINS}
           components={{ a: ExternalLink, pre: PreBlock }}
         >
           {normalized}
@@ -292,7 +314,10 @@ const MemoizedMarkdownBlock = memo(
       </PromptReadyContext.Provider>
     );
   },
-  (prev, next) => prev.content === next.content && prev.promptReady === next.promptReady,
+  (prev, next) =>
+    prev.content === next.content &&
+    prev.promptReady === next.promptReady &&
+    prev.animate === next.animate,
 );
 
 /**
@@ -304,9 +329,14 @@ const MemoizedMarkdownBlock = memo(
  * paragraph, only that paragraph re-parses — all earlier blocks (finished
  * code blocks, completed paragraphs) hit memo() and bail out.
  */
-export const Markdown = memo(function Markdown({ children }: Props): React.ReactElement {
+export const Markdown = memo(function Markdown({
+  children,
+  animate = false,
+}: Props): React.ReactElement {
   const blocks = useMemo(() => parseMarkdownIntoBlocks(children), [children]);
   const [rowExpanded, setRowExpanded] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const captureHeight = useAnimatedHeight(rootRef, rowExpanded);
   // Oversized content mounts only its leading blocks. Fenced-code folding above
   // handles one huge block; this handles the other shape, hundreds of ordinary
   // blocks in a single row, which no per-block rule would catch.
@@ -314,7 +344,7 @@ export const Markdown = memo(function Markdown({ children }: Props): React.React
   const rowFolded = !rowExpanded && visibleCount < blocks.length;
   const visible = rowFolded ? blocks.slice(0, visibleCount) : blocks;
   return (
-    <div className="markdown">
+    <div ref={rootRef} className="markdown">
       {visible.map((block, index) => (
         // A ```prompt block reveals its "Send to GG Coder" button as soon as ITS
         // own closing fence arrives (per-block), not when the whole reply ends —
@@ -324,10 +354,20 @@ export const Markdown = memo(function Markdown({ children }: Props): React.React
           key={index}
           content={block}
           promptReady={isPromptBlockComplete(block)}
+          // Only the trailing block is still growing, so only it needs word
+          // spans; earlier blocks stay memoized and span-free.
+          animate={animate && index === visible.length - 1}
         />
       ))}
       {rowFolded && (
-        <button type="button" className="code-expand" onClick={() => setRowExpanded(true)}>
+        <button
+          type="button"
+          className="code-expand"
+          onClick={() => {
+            captureHeight();
+            setRowExpanded(true);
+          }}
+        >
           {`Show full output (${blocks.length - visibleCount} more blocks)`}
         </button>
       )}

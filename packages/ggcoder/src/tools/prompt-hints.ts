@@ -11,6 +11,8 @@
  * Cross-tool preferences for those tools live in TOOL_STEERING instead.
  */
 export const TOOL_PROMPT_HINTS: Record<string, string> = {
+  ui_registry: "Inspect public Bklit/Kokonut components, shadcn source and Motion APIs.",
+  ui_adopt: "Plan/adopt Bklit/Kokonut source without overwrites or installs.",
   code_nav:
     "Language-server navigation: `definition`, `references`, `symbols` (file outline), `hover` " +
     "(type/signature). Exact and cross-file, unlike text search.",
@@ -18,23 +20,28 @@ export const TOOL_PROMPT_HINTS: Record<string, string> = {
     "Find the most relevant functions/classes/types for a query via AST chunking + BM25 " +
     "ranking. Returns whole ranked symbol chunks with `file:line → symbol` headers — far fewer " +
     "tokens than reading whole files. TS/JS, Python, Go, Rust, Java, C#.",
-  source_path:
-    "Resolve installed package/repo source via opensrc. Inspect the returned path with read/grep/find/ls before assuming a dependency API.",
+  source_path: "Resolve dependency source via opensrc; inspect it before assuming APIs.",
   web_search:
     "Search the web. Use before web_fetch to find pages; supports include/exclude_domains and a time_range recency filter.",
   web_fetch:
     "Fetch page content as Markdown (or text/html). Pass `urls` to fetch many at once; reads PDFs, follows safe redirects, and prefers a site's /llms.txt for docs.",
-  task_output: "Read new output from a background process by id.",
+  task_output: "Read new output from a background process by id; wait_ms blocks until it exits.",
   task_stop: "Stop a background process by id.",
   screenshot:
-    "Capture a headless-browser PNG of a URL or dev server to visually verify rendered UI; supports waits, click/type actions and viewport size.",
+    "Verify rendered UI with browser screenshots, click/type actions and viewport controls.",
   send_message: "Queue steering into a running child agent without starting another turn.",
   followup_task: "Start another turn in an idle child agent, preserving its context.",
-  wait_agent: "Block until named child agents finish and return their output snapshots.",
+  wait_agent:
+    "Block until named child agents finish and return their snapshots; child agents " +
+    "only (background: task_output wait_ms).",
   list_agents: "List child agent IDs, states, turns and token totals.",
   interrupt_agent: "Interrupt a child agent's current turn, keeping its context for a follow-up.",
   tasks:
     "Manage the project task list. Never proactively — only on explicit request, or at a slash-command's task-handoff step.",
+  ask_user:
+    "Any question ending a reply — blocker or optional next step — goes here as clickable " +
+    "options, never prose. Plain words; mark your pick `recommended`. A click sends only that " +
+    "option, so each must be a complete instruction, not one asking them to specify.",
   enter_plan:
     "Enter read-only plan mode for complex/risky tasks before implementation; draft a plan under .gg/plans/.",
   exit_plan: "Submit a .gg/plans/ markdown plan for user approval and leave plan mode.",
@@ -46,13 +53,9 @@ export const TOOL_PROMPT_HINTS: Record<string, string> = {
     "Matches become callable on your next step. Check the catalog BEFORE concluding you " +
     "lack a capability.",
   generate_image:
-    "Generate or edit images via OpenAI's gpt-image-2. Only when the user explicitly asks — never proactively. Pass `image` to edit an existing file.",
-  "mcp__kencode-search__referenceSources":
-    "Get curated, categorized reference repos for examples, inspiration, architecture, UI, agents, SaaS, workflows, and domain patterns. Repo-only starting points; fetch docs/source, then verify code with searchCode.",
-  "mcp__kencode-search__discoverRepos":
-    "Search GitHub repos live by keyword/language/topic/stars/recency. Use for current/top repos or long-tail discovery; returns metadata, not snippets. Follow with docs/source and searchCode.",
-  "mcp__kencode-search__searchCode":
-    "Verify public GitHub code by literal text or RE2 regex; NOT semantic. Put code/import/API tokens in `query`; `path` is a literal file-path substring, not a concept. Start broad/peek, then narrow by repo/path. RE2 multi-line needs `(?s)`.",
+    "OpenAI image generation/editing: only on explicit user request, never proactively. Pass `image` to edit.",
+  steroids:
+    "Local corpus of real, current open-source repos. `search` (regex, NOT semantic) for how projects do X, `define` for where a symbol lives, `show` to read the file. Topic not covered = corpus gap: run `discover`, don't retry variants.",
 };
 
 /**
@@ -105,6 +108,7 @@ export function buildToolSteering(activeTools: readonly string[]): string {
  * would otherwise cost the agent a capability with no signal at all.
  */
 export const BUILTIN_TOOL_NAMES: readonly string[] = [
+  "ask_user",
   "bash",
   "code_nav",
   "code_search",
@@ -124,12 +128,15 @@ export const BUILTIN_TOOL_NAMES: readonly string[] = [
   "skill",
   "source_path",
   "spawn_agent",
+  "steroids",
   "subagent",
   "task_output",
   "task_send",
   "task_stop",
   "tasks",
   "tool_search",
+  "ui_registry",
+  "ui_adopt",
   "wait_agent",
   "web_fetch",
   "web_search",
@@ -156,7 +163,5 @@ export const DEFAULT_TOOL_NAMES: readonly string[] = [
   "subagent",
   "skill",
   "generate_image",
-  "mcp__kencode-search__referenceSources",
-  "mcp__kencode-search__discoverRepos",
-  "mcp__kencode-search__searchCode",
+  "steroids",
 ];

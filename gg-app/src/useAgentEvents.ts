@@ -13,6 +13,7 @@ import {
   type QueuedMessage,
   type SlashCommand,
 } from "./agent";
+import { isAskUserPrompt } from "./ask-user";
 import { formatTokenCount } from "./ActivityBar";
 import { type LiveToolEntry, LIVE_TOOL_PANEL_ROWS } from "./LiveToolPanel";
 import { type SubAgentLine } from "./SubAgentFeed";
@@ -75,45 +76,6 @@ function formatElapsed(ms: number): string {
   return r > 0 ? `${m}m ${r}s` : `${m}m`;
 }
 
-// Port of packages/ggcoder/src/ui/duration-summary.ts, adapted to the sidecar's
-// underscore tool names. Picks a contextual done-verb from which tools ran.
-function pickDoneVerb(toolsUsed: ReadonlySet<string>): string {
-  const has = (name: string): boolean => toolsUsed.has(name);
-  const writing = has("edit") || has("write");
-  const reading = has("read") || has("grep") || has("find") || has("ls");
-
-  if (has("subagent") && writing) return "Orchestrated changes in";
-  if (has("subagent")) return "Delegated work in";
-  if (has("web_fetch") && writing) return "Researched & coded in";
-  if (has("web_fetch") && reading) return "Researched in";
-  if (has("web_fetch")) return "Fetched the web in";
-  if (has("bash") && writing) return "Built & ran in";
-  if (has("edit") && has("write")) return "Crafted code in";
-  if (has("edit") && has("bash")) return "Refactored & tested in";
-  if (has("edit")) return "Refactored in";
-  if (has("write") && has("bash")) return "Wrote & ran in";
-  if (has("write")) return "Wrote code in";
-  if (has("bash") && has("grep")) return "Hacked away in";
-  if (has("bash") && reading) return "Ran & investigated in";
-  if (has("bash")) return "Executed commands in";
-  if (has("grep") && has("read")) return "Investigated in";
-  if (has("grep") && has("find")) return "Scoured the codebase in";
-  if (has("grep")) return "Searched in";
-  if (has("read") && has("find")) return "Explored in";
-  if (has("read")) return "Studied the code in";
-  if (has("find") || has("ls")) return "Browsed files in";
-
-  const phrases = [
-    "Brewed up a response in",
-    "Cooked up an answer in",
-    "Worked out a reply in",
-    "Conjured a response in",
-    "Pondered for",
-    "Reasoned for",
-  ];
-  return phrases[Math.floor(Math.random() * phrases.length)] ?? "Worked in";
-}
-
 /**
  * App-owned state + cross-cutting refs the build-event handler closes over.
  * App keeps owning these (its render and other handlers also use them); the hook
@@ -127,6 +89,8 @@ export interface AgentEventsDeps {
   handleKenEvent: (e: SidecarEvent) => boolean;
   /** Autopilot event delegate — consulted first; autopilot events early-return. */
   handleAutopilotEvent: (e: SidecarEvent) => boolean;
+  /** Whole-task status sees events before delegates consume their frames. */
+  handleActivityEvent?: (e: SidecarEvent) => void;
 
   setState: Dispatch<SetStateAction<AgentState | null>>;
   setTasks: Dispatch<SetStateAction<BackgroundTask[]>>;
@@ -173,6 +137,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
     nextId,
     handleKenEvent,
     handleAutopilotEvent,
+    handleActivityEvent,
     setState,
     setTasks,
     setProjectTasks,
@@ -213,6 +178,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
   // that ack arrives, and clearing the flag is one-way, so this gates the clear
   // to messages we know really entered the queue.
   const ackedQueueTextsRef = useRef<Map<string, number>>(new Map());
+  const queueSnapshotRef = useRef<QueuedMessage[]>([]);
   const subagentGroupIdRef = useRef<number | null>(null);
   const subagentGroupByAgentRef = useRef<Map<string, number>>(new Map());
   // subagent_state snapshots arrive per tool/turn event PER AGENT — with
@@ -230,7 +196,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
   // flip the same row from shimmer → summary instead of pushing a new line.
   const compactionIdRef = useRef<number | null>(null);
   const runStartRef = useRef<number>(0);
-  const toolsUsedRef = useRef<Set<string>>(new Set());
+
   const tokensRef = useRef<number>(0);
   // Accumulated assistant text this run, for detecting [DONE:n] plan-step
   // markers that may split across deltas.
@@ -366,8 +332,17 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
   }, [setItems]);
 
   const pushItem = useCallback(
-    (item: Item) => {
-      setItems((prev) => [...prev, item]);
+    (item: Item, opts?: { skipIfSameAsLast?: boolean }) => {
+      setItems((prev) => {
+        if (opts?.skipIfSameAsLast) {
+          const last = prev[prev.length - 1];
+          if (last && last.kind === item.kind && last.kind === "hook" && item.kind === "hook") {
+            if (last.hook === item.hook && last.verificationReason === item.verificationReason)
+              return prev;
+          }
+        }
+        return [...prev, item];
+      });
     },
     [setItems],
   );
@@ -541,6 +516,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
 
   const handleEvent = useCallback(
     (e: SidecarEvent) => {
+      handleActivityEvent?.(e);
       // Ken (mentor) events are owned by the useKenMentor hook; delegate and
       // early-return so they never touch the build-session handling below.
       if (handleKenEvent(e)) return;
@@ -569,7 +545,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           subagentGroupIdRef.current = null;
           compactionIdRef.current = null;
           runStartRef.current = Date.now();
-          toolsUsedRef.current = new Set();
+
           tokensRef.current = 0;
           assistantTextRef.current = "";
           // Arming is per-run state on the sidecar; start every run streaming
@@ -650,7 +626,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           const toolCallId = String(d.toolCallId ?? "");
           const name = String(d.name ?? "tool");
           const args = (d.args as Record<string, unknown>) ?? {};
-          toolsUsedRef.current.add(name);
+
           // Tools live ONLY in the pinned panel, never in the transcript. Keep a
           // bounded tail so memory stays flat across long sessions; the panel
           // itself renders just the last LIVE_TOOL_PANEL_ROWS.
@@ -740,8 +716,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           const groupId = subagentGroupIdRef.current;
           if (groupId !== null) {
             const endDetails = details as
-              | { durationMs?: number; tokenUsage?: SubAgentLine["tokenUsage"] }
-              | undefined;
+              { durationMs?: number; tokenUsage?: SubAgentLine["tokenUsage"] } | undefined;
             const durationMs = endDetails?.durationMs;
             const finalTokens = endDetails?.tokenUsage;
             setItems((prev) =>
@@ -905,8 +880,22 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           finalizeThinking();
           // The queue drained into this run — un-dim any messages that were
           // waiting, since the agent has now consumed them.
+          //
+          // A question band closes ONLY on a cancelled run, which is the case
+          // the sidecar answers with `asks.cancelAll()`. A plain run_end must
+          // leave it live: autopilot emits one per injected round while the
+          // parked tool call is still waiting, so closing here would kill a
+          // question the user can still answer and strand the agent until it
+          // timed out ten minutes later.
+          const runCancelled = d.cancelled === true;
           setItems((prev) =>
-            prev.map((it) => (it.kind === "user" && it.queued ? { ...it, queued: false } : it)),
+            prev.map((it) => {
+              if (it.kind === "user" && it.queued) return { ...it, queued: false };
+              if (runCancelled && it.kind === "ask" && !it.sent && !it.cancelled) {
+                return { ...it, cancelled: true };
+              }
+              return it;
+            }),
           );
           // Exit the tool panel (mirrors ggcoder).
           setLiveToolFeed([]);
@@ -937,7 +926,12 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
             setStatus("cancelled");
           } else {
             const elapsedMs = runStartRef.current ? Date.now() - runStartRef.current : 0;
-            const verb = pickDoneVerb(toolsUsedRef.current);
+            const verb =
+              d.unverified === true
+                ? "Unverified"
+                : d.failed === true
+                  ? "Task failed after"
+                  : "Response ready in";
             const parts = [`${verb} ${formatElapsed(elapsedMs)}`];
             if (tokensRef.current > 0) {
               parts.push(`\u2193 ${formatTokenCount(tokensRef.current)} tokens`);
@@ -949,13 +943,13 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
               Array.from({ length: planTotalRef.current }, (_, i) => i + 1).every((step) =>
                 planDoneRef.current.has(step),
               );
-            if (completedPlan) {
+            if (completedPlan && d.unverified !== true) {
               planTotalRef.current = 0;
               planDoneRef.current = new Set();
               setPlanTotal(0);
               setPlanDone(new Set());
             }
-            playSound("done");
+            if (d.unverified !== true) playSound("done");
             // A run may have created/removed `.gg/commands/*.md` (e.g.
             // /setup-commit writing commit.md). Refresh so the top-right
             // commit button flips /setup-commit → /commit without a restart.
@@ -989,6 +983,13 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
         case "plan_enter":
           setState((s) => (s ? { ...s, planMode: true } : s));
           pushItem({ kind: "plan", id: nextId(), reason: String(d.reason ?? "") });
+          break;
+        case "ask_user":
+          // The agent's turn is parked on this question until App POSTs the
+          // answers back (or the run ends and `run_end` closes the band). A
+          // malformed frame is dropped rather than rendered as an empty band
+          // the user could never answer.
+          if (isAskUserPrompt(d)) pushItem({ kind: "ask", id: nextId(), prompt: d });
           break;
         case "plan_progress": {
           // The sidecar reads the live approved-plan file, so this snapshot
@@ -1045,7 +1046,12 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           planReviewContentRef.current = null;
           setPlanReview(null);
           endStreamingText();
-          pushItem({ kind: "autopilot", id: nextId(), phase: "plan_approved" });
+          pushItem({
+            kind: "autopilot",
+            id: nextId(),
+            phase: "plan_approved",
+            reason: typeof d.reason === "string" ? d.reason : undefined,
+          });
           break;
         case "autopilot_prompted":
           // Autopilot-only plan revision path: Ken rejected/refined the plan and
@@ -1078,6 +1084,14 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           // row can offer an individual cancel.
           const list = Array.isArray(d.messages) ? (d.messages as QueuedMessage[]) : [];
           setQueuedMessages(list);
+          const previousQueue = queueSnapshotRef.current;
+          const cancelled = previousQueue.find((m) => m.id === d.cancelledId);
+          const cancelledIndex = cancelled
+            ? previousQueue
+                .filter((m) => m.text === cancelled.text)
+                .findIndex((m) => m.id === cancelled.id)
+            : -1;
+          queueSnapshotRef.current = list;
           // This event also fires when the agent CONSUMES queued steering at a
           // turn boundary (the sidecar re-broadcasts `queue_drained` here), so
           // drop the pending affordance from bubbles that have left the queue.
@@ -1102,6 +1116,15 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           }
 
           setItems((prev) => {
+            // Remove only a server-confirmed cancellation, before counting drains.
+            // Match its ordinal in the previous queue so duplicate text is safe.
+            if (cancelled && cancelledIndex >= 0) {
+              let index = 0;
+              prev = prev.filter((it) => {
+                if (it.kind !== "user" || !it.queued || it.text !== cancelled.text) return true;
+                return index++ !== cancelledIndex;
+              });
+            }
             // How many queued bubbles exist per text, so the number the agent has
             // taken is (bubbles - still pending).
             const bubbleCount = new Map<string, number>();
@@ -1132,6 +1155,12 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           schedulePromotionEnd();
           break;
         }
+        case "diagnostics": {
+          // Raw post-edit feedback belongs to the agent, not the conversation.
+          // The session still delivers it to the model and enforces verification;
+          // don't add chat rows, split streamed answers, or release held drafts.
+          break;
+        }
         case "hook_armed": {
           // Pre-final hooks hold text back; other hooks are mid-loop.
           const armedKind = String(d.kind ?? "ideal");
@@ -1160,7 +1189,23 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
               releaseHeldText();
               endStreamingText();
             }
-            pushItem({ kind: "hook", id: nextId(), hook: kind });
+            // One review can inject several times (the read-coverage retries
+            // and their escalation), and each injection announces itself so the
+            // draft it supersedes is discarded. The DISCARD must happen every
+            // time; the notice is the same sentence, so stacking identical
+            // copies just tells the user the same thing four times.
+            pushItem(
+              {
+                kind: "hook",
+                id: nextId(),
+                hook: kind,
+                ...(kind === "verification" &&
+                (d.verificationReason === "recheck" || d.verificationReason === "check_review")
+                  ? { verificationReason: d.verificationReason }
+                  : {}),
+              },
+              { skipIfSameAsLast: true },
+            );
           }
           break;
         }
@@ -1172,6 +1217,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           // The transcript is going away, so acked queue texts from the old
           // session must not gate clears in the new one.
           ackedQueueTextsRef.current.clear();
+          queueSnapshotRef.current = [];
           armedHooksRef.current.clear();
           heldTextRef.current = "";
           stickToBottomRef.current = true;
@@ -1239,6 +1285,8 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
                     d.gitHubRepoUrl !== undefined
                       ? (d.gitHubRepoUrl as string | null)
                       : s.gitHubRepoUrl,
+                  gitHubCI:
+                    d.gitHubCI !== undefined ? (d.gitHubCI as AgentState["gitHubCI"]) : s.gitHubCI,
                   additionalRoots: (d.additionalRoots as string[] | undefined) ?? s.additionalRoots,
                 }
               : s,
@@ -1253,6 +1301,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
     [
       handleKenEvent,
       handleAutopilotEvent,
+      handleActivityEvent,
       appendAssistant,
       pushItem,
       finalizeThinking,

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import type OpenAI from "openai";
 import type { Provider, ThinkingLevel } from "../types.js";
 import { ProviderError } from "../errors.js";
@@ -387,6 +388,42 @@ describe("streamOpenAI request shaping", () => {
       /* consume */
     }
     expect(createMock.mock.calls[0]?.[0]).toMatchObject({ thinking: { type: "disabled" } });
+  });
+
+  it("sends strict:true tools to openai but not to other OpenAI-compatible providers", async () => {
+    const tools = [
+      {
+        name: "read",
+        description: "read",
+        parameters: z.object({ path: z.string(), offset: z.number().optional() }),
+      },
+    ];
+    for (const provider of ["openai", "deepseek"] as const) {
+      createMock.mockReset();
+      createMock.mockResolvedValueOnce(createStreamingResult(""));
+      const result = streamOpenAI({
+        provider,
+        model: "test-model",
+        messages: [{ role: "user", content: "hi" }],
+        apiKey: "k",
+        tools,
+      });
+      for await (const _event of result) {
+        /* consume */
+      }
+      const request = createMock.mock.calls[0]?.[0] as OpenAI.ChatCompletionCreateParamsStreaming;
+      const tool = request.tools?.[0];
+      if (tool?.type !== "function") throw new Error("Expected a function tool");
+      const wire = tool.function;
+      if (provider === "openai") {
+        expect(wire.strict).toBe(true);
+        expect(wire.parameters).toHaveProperty("required", ["path", "offset"]);
+        expect(wire.parameters).toHaveProperty("additionalProperties", false);
+      } else {
+        expect(wire.strict).toBeUndefined();
+        expect(wire.parameters).toHaveProperty("required", ["path"]);
+      }
+    }
   });
 });
 

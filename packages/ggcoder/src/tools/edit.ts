@@ -4,6 +4,7 @@ import type { AgentTool } from "@kenkaiiii/gg-agent";
 import { resolvePath, rejectSymlink } from "./path-utils.js";
 import {
   fuzzyFindText,
+  normalizeForFuzzyMatch,
   countOccurrences,
   generateDiff,
   findClosestSnippet,
@@ -18,6 +19,7 @@ import { resolveAnchoredEdit } from "../core/hashline.js";
 import { isPlanModeActive, planModeRestriction } from "../core/runtime-mode.js";
 import type { EditSource } from "../core/lsp/edit-telemetry.js";
 import { resolveWriteGuard, type WriteGuardSettings } from "../core/workspace-guard.js";
+import { redactedOldTextHint, redactionLossError } from "./redaction-guard.js";
 
 type MutationCallback = (filePath: string) => void | Promise<void>;
 
@@ -163,19 +165,22 @@ type MatchResult = MatchSuccess | MatchFailure;
 function tryMatch(working: string, old: string, next: string, replaceAll: boolean): MatchResult {
   if (old.length === 0) return { ok: false, reason: "not_found" };
 
-  const occurrences = countOccurrences(working, old);
+  const occurrences = countOccurrences(working, old, !replaceAll);
 
   if (replaceAll && occurrences > 0) {
-    let newWorking = working;
-    let replaced = 0;
-    while (replaced < occurrences) {
-      const match = fuzzyFindText(newWorking, old);
-      if (!match.found) break;
-      newWorking =
-        newWorking.slice(0, match.index) + next + newWorking.slice(match.index + match.matchLength);
-      replaced++;
+    const parts: string[] = [];
+    let cursor = 0;
+    // Search only untouched input: replacements can contain old_text or create
+    // new matches at their boundaries, neither of which belongs to this edit.
+    for (let replaced = 0; replaced < occurrences; replaced++) {
+      const match = fuzzyFindText(working.slice(cursor), old);
+      if (!match.found || match.matchLength === 0) return { ok: false, reason: "not_found" };
+      const start = cursor + match.index;
+      parts.push(working.slice(cursor, start), next);
+      cursor = start + match.matchLength;
     }
-    return replaced === occurrences ? { ok: true, newWorking } : { ok: false, reason: "not_found" };
+    parts.push(working.slice(cursor));
+    return { ok: true, newWorking: parts.join("") };
   }
 
   if (occurrences === 0) return { ok: false, reason: "not_found" };
@@ -193,7 +198,12 @@ function tryMatch(working: string, old: string, next: string, replaceAll: boolea
 
 type FailureKind =
   | { reason: "noop" }
-  | { reason: "not_found"; closestSnippet: string | null; closestLine: number | null }
+  | {
+      reason: "not_found";
+      closestSnippet: string | null;
+      closestLine: number | null;
+      redactedHint: string;
+    }
   | { reason: "ambiguous"; occurrences: number; matchLines: string; more: string }
   | { reason: "stale_anchor" }
   | { reason: "invalid"; detail: string }
@@ -367,6 +377,20 @@ export function createEditTool(
           continue;
         }
 
+        if (
+          normalizedOld.length === 0 ||
+          (!working.includes(normalizedOld) && normalizeForFuzzyMatch(normalizedOld).length === 0)
+        ) {
+          outcomes[i] = {
+            ok: false,
+            failure: {
+              reason: "invalid",
+              detail: "old_text is empty after normalization; provide visible surrounding context.",
+            },
+          };
+          continue;
+        }
+
         // Aider's full fallback ladder, run only when the primary match
         // returns "not_found". Ambiguous matches deliberately don't fall
         // through — the model needs to add context, not paraphrase further.
@@ -407,6 +431,17 @@ export function createEditTool(
         }
 
         if (!result.ok && result.reason === "not_found") {
+          if (replaceAll && /^[ \t]*\.\.\.[ \t]*$/m.test(normalizedOld)) {
+            outcomes[i] = {
+              ok: false,
+              failure: {
+                reason: "invalid",
+                detail:
+                  "replace_all does not support ... elision; use complete matching text or separate uniquely anchored edits.",
+              },
+            };
+            continue;
+          }
           const elided = applyDotdotdots(working, normalizedOld, normalizedNew);
           if (elided !== null) {
             result = { ok: true, newWorking: elided };
@@ -431,6 +466,7 @@ export function createEditTool(
               reason: "not_found",
               closestSnippet: closest?.snippet ?? null,
               closestLine: closest?.topLine ?? null,
+              redactedHint: redactedOldTextHint(normalizedOld),
             },
           };
         } else {
@@ -486,7 +522,8 @@ export function createEditTool(
           `old_text not found in ${fileName}. ` +
           "Text must match verbatim — do not paraphrase. " +
           "Fix this edit's old_text to match the file exactly (re-read the region below if unsure); " +
-          "the file is unchanged, so successful edits and prior reads are still valid.";
+          "the file is unchanged, so successful edits and prior reads are still valid." +
+          f.redactedHint;
         // Build a bounded read suggestion around the closest-match line so the
         // model can re-read just that region (e.g. ±25 lines) instead of the
         // whole file. Skipped when willPersistSuccesses — see comment above.
@@ -525,6 +562,10 @@ export function createEditTool(
               : "";
         throw new Error(header + formatFailures());
       }
+
+      // Never replace real secrets with the placeholder the model was shown.
+      const lossError = redactionLossError(originalNormalized, working, fileName);
+      if (lossError) throw new Error(lossError);
 
       const relPath = path.relative(cwd, resolved);
       const diff = generateDiff(originalNormalized, working, relPath);

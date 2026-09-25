@@ -145,6 +145,26 @@ describe("AuthStorage — shared-file concurrency", () => {
     expect(refreshOpenAIToken).not.toHaveBeenCalled();
   });
 
+  it("detects a rotated token when replacement size and mtime match the cached file", async () => {
+    const sidecar = await makeStorage();
+    const timestamp = new Date("2026-01-01T00:00:00Z");
+    await sidecar.setCredentials("openai", oauthCreds("token-a"));
+    await fs.utimes(sidecar.path, timestamp, timestamp);
+    await sidecar.load();
+    const before = await fs.stat(sidecar.path);
+    expect((await sidecar.resolveCredentials("openai")).accessToken).toBe("token-a");
+
+    await new AuthStorage(sidecar.path).setCredentials("openai", oauthCreds("token-b"));
+    await fs.utimes(sidecar.path, timestamp, timestamp);
+    const after = await fs.stat(sidecar.path);
+    expect(after.size).toBe(before.size);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+    expect(after.ino).not.toBe(before.ino);
+
+    expect((await sidecar.resolveCredentials("openai")).accessToken).toBe("token-b");
+    expect(refreshOpenAIToken).not.toHaveBeenCalled();
+  });
+
   it("adopts a sibling's token on 401 instead of minting one that revokes theirs", async () => {
     const filePath = await tempAuthFile();
     tmpFiles.push(filePath);
@@ -290,7 +310,7 @@ describe("AuthStorage — Xiaomi dual credential (Token Plan vs. API Credits)", 
   });
 
   it("resolveCredentials prefers the first storageKey, falling back to the next when only that's configured", async () => {
-    // Mirrors mimo-v2.5-pro: prefer Token Plan ("xiaomi"), fall back to
+    // Mirrors mimo-v2.6-pro: prefer Token Plan ("xiaomi"), fall back to
     // API Credits when only that's configured.
     const tokenPlanOnly = await makeStorage();
     await tokenPlanOnly.setCredentials("xiaomi", {

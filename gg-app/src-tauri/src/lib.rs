@@ -1198,6 +1198,33 @@ async fn agent_mcp_elicit(
         .map_err(|e| e.to_string())
 }
 
+/// Proxy: answer an `ask_user` question band.
+///
+/// `action` is `answer` | `cancel`; `answers` maps each question id to the
+/// picked value (or values, for a multi-select). The turn is blocked on this,
+/// so the webview must call it on every dismissal path too.
+#[tauri::command]
+async fn agent_ask_user(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+    id: String,
+    action: String,
+    answers: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    let gg_sid = session_for(&webview).ok_or("session not ready")?;
+    let res = client
+        .post(format!("{}/ask/{}", sidecar_base(port), urlencoding(&id)))
+        .header("x-gg-session", &gg_sid)
+        .json(&serde_json::json!({ "action": action, "answers": answers }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    res.json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Proxy: disconnect a provider (clear its stored credentials).
 #[tauri::command]
 async fn agent_auth_logout(
@@ -1648,9 +1675,19 @@ async fn agent_enhance_prompt(
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    res.json::<serde_json::Value>()
+    let status = res.status();
+    let body = res
+        .json::<serde_json::Value>()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Couldn't enhance the prompt. Your original draft has been kept.")
+            .to_owned());
+    }
+    Ok(body)
 }
 
 /// Proxy: cycle the reasoning/thinking level to the next supported value.
@@ -2153,7 +2190,7 @@ const AUTH_PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta {
         value: "anthropic",
         label: "Anthropic",
-        description: "Claude Fable 5, Opus 5, Sonnet 5, Haiku 4.5",
+        description: "Claude Fable 5.1, Opus 5.5, Sonnet 5, Haiku 4.5",
         methods: &["oauth"],
         oauth_key: None,
         oauth_label: None,
@@ -2165,7 +2202,7 @@ const AUTH_PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta {
         value: "openai",
         label: "OpenAI",
-        description: "GPT-5.6 Sol, GPT-5.6 Terra, GPT-5.6 Luna, GPT-5.5",
+        description: "GPT-6 Astra, GPT-6 Sol, GPT-6 Luna",
         methods: &["oauth"],
         oauth_key: None,
         oauth_label: None,
@@ -2243,7 +2280,7 @@ const AUTH_PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta {
         value: "glm",
         label: "Z.AI (GLM)",
-        description: "GLM-5.3",
+        description: "GLM-5.3, GLM-5.3-Flash",
         methods: &["apikey"],
         oauth_key: None,
         oauth_label: None,
@@ -2315,7 +2352,7 @@ const AUTH_PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta {
         value: "openrouter",
         label: "OpenRouter",
-        description: "Multi-provider gateway",
+        description: "Qwen3.6-Plus · multi-provider gateway",
         methods: &["apikey"],
         oauth_key: None,
         oauth_label: None,
@@ -3026,6 +3063,55 @@ async fn agent_serve_stop(
     res.json::<serde_json::Value>()
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Proxy: Agent Steroids status (`{ installed, connected, version?, repos?, … }`).
+#[tauri::command]
+async fn agent_steroids_status(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    let gg_sid = session_for(&webview).ok_or("session not ready")?;
+    let res = client
+        .get(format!("{}/steroids", sidecar_base(port)))
+        .header("x-gg-session", &gg_sid)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    res.json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Proxy: download + verify + install the `steroids` binary. Returns the
+/// post-install status or the sidecar's error text.
+#[tauri::command]
+async fn agent_steroids_install(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    let gg_sid = session_for(&webview).ok_or("session not ready")?;
+    let res = client
+        .post(format!("{}/steroids/install", sidecar_base(port)))
+        .header("x-gg-session", &gg_sid)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = res.status();
+    let body = res
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let msg = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("failed to install Steroids");
+        return Err(msg.to_string());
+    }
+    Ok(body)
 }
 
 /// Proxy: list MCP servers with live connection status (`{ servers: […] }`).
@@ -4205,6 +4291,13 @@ fn start_event_bridge(app: tauri::AppHandle, label: String, port: u16, session_i
                                     if let Ok(value) =
                                         serde_json::from_str::<serde_json::Value>(payload)
                                     {
+                                        let state: State<Windows> = app.state();
+                                        let map = state.map.lock().unwrap();
+                                        if map.get(&label).and_then(|w| w.session_id.as_deref())
+                                            != Some(session_id.as_str())
+                                        {
+                                            return;
+                                        }
                                         let _ = app.emit_to(
                                             EventTarget::webview_window(label.clone()),
                                             "agent-event",
@@ -4220,6 +4313,22 @@ fn start_event_bridge(app: tauri::AppHandle, label: String, port: u16, session_i
                 Err(e) => {
                     log::error!("failed to connect to event stream: {e}");
                 }
+            }
+            // Do not leave a stale working/success label while the stream is down,
+            // and never deliver an old session's disconnect to its replacement.
+            {
+                let state: State<Windows> = app.state();
+                let map = state.map.lock().unwrap();
+                if map.get(&label).and_then(|w| w.session_id.as_deref())
+                    != Some(session_id.as_str())
+                {
+                    return;
+                }
+                let _ = app.emit_to(
+                    EventTarget::webview_window(label.clone()),
+                    "agent-event",
+                    serde_json::json!({ "type": "connection_lost", "data": {} }),
+                );
             }
             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         }
@@ -4271,7 +4380,7 @@ fn pick_node(env_override: Option<String>, is_dev: bool, exe_dir: Option<&Path>)
 /// Resolve the built sidecar JS.
 ///
 /// Dev (debug build, or `GG_SIDECAR_PATH` set): use `GG_SIDECAR_PATH`, else the
-/// workspace Error Mom wrapper relative to this crate.
+/// workspace `dist/app-sidecar.js` relative to this crate.
 ///
 /// Bundled (release): resolve the single-file ESM sidecar shipped under
 /// `bundle.resources` via the Tauri resource directory.
@@ -4290,15 +4399,14 @@ fn resolve_sidecar(app: &tauri::AppHandle) -> PathBuf {
     )
 }
 
-/// Path to the workspace dev sidecar wrapper, relative to this crate. The
-/// wrapper initializes Error Mom before importing ggcoder's built sidecar.
+/// Path to the workspace dev sidecar, relative to this crate.
 fn workspace_sidecar() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/error-mom-sidecar.mjs")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packages/ggcoder/dist/app-sidecar.js")
 }
 
 /// Pure sidecar-path decision (testable without an AppHandle).
 /// - `env_override` (GG_SIDECAR_PATH) always wins.
-/// - dev build → workspace Error Mom sidecar wrapper.
+/// - dev build → workspace `dist/app-sidecar.js`.
 /// - bundled → the resolved bundle resource, falling back to the workspace path.
 fn pick_sidecar(env_override: Option<String>, is_dev: bool, resource: Option<&Path>) -> PathBuf {
     if let Some(p) = env_override {
@@ -4504,7 +4612,6 @@ fn spawn_daemon(app: tauri::AppHandle, is_respawn: bool) {
         // GG_APP_LISTENING handshake.
         .env("GG_APP_PORT", "0")
         .env("GG_APP_TOKEN", &app.state::<Daemon>().token)
-        .env("ERROR_MOM_RELEASE", env!("CARGO_PKG_VERSION"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -4945,8 +5052,27 @@ fn restore_or_default_windows(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Install the process-wide rustls crypto provider.
+///
+/// reqwest 0.13 is compiled with `rustls-no-provider` (tauri-plugin-updater
+/// asks for it, and cargo unifies features across the one shared build), and in
+/// that mode `ClientBuilder::build()` PANICS rather than returning an error if
+/// no provider has been installed. `unwrap_or_else` cannot catch that, so a
+/// missing provider takes the whole app down at startup.
+///
+/// The updater installs `ring` lazily, but only when it first checks for an
+/// update — far too late for the client built below. `ring` here matches what
+/// it would install, so whichever runs first the process agrees with itself.
+fn install_rustls_provider() {
+    // Fails only if a provider is already installed, which is the outcome we
+    // want anyway — so the result is deliberately ignored.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_rustls_provider();
+
     // Per-launch daemon auth token (see `Daemon::token`). The shared reqwest
     // client attaches it as a default header so all ~60 proxy call sites are
     // authenticated without per-site changes.
@@ -5020,6 +5146,7 @@ pub fn run() {
             agent_auth_oauth_start,
             agent_auth_oauth_code,
             agent_mcp_elicit,
+            agent_ask_user,
             agent_auth_logout,
             agent_kill_task,
             agent_import_transcript,
@@ -5069,6 +5196,8 @@ pub fn run() {
             agent_serve_status,
             agent_serve_start,
             agent_serve_stop,
+            agent_steroids_status,
+            agent_steroids_install,
             agent_mcp_list,
             agent_mcp_add,
             agent_mcp_remove,
@@ -5277,6 +5406,23 @@ fn refresh_live_sessions(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guards the startup crash from the reqwest 0.13 bump: the shared client is
+    /// built before anything else in `run()`, and without a rustls provider that
+    /// build PANICS, so the packaged app died on launch with no error of its
+    /// own. Asserting `build()` succeeds after `install_rustls_provider` catches
+    /// a provider that stops covering the feature set reqwest is compiled with.
+    ///
+    /// It cannot see the CALL being dropped from `run()` — that ordering is only
+    /// observable by launching the app, which is the Windows packaged smoke's job.
+    #[test]
+    fn shared_http_client_builds_after_provider_install() {
+        install_rustls_provider();
+        assert!(
+            reqwest::Client::builder().build().is_ok(),
+            "shared client must build once the rustls provider is installed",
+        );
+    }
 
     #[test]
     fn cancel_response_accepts_acknowledged_success() {
@@ -5899,13 +6045,13 @@ mod tests {
 
     #[test]
     fn orphan_descendant_tree_is_collected() {
-        // sidecar(500, orphaned) → npm exec(501) → node kencode-search(502).
+        // sidecar(500, orphaned) → npm exec(501) → node some-mcp-server(502).
         // Children still linked to the in-snapshot dead sidecar are caught by
         // the descendant walk regardless of their names.
         let snap = vec![
             proc(500, 1, "node app-sidecar.js"),
-            proc(501, 500, "npm exec @kenkaiiii/kencode-search"),
-            proc(502, 501, "node kencode-search"),
+            proc(501, 500, "npm exec @scope/some-mcp-server"),
+            proc(502, 501, "node some-mcp-server"),
         ];
         let ks = orphan_killset(&snap, 100, &no_ledger());
         assert!(ks.contains(&500));
@@ -6007,7 +6153,7 @@ mod tests {
         // Real PowerShell CIM output: pid|ppid|CommandLine.
         let raw = "4|0|\n\
                    5204|5200|C:\\Program Files\\nodejs\\node.exe app-sidecar.mjs\n\
-                   5300|5204|C:\\Program Files\\nodejs\\node.exe kencode-search";
+                   5300|5204|C:\\Program Files\\nodejs\\node.exe some-mcp-server";
         let rows = parse_cim_output(raw);
         assert_eq!(rows.len(), 3);
         // Kernel process with empty CommandLine.
@@ -6016,9 +6162,9 @@ mod tests {
         assert_eq!(rows[0].command, "");
         // Sidecar with full path.
         assert!(rows[1].command.contains("app-sidecar.mjs"));
-        // kencode grandchild.
+        // MCP grandchild.
         assert_eq!(rows[2].ppid, 5204);
-        assert!(rows[2].command.contains("kencode-search"));
+        assert!(rows[2].command.contains("some-mcp-server"));
     }
 
     #[test]
@@ -6052,7 +6198,7 @@ mod tests {
         let raw = "4|0|\n\
                    1000|4|C:\\Windows\\System32\\cmd.exe\n\
                    5000|9999|C:\\nodejs\\node.exe app-sidecar.mjs\n\
-                   5001|5000|C:\\nodejs\\node.exe kencode-search\n\
+                   5001|5000|C:\\nodejs\\node.exe some-mcp-server\n\
                    6000|4|C:\\Program Files\\GG Coder\\gg-app.exe\n\
                    6001|6000|C:\\nodejs\\node.exe app-sidecar.mjs";
         let snapshot = parse_cim_output(raw);
@@ -6061,7 +6207,7 @@ mod tests {
         // Windows has no pgid (all 0), so classification relies on the sidecar
         // name (5000) + descendant walk (5001) — ledger is irrelevant here.
         let killset = orphan_killset(&snapshot, 6000, &no_ledger());
-        // Orphaned sidecar (5000, parent 9999 dead) + its kencode child (5001).
+        // Orphaned sidecar (5000, parent 9999 dead) + its MCP child (5001).
         assert!(killset.contains(&5000));
         assert!(killset.contains(&5001));
         // Live sidecar (6001) must NOT be killed.

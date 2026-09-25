@@ -38,6 +38,7 @@ export interface BusEventMap {
     };
   };
   max_turns: { totalTurns: number; maxTurns: number };
+  retry: Omit<Extract<AgentEvent, { type: "retry" }>, "type">;
   /** Turn budget was exhausted but extended because the run showed progress. */
   turn_budget_extended: { turn: number; grantedTurns: number; extension: number };
   truncated: {
@@ -50,6 +51,9 @@ export interface BusEventMap {
   server_tool_call: { id: string; name: string; input: unknown };
   server_tool_result: { toolUseId: string; resultType: string; data: unknown };
 
+  /** Informational edit feedback, not a completion gate or a draft replacement. */
+  diagnostics: { text: string };
+
   // Agent self-correction hooks (ideal review / verification / loop-break /
   // re-grounding). Carries only the semantic kind; the presentation layer owns
   // text + color.
@@ -57,6 +61,7 @@ export interface BusEventMap {
     kind: "ideal" | "verification" | "loop_break" | "regrounding";
     coverageExpected?: string[];
     coverageMissing?: string[];
+    verificationReason?: "recheck" | "check_review";
   };
 
   /** A pre-final hook would fire if the agent stopped right now: the Ideal
@@ -190,6 +195,11 @@ export class EventBus {
           totalUsage: event.totalUsage,
         });
         break;
+      case "retry": {
+        const { type: _type, ...retry } = event;
+        this.emit("retry", retry);
+        break;
+      }
       case "max_turns":
         this.emit("max_turns", {
           totalTurns: event.totalTurns,

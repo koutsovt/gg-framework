@@ -1,9 +1,19 @@
-import { mkdir, mkdtemp, readFile, rm, utimes, readdir, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  utimes,
+  readdir,
+  writeFile,
+} from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { afterEach, describe, expect, it } from "vitest";
+import fs from "node:fs/promises";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SessionManager,
   KEN_TURN_CUSTOM_KIND,
@@ -193,6 +203,60 @@ describe("SessionManager compaction coordination", () => {
     expect(order).toEqual(["first:start", "first:end", "second:start", "second:end"]);
   });
 
+  function errno(code: string): NodeJS.ErrnoException {
+    return Object.assign(new Error(`${code}: mkdir`), { code });
+  }
+
+  it("treats a Windows pending-delete EPERM on an existing lock dir as contention", async () => {
+    const home = await makeTempDir();
+    const manager = new SessionManager(home);
+    const realMkdir = fs.mkdir;
+    let lockAttempts = 0;
+    const spy = vi.spyOn(fs, "mkdir").mockImplementation(async (target, options) => {
+      if (String(target).endsWith(".lock")) {
+        lockAttempts += 1;
+        if (lockAttempts === 1) {
+          // Lock dir is present but mid-delete: mkdir fails EPERM while stat still resolves.
+          await realMkdir(target, { recursive: true });
+          throw errno("EPERM");
+        }
+        // The releasing holder finished its delete before we polled again.
+        await rm(String(target), { recursive: true, force: true });
+      }
+      return realMkdir(target, options);
+    });
+    try {
+      await expect(
+        manager.withCompactionLease("conversation", undefined, async () => "acquired"),
+      ).resolves.toBe("acquired");
+      expect(lockAttempts).toBe(2);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("rethrows a genuine EACCES when no lock dir exists instead of waiting forever", async () => {
+    const home = await makeTempDir();
+    const manager = new SessionManager(home);
+    const realMkdir = fs.mkdir;
+    let attempts = 0;
+    const spy = vi.spyOn(fs, "mkdir").mockImplementation(async (target, options) => {
+      if (String(target).endsWith(".lock")) {
+        attempts += 1;
+        throw errno("EACCES");
+      }
+      return realMkdir(target, options);
+    });
+    try {
+      await expect(
+        manager.withCompactionLease("conversation", undefined, async () => "never"),
+      ).rejects.toMatchObject({ code: "EACCES" });
+      expect(attempts).toBeLessThanOrEqual(5);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("recovers a dead-owner lease and ignores coordination storage during discovery", async () => {
     const sessionsDir = await makeTempDir();
     const manager = new SessionManager(sessionsDir);
@@ -261,6 +325,42 @@ describe("SessionManager persistence failure handling", () => {
     await manager.appendEntry(badPath, entry("b"));
     await manager.updateLeaf(badPath, "leaf-1");
     expect(calls).toBe(1);
+  });
+
+  it("appendEntry seals a crash-torn last line instead of fusing onto it", async () => {
+    const sessionsDir = await makeTempDir();
+    const created = await new SessionManager(sessionsDir).create(
+      sessionsDir,
+      "anthropic",
+      "test-model",
+    );
+    // A process killed mid-append: the JSON is cut off and has no newline.
+    await appendFile(created.path, '{"type":"message","id":"torn","mess', "utf-8");
+
+    // A fresh manager, as on resume after the crash.
+    const resumed = new SessionManager(sessionsDir);
+    await resumed.appendEntry(created.path, entry("after-crash"));
+
+    const lines = (await readFile(created.path, "utf-8")).split("\n").filter(Boolean);
+    // The torn record stays lost — it was never complete — but the record
+    // written after it survives as its own parseable line.
+    expect(lines).toHaveLength(3);
+    expect(JSON.parse(lines[2] ?? "")).toMatchObject({ type: "message", id: "after-crash" });
+    const loaded = await resumed.load(created.path);
+    expect(loaded?.entries.map((e) => e.id)).toEqual(["after-crash"]);
+  });
+
+  it("appendEntry leaves an intact file byte-identical apart from the new line", async () => {
+    const sessionsDir = await makeTempDir();
+    const manager = new SessionManager(sessionsDir);
+    const created = await manager.create(sessionsDir, "anthropic", "test-model");
+    const before = await readFile(created.path, "utf-8");
+
+    await manager.appendEntry(created.path, entry("clean"));
+
+    const after = await readFile(created.path, "utf-8");
+    expect(after.startsWith(before)).toBe(true);
+    expect(after.slice(before.length).split("\n").filter(Boolean)).toHaveLength(1);
   });
 
   it("appendEntry still writes normally when the disk is healthy", async () => {
@@ -565,7 +665,7 @@ describe("SessionManager turn metrics", () => {
     version: 1,
     turn: 1,
     provider: "openai",
-    model: "gpt-5.6-sol",
+    model: "gpt-6-sol",
     stopReason: "end_turn",
     usage: { inputTokens: 100, outputTokens: 25, cacheRead: 50 },
     timing: {
@@ -582,7 +682,7 @@ describe("SessionManager turn metrics", () => {
   it("persists and reads validated metrics without putting them on the message DAG", async () => {
     const sessionsDir = await makeTempDir();
     const manager = new SessionManager(sessionsDir);
-    const created = await manager.create("/project", "openai", "gpt-5.6-sol");
+    const created = await manager.create("/project", "openai", "gpt-6-sol");
     await manager.appendTurnMetric(created.path, metric);
     const loaded = await manager.load(created.path);
 

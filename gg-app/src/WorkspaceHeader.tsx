@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
-import { openProjectPath, openUrl, type WorkspaceMode } from "./agent";
+import { openProjectPath, openUrl, type WorkspaceMode, type GitHubCI } from "./agent";
+import { CIIndicator } from "./CIIndicator";
 import { projectAccent } from "./projectAccent";
 
 interface WorkspaceHeaderProps {
@@ -12,6 +13,7 @@ interface WorkspaceHeaderProps {
   gitHubPRs?: number | null;
   /** Origin repo's web URL — makes the issue/PR chips clickable. */
   gitHubRepoUrl?: string | null;
+  gitHubCI?: GitHubCI | null;
   /** Extra workspace roots added with /add-dir. */
   additionalRoots?: string[];
   navHidden: boolean;
@@ -55,6 +57,7 @@ export function WorkspaceHeader({
   gitHubIssues = null,
   gitHubPRs = null,
   gitHubRepoUrl = null,
+  gitHubCI = null,
   additionalRoots = [],
   navHidden,
   onToggleNav,
@@ -101,7 +104,7 @@ export function WorkspaceHeader({
               </button>
               {gitBranch && (
                 <>
-                  <span className="chat-head-sep" data-tauri-drag-region>
+                  <span className="chat-head-sep" aria-hidden="true" data-tauri-drag-region>
                     {"│"}
                   </span>
                   {gitHubRepoUrl ? (
@@ -122,7 +125,7 @@ export function WorkspaceHeader({
               )}
               {additionalRoots.length > 0 && (
                 <>
-                  <span className="chat-head-sep" data-tauri-drag-region>
+                  <span className="chat-head-sep" aria-hidden="true" data-tauri-drag-region>
                     {"│"}
                   </span>
                   <span
@@ -136,7 +139,7 @@ export function WorkspaceHeader({
               )}
               {gitDirtyFileCount > 0 && (
                 <>
-                  <span className="chat-head-sep" data-tauri-drag-region>
+                  <span className="chat-head-sep" aria-hidden="true" data-tauri-drag-region>
                     {"│"}
                   </span>
                   <span
@@ -150,7 +153,7 @@ export function WorkspaceHeader({
               )}
               {gitHubIssues !== null && gitHubIssues > 0 && (
                 <>
-                  <span className="chat-head-sep" data-tauri-drag-region>
+                  <span className="chat-head-sep" aria-hidden="true" data-tauri-drag-region>
                     {"│"}
                   </span>
                   <button
@@ -166,7 +169,7 @@ export function WorkspaceHeader({
               )}
               {gitHubPRs !== null && gitHubPRs > 0 && (
                 <>
-                  <span className="chat-head-sep" data-tauri-drag-region>
+                  <span className="chat-head-sep" aria-hidden="true" data-tauri-drag-region>
                     {"│"}
                   </span>
                   <button
@@ -180,6 +183,7 @@ export function WorkspaceHeader({
                   </button>
                 </>
               )}
+              <CIIndicator ci={gitHubCI} />
             </>
           ) : (
             fallbackTitle

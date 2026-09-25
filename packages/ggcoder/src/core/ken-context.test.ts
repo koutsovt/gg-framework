@@ -10,6 +10,7 @@ import {
   INJECTED_PROMPT_LABEL,
 } from "./ken-context.js";
 import { USER_INSTRUCTIONS_HEADER } from "./autopilot-gate.js";
+import { frameAutopilotInjection } from "./autopilot-cycle.js";
 import { PROMPT_COMMANDS } from "./prompt-commands.js";
 import { createTools } from "../tools/index.js";
 import type { Message } from "@kenkaiiii/gg-ai";
@@ -24,25 +25,20 @@ const KEN_ALLOWED_TOOLS = [
   "web_fetch",
   "web_search",
   "screenshot",
+  "steroids",
 ];
-const KEN_ALLOWED_MCP_SERVERS = ["kencode-search"];
 
-// Mirror of AgentSession.isToolAllowed (which is private): a tool passes when
-// its name is in the allow-list, OR it's an mcp__<server>__<tool> whose server
-// is whitelisted. Kept in lockstep so this test tracks the real filter.
+// Mirror of AgentSession.isToolAllowed (which is private): Ken whitelists no
+// MCP server, so a tool passes only when its name is in the allow-list.
 function isToolAllowed(name: string): boolean {
-  if (KEN_ALLOWED_TOOLS.includes(name)) return true;
-  if (name.startsWith("mcp__")) {
-    const server = name.slice("mcp__".length).split("__")[0];
-    return KEN_ALLOWED_MCP_SERVERS.includes(server);
-  }
-  return false;
+  return KEN_ALLOWED_TOOLS.includes(name);
 }
 
 describe("Ken allowedTools filter", () => {
   it("excludes every mutating tool from the Ken set", async () => {
     const { tools, processManager, lspManager } = await createTools(os.tmpdir(), {
       lspDiagnostics: false,
+      steroidsBin: "/nonexistent/steroids",
     });
     try {
       const kenTools = tools.filter((t) => isToolAllowed(t.name)).map((t) => t.name);
@@ -52,7 +48,7 @@ describe("Ken allowedTools filter", () => {
         expect(kenTools).not.toContain(banned);
       }
       // The read-only research/vision tools must survive.
-      for (const allowed of ["read", "grep", "find", "ls", "screenshot"]) {
+      for (const allowed of ["read", "grep", "find", "ls", "screenshot", "steroids"]) {
         expect(kenTools).toContain(allowed);
       }
     } finally {
@@ -61,13 +57,11 @@ describe("Ken allowedTools filter", () => {
     }
   });
 
-  it("allows whitelisted kencode-search MCP tools but blocks other MCP tools", () => {
-    // kencode-search is Ken's research server: all its tools pass.
-    expect(isToolAllowed("mcp__kencode-search__searchCode")).toBe(true);
-    expect(isToolAllowed("mcp__kencode-search__referenceSources")).toBe(true);
-    expect(isToolAllowed("mcp__kencode-search__discoverRepos")).toBe(true);
-    // A non-whitelisted MCP server (e.g. a user-configured one) is blocked,
-    // even if it exposes an innocuous-looking name.
+  it("allows the native steroids tool but blocks every MCP tool", () => {
+    // steroids is Ken's research corpus: a native tool, no MCP server needed.
+    expect(isToolAllowed("steroids")).toBe(true);
+    // Any MCP server (e.g. a user-configured one) is blocked, even if it
+    // exposes an innocuous-looking name.
     expect(isToolAllowed("mcp__some-other-server__searchCode")).toBe(false);
     expect(isToolAllowed("mcp__filesystem__write_file")).toBe(false);
   });
@@ -80,6 +74,68 @@ describe("buildKenDigest", () => {
     gitBranch: "main" as string | null,
     platform: "darwin",
   };
+
+  it("uses host results instead of re-rejecting a completed background launch", () => {
+    const messages: Message[] = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_call",
+            id: "bg",
+            name: "bash",
+            args: { command: "pnpm test", run_in_background: true },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [{ type: "tool_result", toolCallId: "bg", content: "ID: task-1", isError: false }],
+      },
+    ];
+    const digest = buildKenDigest({
+      ...base,
+      messages,
+      verificationProblem: null,
+      verificationEvidence: [
+        { command: "pnpm test", status: "passed", reason: "Host exit code 0" },
+      ],
+    });
+    expect(digest).toContain("PASSED: `pnpm test`");
+    expect(digest).toContain("Current host gate: satisfied");
+    expect(digest).not.toContain("REJECTED: `pnpm test`");
+    expect(digest).not.toContain("background or persistent commands are not bounded evidence");
+  });
+
+  it("does not fall back to old transcript failures when restored host evidence has no command names", () => {
+    const messages: Message[] = [
+      {
+        role: "assistant",
+        content: [{ type: "tool_call", id: "old", name: "bash", args: { command: "pnpm test" } }],
+      },
+      {
+        role: "tool",
+        content: [
+          { type: "tool_result", toolCallId: "old", content: "Exit code: 1", isError: true },
+        ],
+      },
+    ];
+    const digest = buildKenDigest({
+      ...base,
+      messages,
+      verificationEvidence: [],
+      verificationProblem: null,
+    });
+    expect(digest).toContain("Current host gate: satisfied");
+    expect(digest).not.toContain("FAILED: `pnpm test`");
+    const unresolved = buildKenDigest({
+      ...base,
+      messages,
+      verificationEvidence: [],
+      verificationProblem: "Unverified: a check failed",
+    });
+    expect(unresolved).toContain("Current host gate: Unverified: a check failed");
+  });
 
   it("includes the env and the question", () => {
     const digest = buildKenDigest({ ...base, messages: [] });
@@ -95,11 +151,164 @@ describe("buildKenDigest", () => {
       messages.push({ role: "user", content: `msg-${i}` });
     }
     const digest = buildKenDigest({ ...base, messages });
-    // The earliest messages fall outside the cap.
-    expect(digest).not.toContain("msg-0");
-    expect(digest).not.toContain("msg-5");
+    // Older user requests survive separately; recent activity stays bounded.
+    const recent = digest.split("## Recent activity (GG Coder and user)")[1];
+    expect(recent).not.toContain("msg-0");
+    expect(recent).not.toContain("msg-5");
+    expect(digest).toContain("**User:** msg-0");
+    expect(digest).toContain("**User:** msg-5");
     // The newest message is kept.
     expect(digest).toContain(`msg-${KEN_RECENT_MESSAGE_LIMIT + 9}`);
+  });
+
+  it("retains early constraints and later corrections for manual and autopilot reviews", () => {
+    const messages: Message[] = [
+      { role: "user", content: "CSV only, no new dependencies." },
+      { role: "assistant", content: "SUGGESTED: rewrite in Excel." },
+      {
+        role: "user",
+        content: [{ type: "text", text: "Correction: preserve the current filters too." }],
+      },
+      ...Array.from({ length: 25 }, (): Message => ({
+        role: "assistant",
+        content: "Still working.",
+      })),
+    ];
+    for (const digest of [
+      buildKenDigest({ ...base, messages }),
+      buildKenAutopilotContext({ ...base, messages }),
+    ]) {
+      expect(digest).toContain("CSV only, no new dependencies.");
+      expect(digest).toContain("Correction: preserve the current filters too.");
+      expect(digest.indexOf("CSV only")).toBeLessThan(digest.indexOf("Correction:"));
+      expect(digest).not.toContain("SUGGESTED:");
+      expect(digest).not.toContain("Context incomplete");
+    }
+  });
+
+  it("does not retain injected prompts as user decisions after restart", () => {
+    const messages: Message[] = [
+      { role: "user", content: frameAutopilotInjection("Add analytics.") },
+      { role: "user", content: "Old unframed injection." },
+      { role: "user", content: "Keep it dependency-free." },
+      ...Array.from({ length: 25 }, (): Message => ({ role: "assistant", content: "Working." })),
+    ];
+    const digest = buildKenDigest({
+      ...base,
+      messages,
+      injectedPrompts: ["Old unframed injection."],
+    });
+    expect(digest).toContain("Keep it dependency-free.");
+    expect(digest).not.toContain("Add analytics.");
+    expect(digest).not.toContain("Old unframed injection.");
+    const recent = buildKenDigest({ ...base, messages: [messages[0]] });
+    expect(recent).toContain(INJECTED_PROMPT_LABEL);
+    expect(recent).not.toContain("**User:**");
+  });
+
+  it("bounds retained decisions and explicitly discloses omitted or truncated context", () => {
+    const messages: Message[] = [
+      ...Array.from({ length: 100 }, (_, i): Message => ({
+        role: "user",
+        content: `Decision ${i}: ${"x".repeat(500)}`,
+      })),
+      ...Array.from({ length: 25 }, (): Message => ({ role: "assistant", content: "Working." })),
+    ];
+    const digest = buildKenDigest({ ...base, messages });
+    expect(digest).toContain("Context incomplete: some earlier user messages");
+    expect(digest).toContain("Decision 99:");
+    expect(digest.length).toBeLessThan(11000);
+    expect(buildKenDigest({ ...base, messages: [], originalRequest: "x".repeat(5000) })).toContain(
+      "Context incomplete: original request was truncated",
+    );
+    expect(
+      buildKenDigest({
+        ...base,
+        messages: [{ role: "user", content: "[Previous conversation summary]" + "x".repeat(5000) }],
+      }),
+    ).toContain("Context incomplete: conversation summary was truncated");
+  });
+
+  it("retains only human decisions and labels recent automation in both modes", () => {
+    const messages: Message[] = [
+      {
+        role: "user",
+        content: "CSV only.",
+        provenance: { source: "human", kind: "prompt", visibility: "transcript" },
+      },
+      { role: "user", content: "Legacy human constraint: no dependencies." },
+      {
+        role: "user",
+        content: "Old verification reminder.",
+        provenance: { source: "runtime", kind: "completion_gate", visibility: "hidden" },
+      },
+      {
+        role: "user",
+        content: "Old agent continuation.",
+        provenance: { source: "agent", kind: "automation", visibility: "hidden" },
+      },
+      ...Array.from({ length: 25 }, (): Message => ({ role: "assistant", content: "Progress." })),
+      {
+        role: "user",
+        content: "Latest verification reminder.",
+        provenance: { source: "runtime", kind: "completion_gate", visibility: "hidden" },
+      },
+      {
+        role: "user",
+        content: "Latest agent continuation.",
+        provenance: { source: "agent", kind: "automation", visibility: "hidden" },
+      },
+      {
+        role: "user",
+        content: "Correction: preserve filters.",
+        provenance: { source: "human", kind: "steering", visibility: "transcript" },
+      },
+    ];
+    for (const digest of [
+      buildKenDigest({ ...base, messages }),
+      buildKenAutopilotContext({ ...base, messages }),
+    ]) {
+      expect(digest).toContain("**User:** CSV only.");
+      expect(digest).toContain("**User:** Legacy human constraint: no dependencies.");
+      expect(digest).toContain("**User:** Correction: preserve filters.");
+      expect(digest).not.toContain("Old verification reminder.");
+      expect(digest).not.toContain("Old agent continuation.");
+      expect(digest).toContain("**Runtime (not a user request):** Latest verification reminder.");
+      expect(digest).toContain(
+        "**Agent automation (not a user request):** Latest agent continuation.",
+      );
+      expect(digest).not.toContain("**User:** Latest");
+    }
+  });
+
+  it("runtime reminders cannot consume the retained user-decision budget", () => {
+    const messages: Message[] = [
+      { role: "user", content: "Keep this genuine requirement." },
+      ...Array.from({ length: 40 }, (): Message => ({
+        role: "user",
+        content: "Internal reminder. ".repeat(300),
+        provenance: { source: "runtime", kind: "notification", visibility: "hidden" },
+      })),
+      ...Array.from({ length: 25 }, (): Message => ({ role: "assistant", content: "Progress." })),
+    ];
+    const digest = buildKenDigest({ ...base, messages });
+    expect(digest).toContain("Keep this genuine requirement.");
+    expect(digest).not.toContain("Internal reminder.");
+    expect(digest).not.toContain("Context incomplete");
+  });
+
+  it("preserves provenance-tagged compaction summaries", () => {
+    const messages: Message[] = [
+      {
+        role: "user",
+        content: "[Previous conversation summary] User chose CSV and rejected Excel.",
+        provenance: { source: "runtime", kind: "compaction_summary", visibility: "summary" },
+      },
+    ];
+    const digest = buildKenDigest({ ...base, messages });
+    expect(digest).toContain("## Story so far");
+    expect(digest).toContain("User chose CSV and rejected Excel.");
+    expect(digest).not.toContain("**User:**");
   });
 
   it("strips image blocks from user messages", () => {
@@ -235,6 +444,7 @@ describe("buildKenDigest", () => {
     });
     const section = digest.slice(digest.indexOf("## Plan under review"));
     expect(section).toContain("more chars]");
+    expect(section).toContain("Context incomplete: plan was truncated");
     expect(section.length).toBeLessThan(9000);
   });
 

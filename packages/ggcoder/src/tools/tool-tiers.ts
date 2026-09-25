@@ -20,6 +20,10 @@ import type { AgentTool } from "@kenkaiiii/gg-agent";
  * rates hold: measure that, not just the token saving, before moving a name.
  */
 export const CORE_TOOL_NAMES: readonly string[] = [
+  // Core wherever it is registered at all (the app sidecar): a question the
+  // model must `tool_search` for first is a question it writes in prose
+  // instead. Hosts with nobody to answer never build it, so they pay nothing.
+  "ask_user",
   "read",
   "write",
   "edit",
@@ -31,6 +35,7 @@ export const CORE_TOOL_NAMES: readonly string[] = [
   "code_nav",
   "web_search",
   "web_fetch",
+  "steroids",
   "task_output",
   "task_send",
   "task_stop",
@@ -49,6 +54,8 @@ export const CORE_TOOL_NAMES: readonly string[] = [
  * (the child-agent control cluster follows `spawn_agent`).
  */
 export const DEFERRED_TOOL_NAMES: readonly string[] = [
+  "ui_registry",
+  "ui_adopt",
   "source_path",
   "screenshot",
   "generate_image",

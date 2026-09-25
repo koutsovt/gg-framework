@@ -110,26 +110,24 @@ describe("getFastModel", () => {
   });
 
   it("picks Haiku for Anthropic and Luna for OpenAI", () => {
-    expect(getFastModel("anthropic", "claude-opus-5").costTier).toBe("low");
-    expect(getFastModel("openai", "gpt-5.6-sol").id).toBe("gpt-5.6-luna");
+    expect(getFastModel("anthropic", "claude-opus-5-5").costTier).toBe("low");
+    expect(getFastModel("openai", "gpt-6-sol").id).toBe("gpt-6-luna");
   });
 });
 
 describe("model registry context windows", () => {
   it.each([
-    ["gpt-5.5", 1_050_000],
-    ["gpt-5.6-sol", 1_050_000],
-    ["gpt-5.6-terra", 1_050_000],
-    ["gpt-5.6-luna", 1_050_000],
+    ["gpt-6-astra", 1_050_000],
+    ["gpt-6-sol", 1_050_000],
+    ["gpt-6-luna", 1_050_000],
   ] as const)("uses the %s public API context window without an OAuth account", (model, limit) => {
     expect(getContextWindow(model, { provider: "openai" })).toBe(limit);
   });
 
   it.each([
-    ["gpt-5.5", 272_000],
-    ["gpt-5.6-sol", 272_000],
-    ["gpt-5.6-terra", 272_000],
-    ["gpt-5.6-luna", 272_000],
+    ["gpt-6-astra", 272_000],
+    ["gpt-6-sol", 272_000],
+    ["gpt-6-luna", 272_000],
   ] as const)("uses the %s Codex product window for OpenAI OAuth", (model, limit) => {
     const options = { provider: "openai" as const, accountId: "acct_123" };
     expect(usesOpenAICodexTransport(options)).toBe(true);
@@ -147,7 +145,7 @@ describe("model registry context windows", () => {
   });
 
   it("keeps the generic tool-output allowance outside Codex OAuth", () => {
-    expect(getToolResultCharLimit("gpt-5.6-sol", { provider: "openai" })).toBeUndefined();
+    expect(getToolResultCharLimit("gpt-6-sol", { provider: "openai" })).toBeUndefined();
     expect(
       getToolResultCharLimit("claude-sonnet-5", {
         provider: "anthropic",
@@ -197,11 +195,23 @@ describe("model registry context windows", () => {
     expect(
       getDefaultThinkingLevel("kimi-k2.7-code", { baseUrl: "https://api.kimi.com/coding/v1" }),
     ).toBe("high");
-    expect(getDefaultThinkingLevel("claude-opus-5")).toBe("max");
-    expect(getDefaultThinkingLevel("claude-opus-5")).toBe("max");
+    expect(getDefaultThinkingLevel("claude-opus-5-5")).toBe("max");
+    expect(getDefaultThinkingLevel("claude-opus-5-5")).toBe("max");
   });
 
-  it("makes GLM-5.3 the sole GLM model, at a max thinking ceiling", () => {
+  it("starts Codex models at their catalog default, not the ladder ceiling", () => {
+    // openai/codex models.json `default_reasoning_level`: the deep-reasoning
+    // flagship (Astra) ships "low", GPT-6 Sol/Luna "medium". Defaulting to
+    // maxThinkingLevel made fresh Astra sessions reason at max effort.
+    expect(getDefaultThinkingLevel("gpt-6-astra")).toBe("low");
+    expect(getDefaultThinkingLevel("gpt-6-sol")).toBe("medium");
+    expect(getDefaultThinkingLevel("gpt-6-luna")).toBe("medium");
+    // Ceilings are unchanged — users can still opt up.
+    expect(getModel("gpt-6-astra")?.maxThinkingLevel).toBe("ultra");
+    expect(getModel("gpt-6-luna")?.maxThinkingLevel).toBe("max");
+  });
+
+  it("pairs GLM-5.3 with its Flash sibling, both at a max thinking ceiling", () => {
     expect(getDefaultModel("glm")).toMatchObject({
       id: "glm-5.3",
       name: "GLM-5.3",
@@ -213,24 +223,36 @@ describe("model registry context windows", () => {
       maxThinkingLevel: "max",
     });
     expect(getDefaultThinkingLevel("glm-5.3")).toBe("max");
-    // 5.3 is the ONLY GLM entry: the older ids route to strictly worse coding
-    // for the same plan quota, and the coding endpoint already answers
-    // glm-5.2 requests as glm-5.3. Saved sessions on any of them fall back to
-    // the provider default.
-    expect(getModelsForProvider("glm").map((model) => model.id)).toEqual(["glm-5.3"]);
+    // Flash is natively multimodal, so its attachments stay inline instead of
+    // taking the zai_vision MCP detour that `supportsImages: false` triggers.
+    expect(getModel("glm-5.3-flash")).toMatchObject({
+      name: "GLM-5.3-Flash",
+      contextWindow: 1_000_000,
+      supportsImages: true,
+      costTier: "low",
+      maxThinkingLevel: "max",
+    });
+    // Only the 5.3 pair ships: the older ids route to strictly worse coding for
+    // the same plan quota, and the coding endpoint already answers glm-5.2
+    // requests as glm-5.3. Saved sessions on any of them fall back to the
+    // provider default.
+    expect(getModelsForProvider("glm").map((model) => model.id)).toEqual([
+      "glm-5.3",
+      "glm-5.3-flash",
+    ]);
     for (const retired of ["glm-5.2", "glm-5.1", "glm-4.7", "glm-4.7-flash"]) {
       expect(getModel(retired), `${retired} retired`).toBeUndefined();
     }
-    // No cheap sibling left, so scout/summary routing must keep 5.3 rather
-    // than crash or jump to another provider's login.
-    expect(getFastModel("glm", "glm-5.3").id).toBe("glm-5.3");
-    expect(getSummaryModel("glm", "glm-5.3").id).toBe("glm-5.3");
+    // Flash is the cheap sibling, so scout/summary routing drops to it instead
+    // of paying 5.3 rates for recon and compaction.
+    expect(getFastModel("glm", "glm-5.3").id).toBe("glm-5.3-flash");
+    expect(getSummaryModel("glm", "glm-5.3").id).toBe("glm-5.3-flash");
   });
 
-  it("defaults xAI to Grok 4.6 and keeps 4.5 capped at high", () => {
+  it("defaults xAI to Grok 4.7 alone, retiring the superseded 4.6/4.5 ids", () => {
     expect(getDefaultModel("xai")).toMatchObject({
-      id: "grok-4.6",
-      name: "Grok 4.6",
+      id: "grok-4.7",
+      name: "Grok 4.7",
       provider: "xai",
       contextWindow: 500_000,
       maxOutputTokens: 131_072,
@@ -239,10 +261,13 @@ describe("model registry context windows", () => {
       supportsVideo: false,
       maxThinkingLevel: "xhigh",
     });
-    expect(getDefaultThinkingLevel("grok-4.6")).toBe("xhigh");
-    expect(getModelsForProvider("xai").map((model) => model.id)).toEqual(["grok-4.6", "grok-4.5"]);
-    // 4.5 stays registered as the legacy option without the new xhigh rung.
-    expect(getModel("grok-4.5")?.maxThinkingLevel).toBe("high");
+    expect(getDefaultThinkingLevel("grok-4.7")).toBe("xhigh");
+    expect(getModelsForProvider("xai").map((model) => model.id)).toEqual(["grok-4.7"]);
+    // Only the newest Grok ships — saved sessions on 4.6/4.5 fall back to the
+    // provider default.
+    for (const retired of ["grok-4.6", "grok-4.5"]) {
+      expect(getModel(retired), `${retired} retired`).toBeUndefined();
+    }
   });
 
   it("defaults MiniMax to the multimodal M3 with a 1M context window", () => {
@@ -263,16 +288,44 @@ describe("model registry context windows", () => {
     expect(getAuthStorageKey("anthropic", "claude-sonnet-5")).toBe("anthropic");
   });
 
-  it("mimo-v2.5-pro / mimo-v2.5 prefer the Token Plan key but fall back to API Credits", () => {
-    expect(getAuthStorageKeys("xiaomi", "mimo-v2.5-pro")).toEqual(["xiaomi", XIAOMI_CREDITS_KEY]);
-    expect(getAuthStorageKeys("xiaomi", "mimo-v2.5")).toEqual(["xiaomi", XIAOMI_CREDITS_KEY]);
-    // getAuthStorageKey() is the FIRST preference, not the only option.
-    expect(getAuthStorageKey("xiaomi", "mimo-v2.5-pro")).toBe("xiaomi");
+  it("defaults Xiaomi to the full-modal MiMo-V2.6-Pro and retires the V2.5 ids", () => {
+    expect(getDefaultModel("xiaomi")).toMatchObject({
+      id: "mimo-v2.6-pro",
+      name: "MiMo-V2.6-Pro",
+      provider: "xiaomi",
+      contextWindow: 1_000_000,
+      maxOutputTokens: 131_072,
+      supportsThinking: true,
+      // The whole V2.6 series is natively full-modal — Pro is no longer
+      // text-only the way V2.5-Pro was.
+      supportsImages: true,
+      supportsVideo: true,
+      maxVideoBytes: 36 * 1024 * 1024,
+    });
+    expect(getModelsForProvider("xiaomi").map((model) => model.id)).toEqual([
+      "mimo-v2.6-pro",
+      "mimo-v2.6-flash",
+      "mimo-v2.6-pro-ultraspeed",
+    ]);
+    // V2.5 ids deprecate on the platform 2026-10-21 — retired here, saved
+    // sessions fall back to the provider default.
+    for (const retired of ["mimo-v2.5-pro", "mimo-v2.5", "mimo-v2.5-pro-ultraspeed"]) {
+      expect(getModel(retired), `${retired} retired`).toBeUndefined();
+    }
+    // Flash is the low-cost sibling, so scout routing drops to it.
+    expect(getFastModel("xiaomi", "mimo-v2.6-pro").id).toBe("mimo-v2.6-flash");
   });
 
-  it("mimo-v2.5-pro-ultraspeed is API-Credits only, with no Token Plan fallback", () => {
-    expect(getAuthStorageKeys("xiaomi", "mimo-v2.5-pro-ultraspeed")).toEqual([XIAOMI_CREDITS_KEY]);
-    expect(getAuthStorageKey("xiaomi", "mimo-v2.5-pro-ultraspeed")).toBe(XIAOMI_CREDITS_KEY);
+  it("mimo-v2.6-pro / mimo-v2.6-flash prefer the Token Plan key but fall back to API Credits", () => {
+    expect(getAuthStorageKeys("xiaomi", "mimo-v2.6-pro")).toEqual(["xiaomi", XIAOMI_CREDITS_KEY]);
+    expect(getAuthStorageKeys("xiaomi", "mimo-v2.6-flash")).toEqual(["xiaomi", XIAOMI_CREDITS_KEY]);
+    // getAuthStorageKey() is the FIRST preference, not the only option.
+    expect(getAuthStorageKey("xiaomi", "mimo-v2.6-pro")).toBe("xiaomi");
+  });
+
+  it("mimo-v2.6-pro-ultraspeed is API-Credits only, with no Token Plan fallback", () => {
+    expect(getAuthStorageKeys("xiaomi", "mimo-v2.6-pro-ultraspeed")).toEqual([XIAOMI_CREDITS_KEY]);
+    expect(getAuthStorageKey("xiaomi", "mimo-v2.6-pro-ultraspeed")).toBe(XIAOMI_CREDITS_KEY);
   });
 
   it("registers a Code Assist-supported Gemini default", () => {
@@ -281,17 +334,28 @@ describe("model registry context windows", () => {
       name: "Gemini 3.1 Flash Lite",
       provider: "gemini",
     });
-    // 3.7 Flash joins as the newest flagship flash but stays non-default and
-    // non-first: it rides Code Assist ahead of gemini-cli (issue #28802) and is
-    // account-gated there, while flash-lite works on every account and must
-    // remain what getFastModel picks as the low-tier sibling.
+    // New public GA releases are opt-in: retain the working OAuth default/fast model.
     expect(getModelsForProvider("gemini").map((model) => model.id)).toEqual([
       "gemini-3.1-flash-lite",
+      "gemini-3.8-flash",
+      "gemini-3.5-flash-lite",
       "gemini-3.7-flash",
       "gemini-3-flash",
       "gemini-3.1-pro-preview",
     ]);
     expect(getFastModel("gemini", "gemini-3.1-flash-lite").id).toBe("gemini-3.1-flash-lite");
+    for (const id of ["gemini-3.8-flash", "gemini-3.5-flash-lite"]) {
+      expect(getModel(id)).toMatchObject({
+        contextWindow: 1_048_576,
+        maxOutputTokens: 65_536,
+        supportsImages: true,
+        supportsVideo: true,
+        maxThinkingLevel: "high",
+      });
+      expect(getFastModel("gemini", id).id).toBe("gemini-3.1-flash-lite");
+      // Summaries intentionally stay on the selected Gemini model.
+      expect(getSummaryModel("gemini", id).id).toBe(id);
+    }
     expect(getContextWindow("gemini-3.7-flash", { provider: "gemini" })).toBe(1_048_576);
     expect(getContextWindow("gemini-3.1-flash-lite", { provider: "gemini" })).toBe(1_048_576);
     expect(getContextWindow("gemini-3-flash", { provider: "gemini" })).toBe(1_048_576);
@@ -301,11 +365,36 @@ describe("model registry context windows", () => {
     expect(getDefaultModel("deepseek")).toMatchObject({
       id: "deepseek-v4-pro",
       contextWindow: 1_048_576,
-      maxOutputTokens: 393_216,
+      maxOutputTokens: 384_000,
       supportsImages: false,
-      // ~$0.43/$0.87 per MTok on DeepSeek's API — mid band, not the preview's top.
       costTier: "medium",
-      maxThinkingLevel: "xhigh",
+      maxThinkingLevel: "max",
+    });
+  });
+
+  it("adds experimental DeepSeek vision without replacing stable summaries", () => {
+    expect(getModel("deepseek-v4-flash-vision-exp")).toMatchObject({
+      supportsImages: true,
+      supportsVideo: false,
+      contextWindow: 1_048_576,
+      maxOutputTokens: 384_000,
+      maxThinkingLevel: "max",
+    });
+    expect(getSummaryModel("deepseek", "deepseek-v4-flash-vision-exp").id).toBe(
+      "deepseek-v4-flash",
+    );
+    expect(
+      getModelsForProvider("deepseek").every((model) => model.maxOutputTokens === 384_000),
+    ).toBe(true);
+  });
+
+  it("enables Qwen image/video input with bounded inline video payloads", () => {
+    expect(getModel("qwen/qwen3.6-plus")).toMatchObject({
+      supportsImages: true,
+      supportsVideo: true,
+      maxVideoBytes: 20 * 1024 * 1024,
+      contextWindow: 1_000_000,
+      maxOutputTokens: 65_536,
     });
   });
 

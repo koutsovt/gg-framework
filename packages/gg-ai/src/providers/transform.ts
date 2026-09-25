@@ -16,6 +16,7 @@ import type {
   ToolResultContent,
 } from "../types.js";
 import { resolveToolSchema, zodToJsonSchema } from "../utils/zod-to-json-schema.js";
+import { makeStrictToolSchema, UnsupportedStrictSchemaError } from "../utils/strict-tool-schema.js";
 import { DEFAULT_REASONING_FIELD } from "./reasoning-field.js";
 
 // ── Shared helpers ─────────────────────────────────────────
@@ -510,10 +511,7 @@ export function toAnthropicMessages(
                     source: {
                       type: "base64" as const,
                       media_type: part.mediaType as
-                        | "image/jpeg"
-                        | "image/png"
-                        | "image/gif"
-                        | "image/webp",
+                        "image/jpeg" | "image/png" | "image/gif" | "image/webp",
                       data: part.data,
                     },
                   };
@@ -641,11 +639,12 @@ export function toAnthropicToolChoice(choice: ToolChoice): Anthropic.ToolChoice 
 }
 
 /**
- * Anthropic models with built-in adaptive thinking (Fable 5, Mythos 5,
- * Opus 5, Opus 4.8/4.7/4.6, Sonnet 5). Matches both dashed (`opus-4-8`) and
+ * Anthropic models with built-in adaptive thinking (Fable 5.x, Mythos 5.x,
+ * Opus 5.5/5, Opus 4.8/4.7/4.6, Sonnet 5). Matches both dashed (`opus-4-8`) and
  * dotted (`opus-4.8`) forms so callers don't have to enumerate variants. These
  * models don't need the `interleaved-thinking` beta header — it's built in.
- * (`opus-5` can't false-match `claude-opus-4-5-…` — the `4-` breaks the literal.)
+ * (`opus-5` can't false-match `claude-opus-4-5-…` — the `4-` breaks the literal;
+ * it also covers `opus-5-5`.)
  */
 export function isAdaptiveThinkingModel(model: string): boolean {
   return /opus-5|opus-4[-.]8|opus-4[-.]7|opus-4[-.]6|sonnet-5|fable-5|mythos-5/.test(model);
@@ -662,9 +661,9 @@ export function toAnthropicThinking(
 } {
   if (isAdaptiveThinkingModel(model)) {
     // Adaptive thinking — model decides when/how much to think.
-    // budget_tokens is deprecated on Opus 5 / 4.8 / 4.7 / 4.6 and Sonnet 5.
+    // budget_tokens is deprecated on Opus 5.x / 4.8 / 4.7 / 4.6 and Sonnet 5.
     // Anthropic's output_config.effort accepts low, medium, high, xhigh, and max.
-    // xhigh is Opus 5 / 4.8 / 4.7-only; max is supported by every adaptive model.
+    // xhigh is Opus 5.x / 4.8 / 4.7-only; max is supported by every adaptive model.
     let effort: string = level;
     if (effort === "xhigh" && !/opus-5|opus-4-8|opus-4-7/.test(model)) {
       effort = "high";
@@ -780,9 +779,10 @@ export function toOpenAIMessages(
                 // openai provider uploads first and caches `fileId` on the part.
                 // Match Kimi's wire shape exactly: when uploaded, include both
                 // `url` and `id`. Non-video models never reach here.
-                const videoUrl = part.fileId
-                  ? { url: `ms://${part.fileId}`, id: part.fileId }
-                  : { url: `data:${part.mediaType};base64,${part.data}` };
+                const videoUrl =
+                  options?.provider === "moonshot" && part.fileId
+                    ? { url: `ms://${part.fileId}`, id: part.fileId }
+                    : { url: `data:${part.mediaType};base64,${part.data}` };
                 return {
                   type: "video_url",
                   video_url: videoUrl,
@@ -808,13 +808,11 @@ export function toOpenAIMessages(
               .filter(
                 (p): p is Extract<ContentPart, { type: "tool_call" }> => p.type === "tool_call",
               )
-              .map(
-                (tc): OpenAI.ChatCompletionMessageToolCall => ({
-                  id: remapToolCallId(tc.id, idMap),
-                  type: "function",
-                  function: { name: tc.name, arguments: JSON.stringify(tc.args) },
-                }),
-              )
+              .map((tc): OpenAI.ChatCompletionMessageToolCall => ({
+                id: remapToolCallId(tc.id, idMap),
+                type: "function",
+                function: { name: tc.name, arguments: JSON.stringify(tc.args) },
+              }))
           : undefined;
       const textParts =
         typeof msg.content !== "string"
@@ -940,15 +938,33 @@ export function toOpenAIMessages(
   return out;
 }
 
-export function toOpenAITools(tools: Tool[]): OpenAI.ChatCompletionTool[] {
-  return tools.map((tool) => ({
-    type: "function" as const,
-    function: {
-      name: tool.name,
-      description: tool.description,
-      parameters: resolveToolSchema(tool),
-    },
-  }));
+export function toOpenAITools(
+  tools: Tool[],
+  opts?: { strict?: boolean },
+): OpenAI.ChatCompletionTool[] {
+  return tools.map((tool) => {
+    let parameters = resolveToolSchema(tool);
+    let strict: true | undefined;
+    if (opts?.strict) {
+      // Prefer provider-guaranteed schema-conformant args; fall back per tool
+      // when the schema cannot be expressed in the strict subset.
+      try {
+        parameters = makeStrictToolSchema(parameters);
+        strict = true;
+      } catch (error) {
+        if (!(error instanceof UnsupportedStrictSchemaError)) throw error;
+      }
+    }
+    return {
+      type: "function" as const,
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters,
+        ...(strict ? { strict } : {}),
+      },
+    };
+  });
 }
 
 export function toOpenAIToolChoice(choice: ToolChoice): OpenAI.ChatCompletionToolChoiceOption {

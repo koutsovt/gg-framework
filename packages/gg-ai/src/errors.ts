@@ -293,7 +293,7 @@ export function formatError(err: unknown): FormattedError {
         statusCode: err.statusCode,
         ...(err.requestId ? { requestId: err.requestId } : {}),
         guidance:
-          "Request access via your Anthropic account team (see platform.claude.com/docs/en/about-claude/models/overview), or switch to Claude Fable 5 via the model selector — same underlying model, generally available.",
+          "Request access via your Anthropic account team (see platform.claude.com/docs/en/about-claude/models/overview), or switch to Claude Fable 5.1 via the model selector — same underlying model, generally available.",
       };
     }
     if (isUsageLimitError(err)) {
@@ -371,7 +371,7 @@ function finaliseBySource(
         message: "",
         guidance:
           hint ??
-          "Only Kimi, Gemini, MiniMax, and MiMo-V2.5 can analyze video. Switch to one of those via the model selector.",
+          "Only Kimi, Gemini, MiniMax, and MiMo-V2.6 can analyze video. Switch to one of those via the model selector.",
         ...(requestId ? { requestId } : {}),
       };
     case "ggcoder":
@@ -379,8 +379,7 @@ function finaliseBySource(
         headline: "GG Coder hit an unexpected error.",
         source,
         message,
-        guidance:
-          hint ?? "This looks like a GG Coder bug — please report it to the developer (see /help).",
+        guidance: hint ?? "This looks like a GG Coder bug — please report it to the developer.",
         ...(requestId ? { requestId } : {}),
       };
   }
@@ -453,6 +452,12 @@ function providerGuidance(
 
   if (statusCode === 401 || lower.includes("unauthorized") || lower.includes("invalid api key")) {
     return `Authentication failed with ${name}. Re-authenticate to refresh your credentials.`;
+  }
+  // ChatGPT backend gates new models on the client version GG Coder advertises.
+  // The provider's own text says "upgrade the app or CLI", which reads as a
+  // user problem; it is really GG Coder that needs updating for this model.
+  if (lower.includes("requires a newer version")) {
+    return `${name} needs a newer GG Coder to serve this model. Update GG Coder to the latest version and retry, or switch to another ${name} model via the model selector.`;
   }
   if (lower.includes("overloaded") || lower.includes("engine_overloaded")) {
     return `${name}'s servers are overloaded right now. Retry in a moment — not a GG Coder issue.`;

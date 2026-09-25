@@ -59,6 +59,7 @@ import {
   type WorkflowCommandSpec,
 } from "./core/autopilot-gate.js";
 import { driveAutopilotCycle, frameAutopilotInjection } from "./core/autopilot-cycle.js";
+import { describeRunVerification, describeTurnVerification } from "./core/run-status.js";
 import { validateKenModelPref, effectiveKenModel, type KenModelPref } from "./core/ken-model.js";
 import type { KenTurnPayload, AppMarkerPayload, RunOutcome } from "./core/session-manager.js";
 import {
@@ -149,6 +150,7 @@ import {
 import { resolveStartOrFallback } from "./core/resolve-start.js";
 import { getGitBranch, getGitDirtyFileCount, isGitRepo } from "./utils/git.js";
 import { getGitHubOpenCounts, getGitHubRepoSlug } from "./utils/github.js";
+import { startGitHubCIPoll, type GitHubCI } from "./utils/github-ci.js";
 import { extractPlanSteps } from "./utils/plan-steps.js";
 import {
   getNextThinkingLevel,
@@ -179,6 +181,7 @@ import {
 import { enrichProcessPath } from "./core/shell-path.js";
 import { downscaleForPreview, shrinkToFit, validateVisionImage } from "./utils/image.js";
 import { startServeMode, type ServeController } from "./modes/serve-mode.js";
+import { installSteroids, probeSteroids } from "./core/steroids.js";
 import { loadTelegramConfig, saveTelegramConfig, verifyBotToken } from "./core/telegram-config.js";
 import {
   loadServers,
@@ -193,19 +196,14 @@ import {
   type MCPServerConfig,
 } from "./core/mcp/index.js";
 import type { ElicitResult } from "@modelcontextprotocol/client";
+import { createAskUserBridge, type AskUserResult } from "./core/ask-user.js";
+import { createAskUserTool } from "./tools/ask-user.js";
 import { buildSnapshot, levelForXp, rankForLevel } from "./core/progress/ranks.js";
 import { loadProgress, peekProgress, updateProgress } from "./core/progress/store.js";
 import { awardPrompt, awardCommits } from "./core/progress/engine.js";
 import { detectNewCommits, repoKey } from "./core/progress/git-xp.js";
 import { rebuildFromSessions } from "./core/progress/rebuild.js";
 import type { ProgressFile, ProgressSnapshot } from "./core/progress/types.js";
-import {
-  captureSidecarError,
-  flushSidecarErrors,
-  shouldCaptureToolFailure,
-  shouldCaptureUsagePollingError,
-  wrapSidecarHandler,
-} from "./core/sidecar-error-reporter.js";
 
 const AUTOMATION_PROVENANCE: MessageProvenance = {
   source: "runtime",
@@ -375,7 +373,6 @@ async function persistModelSelection(
     await sm.set("defaultProvider", provider as Settings["defaultProvider"]);
     await sm.set("defaultModel", model);
   } catch (err) {
-    captureSidecarError(err, "app-sidecar.settings.persist-model");
     log("WARN", "app-sidecar", "failed to persist model selection", { err: String(err) });
   }
 }
@@ -394,7 +391,6 @@ async function persistThinkingLevel(
     await sm.set("thinkingEnabled", !!level);
     if (level) await sm.set("thinkingLevel", level);
   } catch (err) {
-    captureSidecarError(err, "app-sidecar.settings.persist-thinking");
     log("WARN", "app-sidecar", "failed to persist thinking level", { err: String(err) });
   }
 }
@@ -705,20 +701,18 @@ async function buildMcpRows(cwd: string, settingsFile: string): Promise<McpWireR
           requiresAuth: result?.requiresAuth,
         };
       }),
-      ...blocked.map(
-        (s): McpWireRow => ({
-          name: s.config.name,
-          scope: s.scope,
-          ok: false,
-          toolCount: 0,
-          error:
-            "Project-scope server not connected — this repo's .gg/mcp.json runs " +
-            "repo-controlled commands. Add or re-add a server in this project via " +
-            "the MCP modal to trust it.",
-          kind: (s.config.url ? "http" : "stdio") as "http" | "stdio",
-          summary: mcpRowSummary(s.config),
-        }),
-      ),
+      ...blocked.map((s): McpWireRow => ({
+        name: s.config.name,
+        scope: s.scope,
+        ok: false,
+        toolCount: 0,
+        error:
+          "Project-scope server not connected — this repo's .gg/mcp.json runs " +
+          "repo-controlled commands. Add or re-add a server in this project via " +
+          "the MCP modal to trust it.",
+        kind: (s.config.url ? "http" : "stdio") as "http" | "stdio",
+        summary: mcpRowSummary(s.config),
+      })),
     ];
   } finally {
     await manager.dispose();
@@ -801,7 +795,7 @@ async function runJsonModeIfRequested(): Promise<boolean> {
   await runJsonMode({
     message: positionals[0] ?? "",
     provider: (values.provider ?? "anthropic") as Provider,
-    model: values.model ?? "claude-opus-5",
+    model: values.model ?? "claude-opus-5-5",
     cwd: process.cwd(),
     systemPrompt: values["system-prompt"],
     agentPrompt: values["agent-prompt"],
@@ -811,10 +805,6 @@ async function runJsonModeIfRequested(): Promise<boolean> {
     allowedMcpServers,
     promptCacheKey: values["prompt-cache-key"],
   }).catch(async (err: unknown) => {
-    captureSidecarError(err, "app-sidecar.json-mode", {
-      provider: String(values.provider ?? "anthropic"),
-    });
-    await flushSidecarErrors();
     process.stderr.write((err instanceof Error ? err.message : String(err)) + "\n");
     process.exit(1);
   });
@@ -1052,9 +1042,6 @@ async function main(): Promise<void> {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (shouldCaptureUsagePollingError(error)) {
-        captureSidecarError(error, "app-sidecar.usage.fetch", { provider });
-      }
       let backoffMs: number | undefined;
       if (error instanceof SubscriptionUsageError && error.status === 429) {
         backoffMs = Math.min(
@@ -1142,137 +1129,133 @@ async function main(): Promise<void> {
     }
   }
 
-  const server = http.createServer(
-    wrapSidecarHandler((req: http.IncomingMessage, res: http.ServerResponse) => {
-      const url = req.url ?? "/";
-      const method = req.method ?? "GET";
+  const server = http.createServer((req: http.IncomingMessage, res: http.ServerResponse) => {
+    const url = req.url ?? "/";
+    const method = req.method ?? "GET";
 
-      // Answer preflights with a bare 204 but grant NO origins — the webview
-      // reaches the daemon through the Rust proxy, never cross-origin, so any
-      // browser page's preflight must fail here.
-      if (method === "OPTIONS") {
-        res.writeHead(204);
-        res.end();
-        return;
-      }
+    // Answer preflights with a bare 204 but grant NO origins — the webview
+    // reaches the daemon through the Rust proxy, never cross-origin, so any
+    // browser page's preflight must fail here.
+    if (method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
 
-      // Host allowlist. The daemon binds 127.0.0.1 only; rejecting any other
-      // Host blocks DNS rebinding, where a web page's request arrives with
-      // the attacker's hostname (browsers cannot spoof Host).
-      const reqHost = req.headers.host ?? "";
-      if (!/^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(reqHost)) {
-        daemonJson(res, 403, { error: "forbidden host" });
-        return;
-      }
+    // Host allowlist. The daemon binds 127.0.0.1 only; rejecting any other
+    // Host blocks DNS rebinding, where a web page's request arrives with
+    // the attacker's hostname (browsers cannot spoof Host).
+    const reqHost = req.headers.host ?? "";
+    if (!/^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(reqHost)) {
+      daemonJson(res, 403, { error: "forbidden host" });
+      return;
+    }
 
-      if (req.headers["x-gg-token"] !== authToken) {
-        daemonJson(res, 401, { error: "unauthorized" });
-        return;
-      }
+    if (req.headers["x-gg-token"] !== authToken) {
+      daemonJson(res, 401, { error: "unauthorized" });
+      return;
+    }
 
-      // ── Daemon-level routes (session lifecycle) ──────────────────────────
-      // Create a session for a window: { mode?, cwd, sessionPath? } → { sessionId }.
-      if (method === "POST" && url === "/session") {
-        void daemonReadBody(req, res).then(async (raw) => {
-          if (raw === null) return;
-          let body: { mode?: unknown; chatAgent?: unknown; cwd?: unknown; sessionPath?: unknown } =
-            {};
-          try {
-            body = raw ? (JSON.parse(raw) as typeof body) : {};
-          } catch {
-            /* empty/invalid body → defaults below */
-          }
-          const mode: WorkspaceMode = body.mode === "chat" ? "chat" : "code";
-          const chatAgent = parseChatAgentId(body.chatAgent);
-          const sessionCwd =
-            typeof body.cwd === "string" && body.cwd
-              ? body.cwd
-              : (process.env.GG_APP_CWD ?? process.cwd());
-          const sessionPath =
-            typeof body.sessionPath === "string" && body.sessionPath ? body.sessionPath : undefined;
-          const id = randomUUID();
-          try {
-            const ctx = await createSession(
-              {
-                auth,
-                paths,
-                progress,
-                memoryStore,
-                jiwaStore,
-                broadcastAll,
-                oauthInFlightProviders,
-              },
-              { id, mode, chatAgent, cwd: sessionCwd, sessionPath },
-            );
-            sessions.set(id, ctx);
-            log("INFO", "app-sidecar", "session created", {
-              id,
-              mode,
-              chatAgent,
-              cwd: sessionCwd,
-            });
-            daemonJson(res, 200, { sessionId: id });
-          } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            captureSidecarError(err, "app-sidecar.session.create");
-            log("ERROR", "app-sidecar", "session create failed", { message });
-            daemonJson(res, 500, { error: message });
-          }
-        });
-        return;
-      }
-
-      // Dispose a session: DELETE /session/:id.
-      if (method === "DELETE" && url.startsWith("/session/")) {
-        const id = decodeURIComponent(url.slice("/session/".length));
-        const ctx = sessions.get(id);
-        if (ctx) {
-          sessions.delete(id);
-          void ctx.dispose().catch(() => {});
-          log("INFO", "app-sidecar", "session disposed", { id });
+    // ── Daemon-level routes (session lifecycle) ──────────────────────────
+    // Create a session for a window: { mode?, cwd, sessionPath? } → { sessionId }.
+    if (method === "POST" && url === "/session") {
+      void daemonReadBody(req, res).then(async (raw) => {
+        if (raw === null) return;
+        let body: { mode?: unknown; chatAgent?: unknown; cwd?: unknown; sessionPath?: unknown } =
+          {};
+        try {
+          body = raw ? (JSON.parse(raw) as typeof body) : {};
+        } catch {
+          /* empty/invalid body → defaults below */
         }
-        daemonJson(res, 200, { ok: true });
-        return;
-      }
-
-      // Progress is daemon-level so the Home screen can paint before a project
-      // session exists; per-session callers still work through the same endpoint.
-      if (method === "GET" && url === "/progress") {
-        daemonJson(res, 200, progress.snapshot());
-        return;
-      }
-
-      // Subscription quota is account-wide, not project/session-specific. OAuth
-      // tokens stay in this daemon; only the active provider's normalized snapshot
-      // reaches the webview.
-      if (method === "GET" && (url === "/usage" || url.startsWith("/usage?"))) {
-        void (async () => {
-          const provider = new URL(url, `http://${host}`).searchParams.get("provider");
-          if (provider !== "anthropic" && provider !== "openai" && provider !== "moonshot") {
-            daemonJson(res, 400, { error: "unsupported usage provider" });
-            return;
-          }
-          daemonJson(res, 200, await subscriptionUsage(provider));
-        })().catch((error) => {
-          captureSidecarError(error, "app-sidecar.usage.request");
-          log("ERROR", "app-sidecar", "subscription usage request failed", {
-            message: error instanceof Error ? error.message : String(error),
+        const mode: WorkspaceMode = body.mode === "chat" ? "chat" : "code";
+        const chatAgent = parseChatAgentId(body.chatAgent);
+        const sessionCwd =
+          typeof body.cwd === "string" && body.cwd
+            ? body.cwd
+            : (process.env.GG_APP_CWD ?? process.cwd());
+        const sessionPath =
+          typeof body.sessionPath === "string" && body.sessionPath ? body.sessionPath : undefined;
+        const id = randomUUID();
+        try {
+          const ctx = await createSession(
+            {
+              auth,
+              paths,
+              progress,
+              memoryStore,
+              jiwaStore,
+              broadcastAll,
+              oauthInFlightProviders,
+            },
+            { id, mode, chatAgent, cwd: sessionCwd, sessionPath },
+          );
+          sessions.set(id, ctx);
+          log("INFO", "app-sidecar", "session created", {
+            id,
+            mode,
+            chatAgent,
+            cwd: sessionCwd,
           });
-          daemonJson(res, 500, { error: "Usage is temporarily unavailable." });
-        });
-        return;
-      }
+          daemonJson(res, 200, { sessionId: id });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          log("ERROR", "app-sidecar", "session create failed", { message });
+          daemonJson(res, 500, { error: message });
+        }
+      });
+      return;
+    }
 
-      // ── Per-session delegation ───────────────────────────────────────────
-      const id = sessionIdFromReq(req, url);
-      const ctx = id ? sessions.get(id) : undefined;
-      if (!ctx) {
-        daemonJson(res, 404, { error: "unknown session" });
-        return;
+    // Dispose a session: DELETE /session/:id.
+    if (method === "DELETE" && url.startsWith("/session/")) {
+      const id = decodeURIComponent(url.slice("/session/".length));
+      const ctx = sessions.get(id);
+      if (ctx) {
+        sessions.delete(id);
+        void ctx.dispose().catch(() => {});
+        log("INFO", "app-sidecar", "session disposed", { id });
       }
-      ctx.handle(req, res, url, method);
-    }, "app-sidecar.http"),
-  );
+      daemonJson(res, 200, { ok: true });
+      return;
+    }
+
+    // Progress is daemon-level so the Home screen can paint before a project
+    // session exists; per-session callers still work through the same endpoint.
+    if (method === "GET" && url === "/progress") {
+      daemonJson(res, 200, progress.snapshot());
+      return;
+    }
+
+    // Subscription quota is account-wide, not project/session-specific. OAuth
+    // tokens stay in this daemon; only the active provider's normalized snapshot
+    // reaches the webview.
+    if (method === "GET" && (url === "/usage" || url.startsWith("/usage?"))) {
+      void (async () => {
+        const provider = new URL(url, `http://${host}`).searchParams.get("provider");
+        if (provider !== "anthropic" && provider !== "openai" && provider !== "moonshot") {
+          daemonJson(res, 400, { error: "unsupported usage provider" });
+          return;
+        }
+        daemonJson(res, 200, await subscriptionUsage(provider));
+      })().catch((error) => {
+        log("ERROR", "app-sidecar", "subscription usage request failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+        daemonJson(res, 500, { error: "Usage is temporarily unavailable." });
+      });
+      return;
+    }
+
+    // ── Per-session delegation ───────────────────────────────────────────
+    const id = sessionIdFromReq(req, url);
+    const ctx = id ? sessions.get(id) : undefined;
+    if (!ctx) {
+      daemonJson(res, 404, { error: "unknown session" });
+      return;
+    }
+    ctx.handle(req, res, url, method);
+  });
   server.listen(port, host, () => {
     const addr = server.address() as AddressInfo;
     // The Rust shell reads this line to learn the daemon port (it already
@@ -1338,12 +1321,10 @@ const KEN_ALLOWED_TOOLS = [
   "web_fetch",
   "web_search",
   "screenshot",
+  // Local corpus of real repos: lets Ken verify against code that ships
+  // instead of assuming — core to how he's meant to work. Read-only.
+  "steroids",
 ];
-
-/** MCP servers Ken is allowed to use. kencode-search lets him look into real
- *  public repos / verify against actual code instead of assuming — core to how
- *  he's meant to work. Read-only research; no other MCP server is connected. */
-const KEN_ALLOWED_MCP_SERVERS = ["kencode-search"];
 
 /** Extract the plain text of the most recent assistant message (Ken's reply).
  *  Strips tool-call / image blocks, returning just the prose Ken streamed. */
@@ -1382,6 +1363,8 @@ function buildKenContext(
     cwd,
     gitBranch,
     messages: buildSession.getMessages(),
+    verificationEvidence: buildSession.getVerificationEvidence(),
+    verificationProblem: buildSession.getVerificationProblem(),
     workflowCommands,
     injectedPrompts,
   });
@@ -1462,7 +1445,6 @@ async function createProgressManager(
       lastSeenNonce = updated.lastEvent?.nonce ?? null;
       broadcastAll(buildSnapshot(updated), originId);
     } catch (err) {
-      captureSidecarError(err, "app-sidecar.progress.award");
       log("DEBUG", "app-sidecar", "progress award failed", {
         message: err instanceof Error ? err.message : String(err),
       });
@@ -1492,7 +1474,6 @@ async function createProgressManager(
     watcher.unref();
     progressWatcher = watcher;
   } catch (err) {
-    captureSidecarError(err, "app-sidecar.progress.watch");
     log("DEBUG", "app-sidecar", "progress watch unavailable", {
       message: err instanceof Error ? err.message : String(err),
     });
@@ -1648,10 +1629,7 @@ async function createSession(
           "Start a new session to reset the context.",
         )
         // /model: handle each phrasing pattern
-        .replaceAll(
-          /switch to claude-fable-5 with \/model/gi,
-          "switch to claude-fable-5 using the model selector",
-        )
+        .replaceAll(/switch to (\S+) with \/model/gi, "switch to $1 using the model selector")
         .replaceAll(/Switch with \/model\./gi, "Switch using the model selector.")
         .replaceAll(
           /try a different model with \/model\./gi,
@@ -1696,11 +1674,6 @@ async function createSession(
     const f = formatError(err);
     const message = f.message ? desktopGuidance(f.message) : undefined;
     const guidance = localNetworkGuidance(f.source) ?? desktopGuidance(f.guidance);
-    captureSidecarError(err, `app-sidecar.${logLabel.replaceAll(" ", "-")}`, {
-      scope: type,
-      ...(f.provider ? { provider: f.provider } : {}),
-      ...(f.statusCode != null ? { status: String(f.statusCode) } : {}),
-    });
     log("ERROR", "app-sidecar", logLabel, {
       headline: f.headline,
       source: f.source,
@@ -1742,6 +1715,17 @@ async function createSession(
       }),
   });
 
+  // ── ask_user bridge ────────────────────────────────────────
+  // The `ask_user` tool parks the turn on a human answer. Same shape as the
+  // MCP bridge above: broadcast over SSE, resolved when the webview POSTs
+  // /ask/:id. Registered ONLY here — a TUI/headless/subagent run has nobody to
+  // answer, so the tool is absent there rather than hanging on a dead channel.
+  const asks = createAskUserBridge({
+    broadcast: (prompt) => broadcast("ask_user", prompt),
+    onTimeout: (prompt) => log("WARN", "app-sidecar", "ask_user timed out", { id: prompt.id }),
+  });
+  const askUserTool = createAskUserTool(asks.park);
+
   // The session file path to resume (passed by the daemon's POST /session);
   // empty/unset starts a fresh session.
   const resumeSessionPath = opts.sessionPath;
@@ -1768,14 +1752,17 @@ async function createSession(
     session = createChatAgent(chatAgent, {
       ...baseSessionOptions,
       sessionsDir: paths.sessionsDir,
-      additionalTools: [...buildMemoryTools(memoryStore), ...buildJiwaTools(jiwaStore)],
+      additionalTools: [
+        askUserTool,
+        ...buildMemoryTools(memoryStore),
+        ...buildJiwaTools(jiwaStore),
+      ],
       getSystemPromptTail: () =>
         `${memoryStore.renderForPrompt()}\n\n${jiwaStore.renderForPrompt()}`,
       onAgentChange: async (nextAgent) => {
         chatAgent = nextAgent;
         broadcast("chat_agent_change", { chatAgent: nextAgent });
         await session.persistAppMarker("agent_handoff", { chatAgent: nextAgent }).catch((error) => {
-          captureSidecarError(error, "app-sidecar.chat-agent.persist-handoff");
           log("WARN", "app-sidecar", "agent handoff marker persist failed", {
             message: error instanceof Error ? error.message : String(error),
           });
@@ -1785,6 +1772,7 @@ async function createSession(
   } else {
     session = new AgentSession({
       ...baseSessionOptions,
+      additionalTools: [askUserTool],
       // Plan mode belongs only to the coding agent.
       onEnterPlan: async (reason) => {
         deactivateApprovedPlan();
@@ -2180,6 +2168,7 @@ async function createSession(
   const gitHubSlug: string | null = initialGitHubSlug;
   let gitHubIssues: number | null = null;
   let gitHubPRs: number | null = null;
+  let gitHubCI: GitHubCI | null = null;
   function currentContextWindow(): number {
     const st = session.getState();
     return getContextWindow(st.model, { provider: st.provider, accountId: st.accountId });
@@ -2194,6 +2183,7 @@ async function createSession(
     gitHubIssues: number | null;
     gitHubPRs: number | null;
     gitHubRepoUrl: string | null;
+    gitHubCI: GitHubCI | null;
     tasks: ReturnType<typeof session.listBackgroundProcesses>;
     additionalRoots: string[];
   } {
@@ -2204,6 +2194,7 @@ async function createSession(
       gitDirtyFileCount,
       gitHubIssues,
       gitHubPRs,
+      gitHubCI,
       gitHubRepoUrl: gitHubSlug ? `https://github.com/${gitHubSlug}` : null,
       tasks: session.listBackgroundProcesses(),
       // Roots added with /add-dir — the header shows a badge when non-empty.
@@ -2291,7 +2282,6 @@ async function createSession(
       .catch(() => false)
       .then(() => syncApprovedPlanProgress(generation))
       .catch((error) => {
-        captureSidecarError(error, "app-sidecar.plan.refresh-progress");
         log("WARN", "app-sidecar", "plan progress refresh failed", {
           message: error instanceof Error ? error.message : String(error),
         });
@@ -2339,6 +2329,10 @@ async function createSession(
     recordApprovedPlanMarkers(d.text);
   });
   session.eventBus.on("thinking_delta", (d) => broadcast("thinking_delta", d));
+  session.eventBus.on("retry", (d) => {
+    if (!d.silent) broadcast("retry", { reason: d.reason, attempt: d.attempt, delayMs: d.delayMs });
+  });
+  session.eventBus.on("max_turns", (d) => broadcast("max_turns", d));
   // The agent consumed queued steering at a turn boundary. Re-broadcast as the
   // usual `queued` depth update so the webview drops the pending affordance the
   // moment the message lands in the loop, not at run_end.
@@ -2353,11 +2347,6 @@ async function createSession(
   session.eventBus.on("tool_call_end", (d) => {
     const name = toolCallNames.get(d.toolCallId) ?? "unknown";
     toolCallNames.delete(d.toolCallId);
-    if (d.isError && shouldCaptureToolFailure(name, d.result)) {
-      // Expected model-correctable validation failures stay in the local log and
-      // conversation. Unexpected failures are reported without private result data.
-      captureSidecarError(new Error(`Tool ${name} failed`), `tool.${name}`, { tool: name });
-    }
     log(d.isError ? "ERROR" : "INFO", "tool", `Tool call ended: ${name}`, {
       id: d.toolCallId,
       durationMs: String(d.durationMs),
@@ -2404,6 +2393,7 @@ async function createSession(
   });
   session.eventBus.on("model_change", (d) => broadcast("model_change", d));
   session.eventBus.on("hook", (d) => broadcast("hook", d));
+  session.eventBus.on("diagnostics", (d) => broadcast("diagnostics", d));
   // Fires BEFORE the candidate final answer streams. The webview holds assistant
   // text back while armed, so an Ideal review supersedes a draft that was never
   // painted instead of deleting one the user already started reading.
@@ -2577,7 +2567,6 @@ async function createSession(
       cwd,
       systemPrompt: await buildKenSystemPrompt(cwd),
       allowedTools: KEN_ALLOWED_TOOLS,
-      allowedMcpServers: KEN_ALLOWED_MCP_SERVERS,
       transient: true,
       signal: kenAbort.signal,
       // Ken belongs to THIS window, so its window is where an MCP prompt
@@ -2653,7 +2642,6 @@ async function createSession(
       cwd,
       systemPrompt: await buildKenAutopilotSystemPrompt(cwd),
       allowedTools: KEN_ALLOWED_TOOLS,
-      allowedMcpServers: KEN_ALLOWED_MCP_SERVERS,
       transient: true,
       signal: kenAutoAbort.signal,
       // Same as Ken chat: this reviewer belongs to a window, so route prompts
@@ -2668,8 +2656,10 @@ async function createSession(
     // his own Ideal self-review adds latency and can corrupt the verdict shape.
     ken.setIdealReviewSuppressed(true);
     await ken.initialize();
-    // Deliberately no bus bridge: the review is silent. Errors surface via the
-    // runAutopilotReview try/catch as autopilot_error frames.
+    // Keep review text/tools silent; report usage only for whole-task accounting.
+    ken.eventBus.on("turn_end", (d) => {
+      broadcast("autopilot_usage", { outputTokens: d.usage.outputTokens });
+    });
     kenAutoSession = ken;
     log("INFO", "app-sidecar", "ken autopilot session ready", {
       provider: target.provider,
@@ -2683,8 +2673,9 @@ async function createSession(
     abort.abort();
     // An MCP tool call parked on user input is not cancelled by the signal —
     // the promise lives in the bridge. Release it, or the aborted turn's tool
-    // call never returns.
+    // call never returns. Same for a question parked on the user.
     elicitations.cancelAll();
+    asks.cancelAll();
     // Stop a run-all sweep and every async child through AgentSession's signal.
     taskRunAll = false;
     autopilotCancelled = true;
@@ -2717,7 +2708,11 @@ async function createSession(
 
   // Core provider-run bracket. Standalone runs own a lifecycle generation;
   // injected autopilot runs share the cycle's outer generation.
-  async function runAgent(label: string, run: () => Promise<void>): Promise<void> {
+  async function runAgent(
+    label: string,
+    run: () => Promise<void>,
+    reviewPending: () => boolean = () => false,
+  ): Promise<void> {
     const ownsGeneration = !runLifecycle.running;
     const generation = ownsGeneration
       ? runLifecycle.begin(abortOwnedWork).generation
@@ -2729,7 +2724,11 @@ async function createSession(
     const cancelGenAtStart = cancelGeneration;
     const assistantsBeforeRun = countAssistantMessages(session.getMessages());
     let runSucceeded = false;
-    broadcast("run_start", { text: label, runState: runLifecycle.state });
+    broadcast("run_start", {
+      text: label,
+      runState: runLifecycle.state,
+      continued: !ownsGeneration,
+    });
     try {
       if (!runLifecycle.isCancellationRequested(generation)) await run();
       runSucceeded = true;
@@ -2739,8 +2738,15 @@ async function createSession(
       }
     } finally {
       const cancelled = runLifecycle.isCancellationRequested(generation);
+      const verificationProblem = cancelled ? null : session.getVerificationProblem();
+      if (runSucceeded && verificationProblem && ownsGeneration) {
+        // Expected control outcome: run_end and the journal already carry Unverified.
+        // Do not format it as a crash or persist a misleading error marker.
+        log("WARN", "app-sidecar", "verification incomplete", { message: verificationProblem });
+      }
       if (
         runSucceeded &&
+        !verificationProblem &&
         !cancelled &&
         cancelGeneration === cancelGenAtStart &&
         countAssistantMessages(session.getMessages()) > assistantsBeforeRun
@@ -2758,6 +2764,7 @@ async function createSession(
       // A run may have opened/closed issues or PRs — refresh fire-and-forget so
       // teardown isn't delayed by the network. Broadcasts itself on change.
       void refreshGitHubCounts();
+      void ciPoll.refresh();
       // Serialize behind any marker/tool-triggered refresh so the terminal
       // progress snapshot uses the live plan file. Once every canonical step
       // is complete, remove the approved plan from future system prompts and
@@ -2765,6 +2772,7 @@ async function createSession(
       if (
         runSucceeded &&
         !cancelled &&
+        !verificationProblem &&
         approvedPlanPath !== null &&
         (await queueApprovedPlanProgressSync())
       ) {
@@ -2775,14 +2783,17 @@ async function createSession(
         } catch (error) {
           // Keep tracking when prompt cleanup fails; hiding the widget here
           // would claim completion while the approved-plan contract remained.
-          captureSidecarError(error, "app-sidecar.plan.cleanup");
           log("WARN", "app-sidecar", "completed plan cleanup failed", {
             message: error instanceof Error ? error.message : String(error),
           });
         }
       }
       if (ownsGeneration) {
-        finishOwnedGeneration(generation, false, runSucceeded ? "completed" : "failed");
+        finishOwnedGeneration(
+          generation,
+          false,
+          verificationProblem ? "unverified" : runSucceeded ? "completed" : "failed",
+        );
       }
       // A cancelled injected run is still owned by the surrounding autopilot
       // cycle; its outer finalizer emits the one terminal cancelled run_end.
@@ -2790,6 +2801,21 @@ async function createSession(
         if (cancelled) cancelledRunEndGenerations.add(generation);
         broadcast("run_end", {
           ...(cancelled ? { cancelled: true } : {}),
+          ...(verificationProblem ? { unverified: true } : {}),
+          failed: !cancelled && !runSucceeded,
+          // The cycle refuses an unresolved verification gate. Do not advertise
+          // a review handoff that will exit before emitting any review events.
+          reviewPending:
+            !cancelled &&
+            runSucceeded &&
+            !verificationProblem &&
+            (reviewPending() || !ownsGeneration),
+          ...describeRunVerification(session.getVerificationEvidence(), verificationProblem),
+          turnVerification: describeTurnVerification(
+            session.getRunVerificationActivity(),
+            verificationProblem,
+          ),
+          ...(verificationProblem ? { verificationReason: verificationProblem } : {}),
           runState: runLifecycle.state,
         });
       }
@@ -2820,6 +2846,8 @@ async function createSession(
         cwd,
         gitBranch,
         messages: session.getMessages(),
+        verificationEvidence: session.getVerificationEvidence(),
+        verificationProblem: session.getVerificationProblem(),
         originalRequest,
         injectedPrompts: [...injectedAutopilotPrompts],
         workflowCommands: await loadWorkflowCommandSpecs(),
@@ -2859,6 +2887,8 @@ async function createSession(
         cwd,
         gitBranch,
         messages: session.getMessages(),
+        verificationEvidence: session.getVerificationEvidence(),
+        verificationProblem: session.getVerificationProblem(),
         originalRequest,
         injectedPrompts: [...injectedAutopilotPrompts],
         workflowCommands: await loadWorkflowCommandSpecs(),
@@ -2896,7 +2926,7 @@ async function createSession(
   // control flow lives in driveAutopilotCycle (core/autopilot-cycle.ts) so
   // every exit path is unit-tested; this only wires the real dependencies.
   async function runAutopilotCycle(originalRequest: string): Promise<void> {
-    if (!autopilot || autopilotCancelled) return;
+    if (!autopilot || autopilotCancelled || session.getVerificationProblem()) return;
     const generation = runLifecycle.begin(abortOwnedWork).generation;
     pendingCancelDrain = null;
     autopilotActive = true;
@@ -2911,6 +2941,7 @@ async function createSession(
         // round available.
         maxRounds: pendingPlanPath !== null ? MAX_AUTOPILOT_ROUNDS + 2 : MAX_AUTOPILOT_ROUNDS,
         isCancelled: () => autopilotCancelled,
+        verificationProblem: () => session.getVerificationProblem(),
         // An injected run entering plan mode WITHOUT submitting (enter_plan,
         // no exit_plan) halts the cycle — Ken never prompts into a read-only
         // plan-mode session. A submitted plan takes the planPending branch.
@@ -2923,7 +2954,7 @@ async function createSession(
         // Auto-accept: the inlined POST /plan/accept body. Returns false when
         // the plan generation moved since the review (user acted) — the cycle
         // exits silently and the user's action stands.
-        acceptPlan: async () => {
+        acceptPlan: async (reason) => {
           if (pendingPlanPath === null || planGeneration !== planGenAtReview) return false;
           const planPath = pendingPlanPath;
           let planTotal: number;
@@ -2938,11 +2969,11 @@ async function createSession(
           clearPendingPlan();
           // Keep the approval marker ahead of the reset, then seed the reset
           // with the sidecar's canonical count from the actual plan file.
-          broadcast("autopilot_plan_accepted", {});
+          broadcast("autopilot_plan_accepted", reason ? { reason } : {});
           broadcast("session_reset", { planTotal });
           broadcast("plan_progress", planProgressPayload());
           // Persisted into the NEW session so a resume shows the marker.
-          void session.persistAutopilotMarker("plan_approved");
+          void session.persistAutopilotMarker("plan_approved", { reason });
           return true;
         },
         runImplement: () => {
@@ -3001,9 +3032,10 @@ async function createSession(
               version: 1,
               phase: "done",
               afterMessageCount: session.getPersistedTranscriptCount(),
+              ...event.data,
             });
             broadcast(event.type, { ...event.data, copySeed: seed });
-            void session.persistAutopilotMarker("done");
+            void session.persistAutopilotMarker("done", event.data);
             return;
           }
           broadcast(event.type, event.data);
@@ -3018,7 +3050,11 @@ async function createSession(
     } finally {
       autopilotActive = false;
       session.setIdealReviewSuppressed(autopilot);
-      finishOwnedGeneration(generation, true);
+      finishOwnedGeneration(
+        generation,
+        true,
+        session.getVerificationProblem() ? "unverified" : "completed",
+      );
       queueMicrotask(() => void runStrandedQueue());
     }
   }
@@ -3054,13 +3090,17 @@ async function createSession(
           isWorkflowCommandText(next.text, await loadWorkflowCommandSpecs());
         const assistantsBefore = countAssistantMessages(session.getMessages());
         const messagesBefore = session.getMessages().length;
-        await runAgent(next.text, async () => {
-          if (next.attachments.length > 0) {
-            await session.promptWithAttachments(next.text, next.attachments);
-          } else {
-            await session.prompt(next.text);
-          }
-        });
+        await runAgent(
+          next.text,
+          async () => {
+            if (next.attachments.length > 0) {
+              await session.promptWithAttachments(next.text, next.attachments);
+            } else {
+              await session.prompt(next.text);
+            }
+          },
+          () => autopilot,
+        );
         const decision = shouldStartAutopilotCycle({
           enabled: autopilot,
           cancelled: autopilotCancelled,
@@ -3083,7 +3123,8 @@ async function createSession(
             kind: decision.kind,
           });
           await runAutopilotCycle(next.text);
-        } else if (autopilot) {
+        } else {
+          broadcast("autopilot_ignored", { reason: decision.reason });
           log("INFO", "app-sidecar", "autopilot skipped (queued turn)", {
             reason: decision.reason,
           });
@@ -3287,6 +3328,10 @@ async function createSession(
     gitHubPoll.unref?.();
   };
   scheduleGitHubPoll(2000);
+  const ciPoll = startGitHubCIPoll(cwd, (next) => {
+    gitHubCI = next;
+    broadcast("extras", footerExtras());
+  });
 
   function readBody(req: http.IncomingMessage, res: http.ServerResponse): Promise<string | null> {
     return readCappedBody(req, res);
@@ -3336,7 +3381,6 @@ async function createSession(
         .snapshot()
         .then((snapshot) => json(res, 200, snapshot))
         .catch((error) => {
-          captureSidecarError(error, "app-sidecar.memory.snapshot");
           json(res, 500, { error: error instanceof Error ? error.message : String(error) });
         });
       return;
@@ -3353,7 +3397,6 @@ async function createSession(
         .then(() => memoryStore.snapshot())
         .then((snapshot) => json(res, 200, snapshot))
         .catch((error) => {
-          captureSidecarError(error, "app-sidecar.memory.forget");
           json(res, 500, { error: error instanceof Error ? error.message : String(error) });
         });
       return;
@@ -3364,7 +3407,6 @@ async function createSession(
         .snapshot()
         .then((snapshot) => json(res, 200, snapshot))
         .catch((error) => {
-          captureSidecarError(error, "app-sidecar.jiwa.snapshot");
           json(res, 500, { error: error instanceof Error ? error.message : String(error) });
         });
       return;
@@ -3381,7 +3423,6 @@ async function createSession(
         .then(() => jiwaStore.snapshot())
         .then((snapshot) => json(res, 200, snapshot))
         .catch((error) => {
-          captureSidecarError(error, "app-sidecar.jiwa.forget");
           json(res, 500, { error: error instanceof Error ? error.message : String(error) });
         });
       return;
@@ -3404,6 +3445,7 @@ async function createSession(
             mode,
             chatAgent,
             running,
+            reviewPending: autopilotActive,
             runState: runLifecycle.state,
             thinkingLevel: session.getThinkingLevel() ?? null,
             supportedThinkingLevels: getSupportedThinkingLevels(st.provider, st.model),
@@ -3426,7 +3468,6 @@ async function createSession(
       void listInstalledPlugins(paths.extensionsDir)
         .then((plugins) => json(res, 200, { plugins }))
         .catch((error) => {
-          captureSidecarError(error, "app-sidecar.plugins.list");
           json(res, 500, { error: error instanceof Error ? error.message : String(error) });
         });
       return;
@@ -3444,7 +3485,6 @@ async function createSession(
           const plugin = await installPlugin(bundlePath, paths.extensionsDir);
           json(res, 200, { plugin, restartRequired: true });
         } catch (error) {
-          captureSidecarError(error, "app-sidecar.plugins.install");
           json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
       });
@@ -3456,7 +3496,6 @@ async function createSession(
       void removePlugin(pluginId, paths.extensionsDir)
         .then(() => json(res, 200, { removed: pluginId, restartRequired: true }))
         .catch((error) => {
-          captureSidecarError(error, "app-sidecar.plugins.remove");
           json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         });
       return;
@@ -3540,7 +3579,6 @@ async function createSession(
           await fs.mkdir(dir, { recursive: true });
           json(res, 200, { path: dir });
         } catch (err) {
-          captureSidecarError(err, "app-sidecar.project.create");
           json(res, 500, { error: err instanceof Error ? err.message : String(err) });
         }
       });
@@ -3575,7 +3613,6 @@ async function createSession(
           await saveAppSettings(settings);
           json(res, 200, { hidden: Array.from(current) });
         } catch (err) {
-          captureSidecarError(err, "app-sidecar.projects.hidden");
           json(res, 500, { error: err instanceof Error ? err.message : String(err) });
         }
       });
@@ -3596,7 +3633,6 @@ async function createSession(
         )
         .then((projects) => json(res, 200, { projects }))
         .catch((err) => {
-          captureSidecarError(err, "app-sidecar.projects.discover");
           log("ERROR", "app-sidecar", "discoverProjects failed", {
             message: err instanceof Error ? err.message : String(err),
           });
@@ -3616,10 +3652,7 @@ async function createSession(
       // agent or request the combined, recency-sorted "all" listing.
       void listSidecarSessions(target, requestedAgent, paths.sessionsDir)
         .then((sessions) => json(res, 200, { sessions }))
-        .catch((error) => {
-          captureSidecarError(error, "app-sidecar.sessions.list");
-          json(res, 200, { sessions: [] });
-        });
+        .catch(() => json(res, 200, { sessions: [] }));
       return;
     }
 
@@ -3628,7 +3661,6 @@ async function createSession(
       void searchProjectFiles(cwd, q)
         .then((files) => json(res, 200, { files }))
         .catch((err) => {
-          captureSidecarError(err, "app-sidecar.files.search");
           log("ERROR", "app-sidecar", "searchProjectFiles failed", {
             message: err instanceof Error ? err.message : String(err),
           });
@@ -4119,6 +4151,13 @@ async function createSession(
             json(res, 400, { error: "empty prompt" });
             return;
           }
+          // A typed prompt supersedes any question parked on the user: they
+          // answered with a message of their own. Release the blocked tool call
+          // NOW — otherwise it waits out its ten-minute timeout while this very
+          // message sits behind it as steering that only drains once the tool
+          // returns, so the turn looks frozen. The webview closes the band on
+          // send; a racing /ask POST just 409s.
+          asks.cancelAll({ action: "cancel", superseded: true });
           if (
             runLifecycle.running &&
             runLifecycle.isCancellationRequested(runLifecycle.generation)
@@ -4202,20 +4241,24 @@ async function createSession(
           clearPendingPlan();
           const assistantsBefore = countAssistantMessages(session.getMessages());
           const messagesBefore = session.getMessages().length;
-          await runAgent(text, async () => {
-            if (attachments.length > 0) {
-              // Persist each attachment under .gg/uploads so files are inspectable
-              // by the agent's tools, then prompt with the media as native blocks.
-              const prepared = await prepareAttachments(cwd, attachments);
-              await session.promptWithAttachments(text, prepared);
-            } else {
-              // Pass the raw text straight through. AgentSession.prompt() is the
-              // single source of truth for slash-command expansion (built-in +
-              // `.gg/commands/*.md` custom), so the agent gets the right body
-              // while the webview keeps showing the short `/name`.
-              await session.prompt(text);
-            }
-          });
+          await runAgent(
+            text,
+            async () => {
+              if (attachments.length > 0) {
+                // Persist each attachment under .gg/uploads so files are inspectable
+                // by the agent's tools, then prompt with the media as native blocks.
+                const prepared = await prepareAttachments(cwd, attachments);
+                await session.promptWithAttachments(text, prepared);
+              } else {
+                // Pass the raw text straight through. AgentSession.prompt() is the
+                // single source of truth for slash-command expansion (built-in +
+                // `.gg/commands/*.md` custom), so the agent gets the right body
+                // while the webview keeps showing the short `/name`.
+                await session.prompt(text);
+              }
+            },
+            () => autopilot,
+          );
           // After the user's run settles, kick off Ken's auto-review loop — but
           // only when the turn is actually reviewable (shouldStartAutopilotCycle):
           // workflow commands (/compare, /expand, …) end with reports or
@@ -4246,7 +4289,8 @@ async function createSession(
           if (decision.start) {
             log("INFO", "app-sidecar", "autopilot cycle starting", { kind: decision.kind });
             await runAutopilotCycle(text);
-          } else if (autopilot) {
+          } else {
+            broadcast("autopilot_ignored", { reason: decision.reason });
             log("INFO", "app-sidecar", "autopilot skipped", { reason: decision.reason });
           }
           // A prompt sent while Ken was reviewing (build idle) queued but had no
@@ -4374,7 +4418,6 @@ async function createSession(
           json(res, 200, result);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          captureSidecarError(err, "app-sidecar.prompt-enhancer");
           log("ERROR", "app-sidecar", "enhance failed", { message });
           json(res, 500, { error: message });
         }
@@ -4684,10 +4727,14 @@ async function createSession(
         }
         // `false` means it already drained into the run between render and
         // click. That is a race, not an error, so report it as a normal result
-        // and let the client reconcile from the fresh list.
+        // and let the client reconcile through the ordered event stream.
         const cancelled = session.cancelQueuedMessage(id);
         const queued = session.listQueuedMessages();
-        broadcast("queued", { count: queued.length, messages: queued });
+        broadcast("queued", {
+          count: queued.length,
+          messages: queued,
+          ...(cancelled ? { cancelledId: id } : {}),
+        });
         json(res, 200, { cancelled, queued });
       });
       return;
@@ -4809,7 +4856,6 @@ async function createSession(
           drained,
         });
       })().catch((error) => {
-        captureSidecarError(error, "app-sidecar.run.cancel");
         broadcast("cancel_failed", { error: "cancel_failed", runState: runLifecycle.state });
         json(res, 500, {
           error: "cancel_failed",
@@ -4838,7 +4884,6 @@ async function createSession(
           json(res, 200, { ok: true });
         })
         .catch((err) => {
-          captureSidecarError(err, "app-sidecar.session.new");
           json(res, 500, { error: err instanceof Error ? err.message : String(err) });
         });
       return;
@@ -4893,7 +4938,6 @@ async function createSession(
           broadcast("plan_progress", planProgressPayload());
           json(res, 200, { ok: true, planTotal });
         } catch (err) {
-          captureSidecarError(err, "app-sidecar.plan.accept");
           json(res, 500, { error: err instanceof Error ? err.message : String(err) });
         }
       });
@@ -5018,7 +5062,6 @@ async function createSession(
             // The OAuth provider's models just became selectable everywhere.
             broadcastAll("models_change", {});
           } catch (err) {
-            captureSidecarError(err, "app-sidecar.auth.oauth", { provider });
             // Deliberately session-scoped: this is the outcome of ONE window's
             // attempt. Another window that never pressed Connect has nothing to
             // show an error about, and its modal correctly still offers login.
@@ -5087,6 +5130,50 @@ async function createSession(
         // the tool call has moved on, so the answer has nowhere to go.
         if (!elicitations.settle(id, result)) {
           json(res, 409, { error: "no elicitation is awaiting a response" });
+          return;
+        }
+        json(res, 200, { ok: true });
+      });
+      return;
+    }
+
+    // Answer (or dismiss) an `ask_user` question band. The turn is blocked on
+    // this, so both paths must land: "answer" carries the picked values,
+    // "cancel" releases the tool call with no answer.
+    if (method === "POST" && url.startsWith("/ask/")) {
+      const id = decodeURIComponent(url.slice("/ask/".length));
+      void readBody(req, res).then((raw) => {
+        if (raw === null) return;
+        let result: AskUserResult;
+        try {
+          const parsed = JSON.parse(raw) as {
+            action?: string;
+            answers?: Record<string, unknown>;
+          };
+          if (parsed.action !== "answer" && parsed.action !== "cancel") {
+            json(res, 400, { error: "action must be answer or cancel" });
+            return;
+          }
+          if (parsed.action === "cancel") {
+            result = { action: "cancel" };
+          } else {
+            // Only strings and string arrays are answers; anything else is a
+            // malformed client, not a value to hand the model.
+            const answers: Record<string, string | string[]> = {};
+            for (const [key, value] of Object.entries(parsed.answers ?? {})) {
+              if (typeof value === "string") answers[key] = value;
+              else if (Array.isArray(value) && value.every((v) => typeof v === "string")) {
+                answers[key] = value as string[];
+              }
+            }
+            result = { action: "answer", answers };
+          }
+        } catch {
+          json(res, 400, { error: "invalid JSON body" });
+          return;
+        }
+        if (!asks.settle(id, result)) {
+          json(res, 409, { error: "no question is awaiting an answer" });
           return;
         }
         json(res, 200, { ok: true });
@@ -5370,7 +5457,6 @@ async function createSession(
           json(res, 200, { running: true });
         } catch (err) {
           serveController = null;
-          captureSidecarError(err, "app-sidecar.serve.start", { provider: st.provider });
           json(res, 400, { error: err instanceof Error ? err.message : String(err) });
         }
       })();
@@ -5390,6 +5476,25 @@ async function createSession(
       return;
     }
 
+    // ── Agent Steroids (local code corpus) ───────────────────────────────
+    if (method === "GET" && url === "/steroids") {
+      void probeSteroids().then((status) => json(res, 200, status));
+      return;
+    }
+
+    if (method === "POST" && url === "/steroids/install") {
+      void installSteroids()
+        .then((status) => {
+          broadcast("steroids_change", status);
+          log("INFO", "app-sidecar", "steroids installed", { version: status.version });
+          json(res, 200, status);
+        })
+        .catch((err: unknown) => {
+          json(res, 400, { error: err instanceof Error ? err.message : String(err) });
+        });
+      return;
+    }
+
     // ── MCP server management (mirrors `ggcoder mcp`) ──────────────────
     // `targetCwd` (project scope) overrides the window cwd so a server can be
     // added/removed for ANY discovered project, not just this window's. Global
@@ -5399,7 +5504,6 @@ async function createSession(
       void buildMcpRows(targetCwd, paths.settingsFile)
         .then((servers) => json(res, 200, { servers }))
         .catch((err) => {
-          captureSidecarError(err, "app-sidecar.mcp.list");
           log("ERROR", "app-sidecar", "buildMcpRows failed", {
             message: err instanceof Error ? err.message : String(err),
           });
@@ -5466,7 +5570,6 @@ async function createSession(
             requiresAuth: probe.requiresAuth,
           });
         } catch (err) {
-          captureSidecarError(err, "app-sidecar.mcp.add", { server: config.name });
           json(res, 500, {
             error: err instanceof Error ? err.message : String(err),
           });
@@ -5560,7 +5663,6 @@ async function createSession(
             broadcast("mcp_auth_error", { name, message: result.error ?? "Login failed." });
           }
         } catch (err) {
-          captureSidecarError(err, "app-sidecar.mcp.login", { server: name });
           broadcast("mcp_auth_error", {
             name,
             message: err instanceof Error ? err.message : String(err),
@@ -5577,12 +5679,14 @@ async function createSession(
 
   async function dispose(): Promise<void> {
     elicitations.cancelAll();
+    asks.cancelAll();
     tasksPollStopped = true;
     if (tasksPoll) clearTimeout(tasksPoll);
     gitPollStopped = true;
     if (gitPoll) clearTimeout(gitPoll);
     gitHubPollStopped = true;
     if (gitHubPoll) clearTimeout(gitHubPoll);
+    ciPoll.stop();
     // Stop the Telegram serve loop + dispose its per-chat sessions.
     if (serveController) await serveController.stop().catch(() => {});
     for (const c of clients) c.res.end();
@@ -5610,8 +5714,6 @@ async function createSession(
 }
 
 main().catch(async (err) => {
-  captureSidecarError(err, "app-sidecar.main", { severity: "fatal" });
-  await flushSidecarErrors();
   const message = err instanceof Error ? err.message : String(err);
   process.stderr.write(`GG_APP_FATAL ${message}\n`);
   process.exit(1);

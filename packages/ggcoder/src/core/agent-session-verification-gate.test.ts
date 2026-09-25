@@ -17,7 +17,7 @@ import { ProcessManager } from "./process-manager.js";
 interface GateInternals {
   processManager?: ProcessManager;
   runStartedAt: number;
-  getHookFollowUpMessages(): Message[] | null;
+  getHookFollowUpMessages(): Promise<Message[] | null>;
   trackHookEvent(event: AgentEvent): Promise<void>;
   verificationGate: {
     recordMutation(): void;
@@ -56,8 +56,11 @@ afterEach(async () => {
   await session?.dispose();
   session = undefined;
   restoreHome?.();
-  await fs.rm(tmpHome, { recursive: true, force: true });
-  await fs.rm(tmpProject, { recursive: true, force: true });
+  // maxRetries: on Windows a just-reaped child's log handle can outlive the
+  // process (background logs live under tmpHome), and a recursive rm then
+  // fails with EBUSY.
+  await fs.rm(tmpHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  await fs.rm(tmpProject, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 async function makeSession(): Promise<GateInternals> {
@@ -74,6 +77,29 @@ async function makeSession(): Promise<GateInternals> {
   return session as unknown as GateInternals;
 }
 
+/**
+ * Wait for a background process to genuinely exit.
+ *
+ * A fixed budget is not a substitute: this test's whole claim is that the agent
+ * read a FINISHED run, and `npm test` cold-starts in ~6s on the Windows runner
+ * — past the 5s the old poll loop allowed, after which it silently continued
+ * and asserted against a still-running process. Fail loudly instead.
+ */
+async function waitForExit(
+  manager: ProcessManager,
+  id: string,
+  timeoutMs = 45_000,
+): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const proc = manager.list().find((entry) => entry.id === id);
+    if (!proc) throw new Error(`Background process ${id} disappeared before it exited.`);
+    if (proc.exitCode !== null) return proc.exitCode;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Background process ${id} did not exit within ${timeoutMs}ms.`);
+}
+
 let callSeq = 0;
 
 async function simulateToolCall(
@@ -81,6 +107,7 @@ async function simulateToolCall(
   name: string,
   args: Record<string, unknown>,
   isError = false,
+  result = "",
 ): Promise<void> {
   const toolCallId = `call-${++callSeq}`;
   await internal.trackHookEvent({
@@ -92,7 +119,7 @@ async function simulateToolCall(
   await internal.trackHookEvent({
     type: "tool_call_end",
     toolCallId,
-    result: "",
+    result,
     isError,
     durationMs: 1,
   } as unknown as AgentEvent);
@@ -106,7 +133,7 @@ describe("AgentSession verification gate", () => {
     await simulateToolCall(internal, "edit", { file_path: "src/a.ts" });
     await simulateToolCall(internal, "bash", { command: "cat src/a.ts" });
 
-    const followUp = internal.getHookFollowUpMessages();
+    const followUp = await internal.getHookFollowUpMessages();
     expect(followUp).not.toBeNull();
     expect(String(followUp![0]!.content)).toContain("src/a.ts");
     expect(String(followUp![0]!.content)).toContain("Run the project's verification");
@@ -116,10 +143,16 @@ describe("AgentSession verification gate", () => {
     const internal = await makeSession();
 
     await simulateToolCall(internal, "edit", { file_path: "src/a.ts" });
-    await simulateToolCall(internal, "bash", { command: "pnpm vitest run" });
+    await simulateToolCall(
+      internal,
+      "bash",
+      { command: "pnpm vitest run" },
+      false,
+      "Exit code: 0\n",
+    );
 
     expect(internal.verificationGate.isOwed()).toBe(false);
-    expect(internal.getHookFollowUpMessages()).toBeNull();
+    expect(await internal.getHookFollowUpMessages()).toBeNull();
   });
 
   it("ignores edits to non-code files and background verification", async () => {
@@ -140,14 +173,14 @@ describe("AgentSession verification gate", () => {
     const internal = await makeSession();
 
     await simulateToolCall(internal, "edit", { file_path: "src/a.ts" });
-    const demand = internal.getHookFollowUpMessages()!;
+    const demand = (await internal.getHookFollowUpMessages())!;
     expect(String(demand[0]!.content)).toContain("Run the project's verification");
 
     // Second stop, still unverified: no further follow-up, so the run ends on
     // the model's next final answer rather than a third restated one.
     expect(internal.verificationGate.isOwed()).toBe(true);
-    expect(internal.getHookFollowUpMessages()).toBeNull();
-    expect(internal.getHookFollowUpMessages()).toBeNull();
+    expect(await internal.getHookFollowUpMessages()).toBeNull();
+    expect(await internal.getHookFollowUpMessages()).toBeNull();
   });
 
   it("counts reading a finished background verification run as verification", async () => {
@@ -156,33 +189,37 @@ describe("AgentSession verification gate", () => {
     managers.push(manager);
     internal.processManager = manager;
 
-    // A real short verification-shaped process; it exits non-zero (empty dir),
-    // which is fine — the agent SAW the result, that is what counts.
-    const started = await manager.start("npm test", tmpProject);
-    for (
-      let i = 0;
-      i < 100 && manager.list().find((p) => p.id === started.id)?.exitCode === null;
-      i += 1
-    ) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-
+    await fs.writeFile(
+      path.join(tmpProject, "verification.test.mjs"),
+      "import assert from 'node:assert/strict'; assert.equal(1 + 1, 2);\n",
+    );
     await simulateToolCall(internal, "edit", { file_path: "src/a.ts" });
-    await simulateToolCall(internal, "bash", {
-      command: "npm test",
-      run_in_background: true,
-    });
+    const command = "node --test verification.test.mjs";
+    const started = await manager.start(command, tmpProject);
+    await simulateToolCall(
+      internal,
+      "bash",
+      {
+        command,
+        run_in_background: true,
+      },
+      false,
+      `ID: ${started.id}\n`,
+    );
     expect(internal.verificationGate.isOwed()).toBe(true); // background ≠ verified
 
+    expect(await waitForExit(manager, started.id)).toBe(0);
     await simulateToolCall(internal, "task_output", { id: started.id });
-    expect(internal.verificationGate.isOwed()).toBe(false); // read of the finished run
-  });
+    expect(internal.verificationGate.isOwed()).toBe(false); // observed success after the edit
+    // Longer than the 20s default: the assertion below is about a FINISHED run,
+    // and npm's cold start on the Windows runner is measured in seconds.
+  }, 60_000);
 
   it("is disabled by the verificationGateEnabled setting", async () => {
     const internal = await makeSession();
     await internal.settingsManager.set("verificationGateEnabled", false);
 
     await simulateToolCall(internal, "edit", { file_path: "src/a.ts" });
-    expect(internal.getHookFollowUpMessages()).toBeNull();
+    expect(await internal.getHookFollowUpMessages()).toBeNull();
   });
 });

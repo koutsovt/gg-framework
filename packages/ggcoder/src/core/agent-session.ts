@@ -8,6 +8,7 @@ import {
 } from "@kenkaiiii/gg-agent";
 import {
   ProviderError,
+  stream,
   type Message,
   type MessageProvenance,
   type Provider,
@@ -25,6 +26,7 @@ import {
 } from "./slash-commands.js";
 import { PROMPT_COMMANDS, getPromptCommand } from "./prompt-commands.js";
 import { loadCustomCommands } from "./custom-commands.js";
+import { expandPromptCommand } from "./prompt-command-expansion.js";
 import { SettingsManager } from "./settings-manager.js";
 import { AuthStorage } from "./auth-storage.js";
 import { dualAuthProvider } from "@kenkaiiii/gg-core";
@@ -84,7 +86,11 @@ import {
 import { partitionToolsByTier } from "../tools/tool-tiers.js";
 import type { BackgroundProcess } from "./process-manager.js";
 import { buildProcessCompletionFollowUp } from "./process-gate.js";
-import { buildSubAgentCompletionFollowUp, type SubAgentManager } from "./subagent-manager.js";
+import {
+  buildSubAgentCompletionFollowUp,
+  type SubAgentManager,
+  type SubAgentState,
+} from "./subagent-manager.js";
 import { applyAsyncSubagentPolicy } from "./subagent-policy.js";
 import { z } from "zod";
 import { MCPClientManager, getAllMcpServers } from "./mcp/index.js";
@@ -99,15 +105,23 @@ import {
   type ImportForeignTranscriptResult,
 } from "./foreign-session-import.js";
 import { createToolSearchTool } from "../tools/tool-search.js";
+import { createSessionStatsTool } from "../tools/session-stats.js";
+import {
+  createDiagnoseCommand,
+  isInternalDiagnosticsEnabled,
+  SessionDiagnosticsRecorder,
+} from "./internal-diagnostics.js";
 import { log } from "./logger.js";
 import { setEstimatorModel, calibrateEstimatorFromUsage } from "./compaction/token-estimator.js";
 import { calculateActiveContextTokens } from "./compaction/active-context.js";
 import { resolveCompactionPolicy } from "./compaction/policy.js";
+import { clampThinkingForPlanMode } from "./thinking-level.js";
 import { pruneStaleToolResults } from "./compaction/tool-result-pruner.js";
 import { discoverAgents } from "./agents.js";
 import { enhancePrompt, type EnhanceResult } from "../utils/prompt-enhancer.js";
-import { detectProjectStack } from "./language-detector.js";
+import { detectLanguages, detectProjectStack, type LanguageId } from "./language-detector.js";
 import {
+  type IdealReviewDecision,
   type IdealReviewStats,
   evaluateIdealReview,
   buildIdealReviewMessage,
@@ -126,10 +140,39 @@ import {
   detectTextRepetition,
   type CycleDetection,
 } from "./loop-breaker.js";
-import { buildRegroundingMessage } from "./regrounding.js";
+import { buildRegroundingMessage, requestTextForRegrounding } from "./regrounding.js";
+import {
+  buildSemanticLoopJudgePrompt,
+  buildSemanticLoopMessage,
+  MAX_SEMANTIC_LOOP_CALLS,
+  parseSemanticLoopVerdict,
+  shouldRunSemanticLoopCheck,
+  SEMANTIC_LOOP_JUDGE_TIMEOUT_MS,
+  withJudgeTimeout,
+  type SemanticCallDigest,
+  type SemanticLoopVerdict,
+} from "./semantic-loop-check.js";
+import {
+  buildIndependentReviewMessage,
+  buildReviewerTask,
+  INDEPENDENT_REVIEW_SCORE_THRESHOLD,
+  parseReviewerFindings,
+  REVIEWER_TOOLS,
+  REVIEWER_WAIT_MS,
+} from "./ideal-review-subagent.js";
+import { buildEnvDeltaMessage } from "./env-delta.js";
 import { wrapSteeringText, buildNotificationSteeringText, STEERING_PREFIX } from "./steering.js";
 import { AgentNotificationQueue } from "./agent-notifications.js";
-import { VerificationGate, isCodeFilePath, isVerificationCommand } from "./verification-gate.js";
+import {
+  VerificationGate,
+  extractAddedLines,
+  isCheckOwnFile,
+  isCodeFilePath,
+  VERIFICATION_STATE_KIND,
+  isVerificationCommand,
+} from "./verification-gate.js";
+import { classifyVerificationCommand, type VerificationEvidence } from "./verification-evidence.js";
+import { captureVerificationSnapshot } from "./verification-snapshot.js";
 
 import { findUserSessionPrompt, getUserSessionPrompt } from "./session-preview.js";
 import { normalizeMessageImages } from "./message-images.js";
@@ -156,6 +199,17 @@ export interface SessionAttachment {
   data: string;
   name: string;
   path?: string;
+}
+
+/** Terminal subagent states — mirrors SubAgentManager's private isTerminal. */
+function isTerminalSubAgentState(state: SubAgentState): boolean {
+  return (
+    state === "completed" ||
+    state === "failed" ||
+    state === "interrupted" ||
+    state === "closed" ||
+    state === "reaped"
+  );
 }
 
 export interface AgentSessionOptions {
@@ -259,9 +313,9 @@ export interface AgentSessionOptions {
    * MCP server names whose tools are allowed in an allow-listed session. Only
    * meaningful alongside `allowedTools`. With it set, the session connects ONLY
    * these named MCP servers (not the full configured set) and every tool they
-   * expose (`mcp__<server>__*`) passes the allow-list. The Ken mentor agent uses
-   * this to get `kencode-search` for real-code research while still being barred
-   * from every mutating tool. Empty/undefined → an allow-listed session skips
+   * expose (`mcp__<server>__*`) passes the allow-list, so a read-only agent can
+   * be handed one research server while still being barred from every mutating
+   * tool. Empty/undefined → an allow-listed session skips
    * MCP entirely (its dynamic tool names could never match a fixed allow-list).
    */
   allowedMcpServers?: string[];
@@ -283,6 +337,10 @@ export interface AgentSessionOptions {
   coderSlashCommands?: boolean;
   /** Enable loop-break, re-grounding, and Ideal review hooks. Defaults to true. */
   selfCorrectionHooks?: boolean;
+  /** Override the semantic-loop judge LLM call (tests). Receives the finished
+   *  prompt, returns the model's raw reply. Default: one-shot `stream()` call
+   *  on the session's ACTIVE model. */
+  semanticLoopJudge?: (prompt: string) => Promise<string>;
   /** Load project skills/agents and create local .gg directories. Defaults to true. */
   projectCustomization?: boolean;
   /** Register global + bundled subagents without loading project customization. */
@@ -383,6 +441,9 @@ export class AgentSession {
   // transcript rows the live run showed.
   private appMarkers: AppMarkerPayload[] = [];
   private turnMetrics: TurnMetricPayload[] = [];
+  /** Internal-only (GG_INTERNAL): live per-session cost/reliability recorder.
+   * Absent entirely in public builds — see core/internal-diagnostics.ts. */
+  private diagnosticsRecorder?: SessionDiagnosticsRecorder;
   private tools: AgentTool[] = [];
   /** Rebuilds the read tool for a new model (video byte cap is baked in at
    *  creation). Called from switchModel so video-capable models get the
@@ -409,7 +470,19 @@ export class AgentSession {
   private hookCycleDetector = new CycleDetector();
   private hookCyclicPattern: CycleDetection | null = null;
   private hookFileEditCounts = new Map<string, number>();
-  private hookToolCalls = new Map<string, { name: string; args: Record<string, unknown> }>();
+  private hookToolCalls = new Map<
+    string,
+    {
+      name: string;
+      args: Record<string, unknown>;
+      revision: number;
+      sourceSnapshot?: string | null;
+    }
+  >();
+  private backgroundVerification = new Map<
+    string,
+    { revision: number; command: string; sourceSnapshot?: string | null }
+  >();
   private idealReviewPhase: "idle" | "reviewing" | "complete" = "idle";
   /** Runtime-only suppression while Ken owns verification in autopilot mode. */
   private idealReviewSuppressed = false;
@@ -427,6 +500,26 @@ export class AgentSession {
   /** 0 = none; 1 = first nudge sent; 2 = final stop-and-report injected. */
   private loopBreakInjected: 0 | 1 | 2 = 0;
   private regroundingInjected = false;
+  /** Recent tool-call digests for the semantic loop judge — bounded ring. */
+  private hookRecentCalls: SemanticCallDigest[] = [];
+  /** LLM-judged loop detection state. `verdict` holds a LOOP verdict awaiting
+   *  injection at the next steering poll; judge failures fail open (no
+   *  injection) and still consume budget + cooldown. */
+  private semanticLoop: {
+    checksUsed: number;
+    lastCheckTurn: number;
+    pending: boolean;
+    verdict: SemanticLoopVerdict | null;
+    injected: boolean;
+  } = { checksUsed: 0, lastCheckTurn: 0, pending: false, verdict: null, injected: false };
+  /** Independent Ideal reviewer spawned once per run (score-gated). */
+  private independentReviewStarted = false;
+  /**
+   * The environment as the cached system prompt currently describes it.
+   * Re-recorded on every prompt build, so a rebuild (e.g. `/add-dir`) needs no
+   * delta; anything that changes WITHOUT one is caught by the hook below.
+   */
+  private renderedEnvironment: SystemPromptEnvironment = {};
   /** Wall-clock start of the current run; scopes the background-process gate. */
   private runStartedAt = 0;
   /** Gate injections spent this run, capped by MAX_PROCESS_GATE_INJECTIONS. */
@@ -437,6 +530,15 @@ export class AgentSession {
    *  only on a real edge. */
   private verificationArmed = false;
   private compactionOccurred = false;
+  /**
+   * Re-grounding carry-over for post-turn compaction. `resetHookState` clears
+   * `compactionOccurred` at run start — before the injection point — so a
+   * background compaction that finished after the final response parks its
+   * "re-ground next turn" signal here for pickup at the next run start.
+   */
+  private compactionArmedForNextRun = false;
+  /** In-flight post-turn (background) compaction, if any. */
+  private postTurnCompaction?: Promise<void>;
   private lastCompactionCompacted = false;
   private compactionRetryAfter = 0;
   /** A restored oversized checkpoint must be canonicalized before its first prompt is persisted. */
@@ -465,6 +567,7 @@ export class AgentSession {
   private readonly notifications = new AgentNotificationQueue();
   private managerAbortSignal?: AbortSignal;
   private readonly managerAbortHandler = () => {
+    this.lspManager?.clearPendingDiagnostics();
     void this.subAgentManager?.interruptAll();
   };
   private mcpManager?: MCPClientManager;
@@ -499,6 +602,13 @@ export class AgentSession {
   private agentPrompt?: string;
   /** Stable prompt prefix retained separately from the volatile uncached tail. */
   private baseSystemPrompt = "";
+  /**
+   * Project languages whose style packs and verify commands are in the
+   * standard prompt. Only ever grows within a session (same policy as the
+   * terminal UI): a pack disappearing mid-task would rewrite the cached prefix
+   * for no benefit.
+   */
+  private activeLanguages = new Set<LanguageId>();
   /** Shared with the tool layer so plan-mode restrictions read live state. */
   private planModeRef = { current: false };
   /** Path of the approved plan currently being implemented, or undefined. When
@@ -637,6 +747,7 @@ export class AgentSession {
       provider: this.provider,
       model: this.model,
       lspDiagnostics: this.settingsManager.get("lspDiagnostics"),
+      deferLspDiagnostics: true,
       getWriteGuardSettings: () => ({
         allowOutsideWorkspaceWrites: this.settingsManager.get("allowOutsideWorkspaceWrites"),
         additionalRoots: this.additionalRoots,
@@ -691,6 +802,11 @@ export class AgentSession {
         : {}),
     });
     const tools = [...builtInTools, ...(this.opts.additionalTools ?? [])];
+    // Internal-only tool, appended last so public sessions keep a
+    // byte-identical tool block (prefix-cache stability).
+    if (isInternalDiagnosticsEnabled()) {
+      tools.push(createSessionStatsTool(() => this.diagnosticsRecorder));
+    }
     // Apply the optional tool allow-list (read-only advisory sessions). Filtering
     // here means the excluded tools are never registered with the agent loop, so
     // a hallucinated call can't mutate the repo — and buildSystemPrompt below is
@@ -794,6 +910,21 @@ export class AgentSession {
       const builtins = createBuiltinCommands();
       for (const cmd of builtins) this.slashCommands.register(cmd);
 
+      // Internal-only diagnostics: recorder + /diagnose exist exclusively when
+      // the internal flag is on. Public sessions never see either, so the
+      // command list and prompt stay identical to a build without this code.
+      if (isInternalDiagnosticsEnabled()) {
+        this.diagnosticsRecorder = new SessionDiagnosticsRecorder({
+          // Lazy: the session id is assigned at first prompt, not init.
+          sessionId: () => this.sessionId,
+          cwd: this.cwd,
+          provider: this.provider,
+          model: this.model,
+        });
+        this.diagnosticsRecorder.attach(this.eventBus);
+        this.slashCommands.register(createDiagnoseCommand());
+      }
+
       // Wire up /help to show all registered + prompt + custom commands.
       const helpCmd = this.slashCommands.get("help");
       if (helpCmd) {
@@ -844,7 +975,7 @@ export class AgentSession {
    * everything passes (default behavior). Otherwise a tool is allowed when its
    * name is in `allowedTools`, OR it's an MCP tool (`mcp__<server>__<tool>`)
    * whose `<server>` is in `allowedMcpServers`. The MCP-prefix rule lets a
-   * whitelisted research server (e.g. kencode-search) expose all its tools
+   * whitelisted research server expose all its tools
    * without hard-coding each one, while every other tool stays blocked.
    */
   private isToolAllowed(name: string): boolean {
@@ -872,8 +1003,7 @@ export class AgentSession {
     if (!this.mcpManager) return;
     // Allow-listed (read-only advisory) sessions enforce a fixed tool set by
     // name. An MCP server is only connected when its name is explicitly
-    // whitelisted via `allowedMcpServers` (the Ken mentor agent does this for
-    // `kencode-search` so it can research real code). With no whitelist, skip
+    // whitelisted via `allowedMcpServers`. With no whitelist, skip
     // MCP entirely — dynamic `mcp__server__tool` names could never match a fixed
     // allow-list, and connecting would waste resources spawning stdio servers.
     const mcpWhitelist = this.opts.allowedMcpServers;
@@ -1128,9 +1258,7 @@ export class AgentSession {
     if (!promptText) return { kind: "command" };
     return {
       kind: "template",
-      fullPrompt: parsed.args
-        ? `${promptText}\n\n## User Instructions\n\n${parsed.args}`
-        : promptText,
+      fullPrompt: expandPromptCommand(promptText, parsed.args),
     };
   }
 
@@ -1156,6 +1284,7 @@ export class AgentSession {
     },
     options: { disableTools?: boolean } = {},
   ): Promise<void> {
+    await this.settlePostTurnCompaction();
     await this.adoptDeferredCheckpointBeforePrompt();
     const slash = await this.resolveSlashInput(content);
     if (slash?.kind === "template") {
@@ -1193,6 +1322,7 @@ export class AgentSession {
    * attachments are always a direct conversational turn.
    */
   async promptWithAttachments(text: string, attachments: SessionAttachment[]): Promise<void> {
+    await this.settlePostTurnCompaction();
     await this.adoptDeferredCheckpointBeforePrompt();
     const parts = this.buildAttachmentParts(text, attachments);
     if (parts.length === 0) return;
@@ -1288,6 +1418,7 @@ export class AgentSession {
    * is the verbatim user ask, pinned for post-compaction re-grounding.
    */
   private resetHookState(originalRequest: string): void {
+    this.lspManager?.clearPendingDiagnostics();
     this.hookStats = {
       changedLines: 0,
       toolCalls: 0,
@@ -1314,10 +1445,30 @@ export class AgentSession {
     this.idealDriftProbe = null;
     this.loopBreakInjected = 0;
     this.regroundingInjected = false;
+    this.hookRecentCalls = [];
+    this.semanticLoop = {
+      checksUsed: 0,
+      lastCheckTurn: 0,
+      pending: false,
+      verdict: null,
+      injected: false,
+    };
+    this.independentReviewStarted = false;
     this.runStartedAt = Date.now();
     this.processGateInjected = 0;
-    this.verificationGate.reset();
+    this.verificationGate.beginRun();
+    const processes = new Set(this.processManager?.list().map((p) => p.id) ?? []);
+    for (const id of this.backgroundVerification.keys()) {
+      if (!processes.has(id)) this.backgroundVerification.delete(id);
+    }
     this.compactionOccurred = false;
+    // Post-turn compaction may have landed between runs — adopt its armed
+    // signal so the re-grounding hook fires for this run exactly as it would
+    // after a pre-run compaction.
+    if (this.compactionArmedForNextRun) {
+      this.compactionArmedForNextRun = false;
+      this.compactionOccurred = true;
+    }
     this.originalRequest = originalRequest;
   }
 
@@ -1332,7 +1483,40 @@ export class AgentSession {
         this.hookText += event.text;
         break;
       case "tool_call_start":
-        this.hookToolCalls.set(event.toolCallId, { name: event.name, args: event.args ?? {} });
+        this.hookToolCalls.set(event.toolCallId, {
+          name: event.name,
+          args: event.args ?? {},
+          revision: this.verificationGate.revision,
+        });
+        if (
+          event.name === "bash" &&
+          typeof event.args?.command === "string" &&
+          (isVerificationCommand(event.args.command) ||
+            classifyVerificationCommand(event.args.command).accepted)
+        ) {
+          // A check that can rewrite files (--fix, build scripts, emitters)
+          // invalidates earlier in-flight evidence AND marks the run as
+          // touched. A check that is merely UNRECOGNIZED (`make test`, `deno
+          // test`) rewrites nothing we can point to: bumping the revision for
+          // it poisoned the gate on green output and re-armed the hook into
+          // every later question turn.
+          this.verificationGate.recordVerificationAttempt();
+          const classification = classifyVerificationCommand(event.args.command);
+          if (classification.snapshotEligible && event.args.persist !== true) {
+            const call = this.hookToolCalls.get(event.toolCallId)!;
+            call.sourceSnapshot = await captureVerificationSnapshot(this.opts.cwd, [
+              ...this.hookFileEditCounts.keys(),
+            ]);
+            if (call.sourceSnapshot === null)
+              this.verificationGate.requireFreshVerification(true, event.args.command);
+          } else {
+            this.verificationGate.requireFreshVerification(
+              !classification.accepted && classification.mayMutate,
+              event.args.command,
+            );
+          }
+          await this.persistVerificationState();
+        }
         break;
       case "tool_call_end": {
         const call = this.hookToolCalls.get(event.toolCallId);
@@ -1356,43 +1540,95 @@ export class AgentSession {
           event.result,
           event.isError,
         );
+        // Semantic-loop judge input: a bounded digest of WHAT was attempted and
+        // HOW it came out. Args/results are sliced AT RECORD TIME — a write with
+        // a 50 KiB payload or a bash dump must never inflate the ring, and the
+        // judge needs shapes, not payloads.
+        this.hookRecentCalls.push({
+          tool: name,
+          args: args === undefined ? "" : JSON.stringify(args).slice(0, 300),
+          ok: !event.isError,
+          result: event.result.slice(0, 400),
+        });
+        if (this.hookRecentCalls.length > MAX_SEMANTIC_LOOP_CALLS) {
+          this.hookRecentCalls.splice(0, this.hookRecentCalls.length - MAX_SEMANTIC_LOOP_CALLS);
+        }
         if (name === "edit" && !event.isError) {
           const diff = (event.details as { diff?: string } | undefined)?.diff ?? event.result;
           const added = (diff.match(/^\+[^+]/gm) ?? []).length;
           const removed = (diff.match(/^-[^-]/gm) ?? []).length;
           this.hookStats.changedLines += added + removed;
         }
-        // Verification-gate bookkeeping: successful code mutations and completed
-        // foreground verification commands, in occurrence order.
+        // Only host-observed successful mutations and trustworthy check results
+        // affect approval. The model's text is never evidence.
+        let verificationChanged = false;
         if (!event.isError && args) {
-          if (
-            (name === "edit" || name === "write") &&
-            isCodeFilePath(String((args as { file_path?: unknown }).file_path ?? ""))
-          ) {
-            this.verificationGate.recordMutation(
-              String((args as { file_path?: unknown }).file_path),
-            );
-          }
-          if (
-            name === "bash" &&
-            !(args as { run_in_background?: unknown }).run_in_background &&
-            isVerificationCommand(String((args as { command?: unknown }).command ?? ""))
-          ) {
-            this.verificationGate.recordVerification();
-          }
-          // Reading the final output of an EXITED background verification run
-          // counts: the process gate forces this read anyway, so without it the
-          // gate would demand a redundant foreground re-run of tests the agent
-          // already watched finish.
-          if (name === "task_output") {
-            const proc = this.processManager
-              ?.list()
-              .find((p) => p.id === (args as { id?: unknown }).id);
-            if (proc && proc.exitCode !== null && isVerificationCommand(proc.command)) {
-              this.verificationGate.recordVerification();
+          if (name === "edit" || name === "write") {
+            const filePath = String((args as { file_path?: unknown }).file_path ?? "");
+            // Check-owning files (tsconfig.json, pytest.ini, vitest.config.ts …)
+            // are tracked even when they are not source code: editing one is how
+            // a red suite is turned green without fixing anything.
+            if (filePath && (isCodeFilePath(filePath) || isCheckOwnFile(filePath))) {
+              const addedText =
+                name === "write"
+                  ? String((args as { content?: unknown }).content ?? "")
+                  : extractAddedLines(
+                      (event.details as { diff?: string } | undefined)?.diff ?? event.result,
+                    );
+              this.verificationGate.recordMutation(filePath, addedText);
+              verificationChanged = true;
             }
           }
         }
+        if (args && call && name === "bash") {
+          const command = typeof args.command === "string" ? args.command : "";
+          const classification = classifyVerificationCommand(command);
+          if (classification.accepted || classification.snapshotEligible) {
+            if (args.run_in_background === true && !event.isError && args.persist !== true) {
+              const id = /^ID:\s*(\S+)/m.exec(event.result)?.[1];
+              // No parseable ID means the check cannot be tracked to a real exit
+              // code — no evidence either way. Recording a FAILURE here made
+              // every later green run of a different spelling look owed.
+              if (id)
+                this.backgroundVerification.set(id, {
+                  revision: call.revision,
+                  command,
+                  ...(classification.snapshotEligible
+                    ? { sourceSnapshot: call.sourceSnapshot ?? null }
+                    : {}),
+                });
+              else if (classification.snapshotEligible)
+                this.verificationGate.requireFreshVerification(true, command);
+            } else if (args.persist === true) {
+              // Persistent-shell checks are not bounded evidence (steering can
+              // interleave): neither a pass nor a failure. A recorded failure
+              // here blocked approval for sessions that prefer the shell.
+            } else if (classification.snapshotEligible) {
+              await this.finishSnapshotVerification(
+                { command, revision: call.revision, sourceSnapshot: call.sourceSnapshot ?? null },
+                !event.isError && /^Exit code:\s*0(?:\s|$)/i.test(event.result.trim()),
+              );
+              verificationChanged = true;
+            } else {
+              if (!event.isError && /^Exit code:\s*0(?:\s|$)/i.test(event.result.trim())) {
+                this.verificationGate.recordVerification(call.revision, command);
+              } else {
+                this.verificationGate.recordFailedVerification(command, call.revision);
+              }
+              verificationChanged = true;
+            }
+            delete call.sourceSnapshot;
+          } else if (classification.candidate) {
+            // Green but untrusted: remember WHY so the demand can tell the
+            // agent which command shape actually clears the gate.
+            this.verificationGate.recordRejectedCheck(command, classification.reason);
+          }
+        }
+        if (!event.isError && args && name === "task_output" && typeof args.id === "string") {
+          verificationChanged =
+            (await this.recordFinishedBackgroundVerification(args.id)) || verificationChanged;
+        }
+        if (verificationChanged) await this.persistVerificationState();
         // Tool results are what push the run over the review gate, and they all
         // land before the model writes its candidate final answer — so this is
         // the point where arming still beats the draft's first token.
@@ -1456,18 +1692,49 @@ export class AgentSession {
    * Mirrors the TUI's getSteeringMessages ordering.
    */
   private getHookSteeringMessages(): Message[] | null {
+    // Environment drift: settings can move the network allowlist mid-session,
+    // and `/add-dir` can widen the workspace, with no prompt rebuild — leaving
+    // the cached Environment section describing facts that are no longer real.
+    // Correcting it by appending is ~30 tokens; re-rendering the prompt would
+    // invalidate every cached byte from that section onward. Unconditional and
+    // cheap: identical facts produce no message at all.
+    //
+    // This runs for a verbatim custom prompt TOO. Those sessions (Ken's) never
+    // rebuild their prompt, so this note is the only channel that can tell them
+    // a root was added — skipping it meant Ken could write into a folder it had
+    // never been told about. The note states the facts outright rather than
+    // referring to a section such a prompt does not have.
+    const environmentDelta = buildEnvDeltaMessage(
+      this.renderedEnvironment,
+      this.promptEnvironment(),
+    );
+    if (environmentDelta) {
+      // The model has now been told; only a further change re-triggers this.
+      this.renderedEnvironment = this.promptEnvironment();
+      log("INFO", "session", "Injecting an environment update the prompt is too stale to show");
+    }
+
     // Push notifications: a child that finished or a background build that
     // exited is new *fact*, not a correction, and it is cheap (bounded to 1 KiB
     // per drain). Drained above the loop-break checks so the agent can act on
     // it in the very next turn instead of discovering it at the pre-stop
     // completion gate — but it never displaces user steering, which rides out
     // in the same batch when both are pending.
+    const diagnosticText = this.lspManager?.drainDiagnostics(
+      this.getVerificationProblem() !== null,
+      { deferUnverified: true },
+    );
+    if (diagnosticText) this.eventBus.emit("diagnostics", { text: diagnosticText });
+    this.refreshVerificationArmed();
     const notified = this.notifications.drain();
     const notificationMessage: Message | null =
-      notified.length > 0
+      notified.length > 0 || diagnosticText
         ? {
             role: "user",
-            content: buildNotificationSteeringText(notified.map((entry) => entry.text)),
+            content: buildNotificationSteeringText([
+              ...notified.map((entry) => entry.text),
+              ...(diagnosticText ? [diagnosticText] : []),
+            ]),
             provenance: { source: "runtime", kind: "notification", visibility: "hidden" },
           }
         : null;
@@ -1509,21 +1776,35 @@ export class AgentSession {
         ];
         return { role: "user", content: parts, provenance };
       });
-      return notificationMessage ? [...steeringMessages, notificationMessage] : steeringMessages;
+      return [
+        ...(environmentDelta ? [environmentDelta] : []),
+        ...steeringMessages,
+        ...(notificationMessage ? [notificationMessage] : []),
+      ];
     }
-    if (notificationMessage) return [notificationMessage];
+    if (environmentDelta || notificationMessage) {
+      return [
+        ...(environmentDelta ? [environmentDelta] : []),
+        ...(notificationMessage ? [notificationMessage] : []),
+      ];
+    }
     if (this.opts.selfCorrectionHooks === false) return null;
     if (!this.settingsManager.get("idealReviewEnabled")) return null;
+    // Deterministic stuck verdict, computed once and shared: the semantic
+    // judge must not spend tokens on a burst the deterministic breaker is
+    // about to correct itself.
+    const deterministicDecision = evaluateLoopBreak({
+      consecutiveFailures: this.hookConsecutiveFailures,
+      repeatedNoProgressCalls: this.hookRepeatedNoProgressCalls,
+      textRepetitionDetected: detectTextRepetition(this.hookText),
+      ...(this.hookCyclicPattern ? { cyclicPattern: this.hookCyclicPattern } : {}),
+    });
+    this.maybeStartSemanticLoopCheck(deterministicDecision.shouldBreak);
     // Two-stage loop-breaker: stage 1 nudges; a FRESH detection after that
     // injects the harsher final stop-and-report prompt. Signals reset after
     // each injection so stage 2 only fires on new evidence.
     if (this.loopBreakInjected < 2) {
-      const decision = evaluateLoopBreak({
-        consecutiveFailures: this.hookConsecutiveFailures,
-        repeatedNoProgressCalls: this.hookRepeatedNoProgressCalls,
-        textRepetitionDetected: detectTextRepetition(this.hookText),
-        ...(this.hookCyclicPattern ? { cyclicPattern: this.hookCyclicPattern } : {}),
-      });
+      const decision = deterministicDecision;
       if (decision.shouldBreak) {
         const stage = this.loopBreakInjected === 0 ? (1 as const) : (2 as const);
         this.loopBreakInjected = stage;
@@ -1532,6 +1813,9 @@ export class AgentSession {
         this.hookCyclicPattern = null;
         this.hookConsecutiveFailures = 0;
         this.hookRepeatedNoProgressCalls = 0;
+        // The deterministic breaker owns this burst — a semantic verdict from
+        // the same burst must not double-correct on the next poll.
+        this.semanticLoop.verdict = null;
         // Clear the text buffer too — otherwise a stage-1 text-repetition
         // trigger still sees the same repeated tail on the next check and
         // escalates to stage 2 on stale evidence.
@@ -1544,12 +1828,177 @@ export class AgentSession {
         return [buildLoopBreakMessage(decision.reasons, stage === 2)];
       }
     }
+    // Semantic loop-break: an LLM verdict (started by maybeStartSemanticLoopCheck
+    // on a suspicious-but-syntactically-quiet burst) is consumed here, exactly
+    // once, with the deterministic breaker getting priority above. Fail-open:
+    // no verdict or no-loop verdict injects nothing.
+    if (this.semanticLoop.verdict && !this.semanticLoop.injected) {
+      const verdict = this.semanticLoop.verdict;
+      this.semanticLoop.injected = true;
+      this.semanticLoop.verdict = null;
+      // The judged burst has been addressed; a fresh burst must re-accumulate.
+      this.hookConsecutiveFailures = 0;
+      log("INFO", "loop-break", "Injecting semantic loop-break steering", {
+        reason: verdict.reason,
+      });
+      this.eventBus.emit("hook", { kind: "loop_break" });
+      return [buildSemanticLoopMessage(verdict)];
+    }
     if (!this.regroundingInjected && this.compactionOccurred) {
       this.regroundingInjected = true;
       this.eventBus.emit("hook", { kind: "regrounding" });
       return [buildRegroundingMessage(this.originalRequest)];
     }
     return null;
+  }
+
+  /** Fire the semantic loop judge when deterministic evidence is suspicious but
+   *  the deterministic breaker stayed quiet — the syntactic blind spot where
+   *  every retry differs slightly and the run still makes no progress.
+   *  Fire-and-forget: the call runs while the next turn streams, and a finished
+   *  verdict is consumed by the NEXT steering poll — never blocking a turn. */
+  private maybeStartSemanticLoopCheck(deterministicBreak: boolean): void {
+    if (
+      !shouldRunSemanticLoopCheck({
+        consecutiveFailures: this.hookConsecutiveFailures,
+        totalFailures: this.hookStats.toolFailures,
+        turns: this.hookStats.turns,
+        lastCheckTurn: this.semanticLoop.lastCheckTurn,
+        checksUsed: this.semanticLoop.checksUsed,
+        checkPending: this.semanticLoop.pending,
+        deterministicBreak,
+      })
+    ) {
+      return;
+    }
+    // resetHookState replaces this object on every prompt. A late judge must
+    // not publish a verdict or consume the next run's budget/cooldown.
+    const runState = this.semanticLoop;
+    runState.pending = true;
+    log("INFO", "loop-break", "Starting semantic loop judge", {
+      turn: String(this.hookStats.turns),
+      consecutiveFailures: String(this.hookConsecutiveFailures),
+      recentCalls: String(this.hookRecentCalls.length),
+    });
+    void (async () => {
+      try {
+        const prompt = buildSemanticLoopJudgePrompt(this.hookRecentCalls, this.originalRequest);
+        const raw = await (this.opts.semanticLoopJudge?.(prompt) ??
+          this.callSemanticLoopJudge(prompt));
+        const verdict = parseSemanticLoopVerdict(raw);
+        if (this.semanticLoop === runState && verdict?.loop) runState.verdict = verdict;
+      } catch (error) {
+        // Fail open: judge errors never stop a run. Budget and cooldown are
+        // still consumed in `finally` so a flaky judge cannot retry-loop.
+        log("WARN", "loop-break", "Semantic loop judge failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        if (this.semanticLoop === runState) {
+          runState.pending = false;
+          runState.checksUsed += 1;
+          runState.lastCheckTurn = this.hookStats.turns;
+        }
+      }
+    })();
+  }
+
+  /** One-shot judge call on the session's ACTIVE model — deliberately not a
+   *  cheaper routing: judging a model's own failure patterns with a weaker
+   *  model swaps false negatives for false positives. */
+  private async callSemanticLoopJudge(prompt: string): Promise<string> {
+    const creds = await this.authStorage.resolveCredentials(this.provider, {
+      storageKeys: this.currentAuthStorageKeys(),
+    });
+    const result = stream({
+      provider: this.provider,
+      model: this.model,
+      messages: [{ role: "user", content: prompt }],
+      maxTokens: 500,
+      apiKey: creds.accessToken,
+      accountId: creds.accountId,
+      projectId: creds.projectId,
+      baseUrl: this.baseUrl ?? creds.baseUrl,
+      signal: this.opts.signal,
+    });
+    const response = await withJudgeTimeout(result.response, SEMANTIC_LOOP_JUDGE_TIMEOUT_MS);
+    // Providers differ in reply shape: some return a bare string, others an
+    // array of parts (glm-5.3 among them) — joining text parts covers both,
+    // where the string-only branch silently dropped the whole verdict.
+    const content = response.message.content;
+    if (typeof content === "string") return content;
+    return Array.isArray(content)
+      ? content
+          .filter((part): part is { type: "text"; text: string } => part.type === "text")
+          .map((part) => part.text)
+          .join("\n")
+      : "";
+  }
+
+  /** Independent fresh-context review of the finished work (Codex Guardian
+   *  pattern). Spawns a READ-ONLY child on the ACTIVE model, waits bounded,
+   * and returns findings for the acting agent to address — or nothing when
+   *  the review passes, is unavailable, or fails (in-thread review remains the
+   *  fallback; the feature degrades, never blocks).
+   *
+   *  Runs inside the pre-stop poll, so the candidate final answer is already
+   *  held by arming and this wait cannot race a streamed answer. */
+  private async runIndependentReview(decision: IdealReviewDecision): Promise<Message[]> {
+    if (!this.subAgentManager) return [];
+    if (this.independentReviewStarted) return [];
+    // An allow-listed session (a subagent worker itself) must not spawn
+    // harness-owned grandchildren the tool policy never granted.
+    if (this.opts.allowedTools && !this.opts.allowedTools.includes("spawn_agent")) return [];
+    if (decision.score < INDEPENDENT_REVIEW_SCORE_THRESHOLD) return [];
+    this.independentReviewStarted = true;
+
+    const taskName = `ideal-reviewer-${Math.random().toString(36).slice(2, 8)}`;
+    let agentId: string | undefined;
+    try {
+      const task = buildReviewerTask({
+        originalRequest: this.originalRequest,
+        changedFiles: [...this.hookFileEditCounts.keys()],
+        stats: this.hookStats,
+        triggerReasons: decision.reasons,
+      });
+      // Active model forced at spawn time — never routed to a fast/review model.
+      const snapshot = await this.subAgentManager.spawn(taskName, task, undefined, {
+        model: this.model,
+        tools: REVIEWER_TOOLS,
+      });
+      agentId = snapshot.agent_id;
+      const waited = await this.subAgentManager.wait([agentId], "all", REVIEWER_WAIT_MS);
+      const agent = waited.agents[0];
+      if (!agent || !isTerminalSubAgentState(agent.state)) {
+        // Timeout: collect the straggler so the completion gate cannot fire on
+        // it later, then fall back to the in-thread review.
+        await this.subAgentManager.interrupt(agentId, true).catch(() => {});
+        log("WARN", "ideal", "Independent reviewer timed out; falling back to in-thread review", {
+          agentId,
+        });
+        return [];
+      }
+      const findings = parseReviewerFindings(agent.output ?? "");
+      if (!findings) {
+        log("WARN", "ideal", "Independent reviewer output unparseable; falling back", { agentId });
+        return [];
+      }
+      if (findings.clean) {
+        log("INFO", "ideal", "Independent reviewer verdict: clean", { agentId });
+        return [];
+      }
+      log("INFO", "ideal", "Independent reviewer flagged findings", {
+        agentId,
+        count: String(findings.findings.length),
+      });
+      return [buildIndependentReviewMessage(findings.findings)];
+    } catch (error) {
+      if (agentId) await this.subAgentManager.interrupt(agentId, true).catch(() => {});
+      log("WARN", "ideal", "Independent reviewer failed; falling back to in-thread review", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
   }
 
   /**
@@ -1613,6 +2062,14 @@ export class AgentSession {
    */
   private wouldInjectIdealReview(): boolean {
     if (this.opts.selfCorrectionHooks === false || this.idealReviewSuppressed) return false;
+    // Mid-review a stop still injects: the coverage follow-up while files are
+    // unread, or its escalation once the budget is spent. Both make the model
+    // answer again, so the candidate answer is a draft exactly as it is before
+    // the review starts — without arming here it paints and the reviewed answer
+    // lands under it as a duplicate.
+    if (this.idealReviewPhase === "reviewing") {
+      return this.reviewCoverage.evidence().missing.length > 0;
+    }
     if (this.idealReviewPhase !== "idle") return false;
     if (!this.settingsManager.get("idealReviewEnabled")) return false;
     if (evaluateIdealReview({ ...this.hookStats, turns: this.hookStats.turns + 1 }).shouldReview) {
@@ -1632,6 +2089,7 @@ export class AgentSession {
   /** Would a stop right now inject the verification gate? Same conditions as
    *  the pre-stop branch below, so arming and injection cannot disagree. */
   private wouldInjectVerification(): boolean {
+    if (this.lspManager?.hasQueuedDiagnostics()) return true;
     if (this.opts.selfCorrectionHooks === false) return false;
     if (!this.settingsManager.get("verificationGateEnabled")) return false;
     if (this.opts.allowedTools && !this.opts.allowedTools.includes("bash")) return false;
@@ -1650,6 +2108,11 @@ export class AgentSession {
   private refreshHookArming(): void {
     if (!this.settingsManager) return;
     this.refreshIdealReviewArmed();
+    this.refreshVerificationArmed();
+  }
+
+  private refreshVerificationArmed(): void {
+    if (!this.settingsManager) return;
     const armed = this.wouldInjectVerification();
     if (armed === this.verificationArmed) return;
     this.verificationArmed = armed;
@@ -1667,9 +2130,35 @@ export class AgentSession {
    * Pre-stop Ideal review phase machine. Once review starts, completion is
    * blocked until harness-owned post-injection reads cover every changed file.
    */
-  private getHookFollowUpMessages(): Message[] | null {
+  private async getHookFollowUpMessages(): Promise<Message[] | null> {
+    // Exit notifications and task_output refer to the same host process record.
+    // Do not force an extra polling tool/turn merely to acknowledge a known exit.
+    let backgroundChanged = false;
+    for (const id of this.backgroundVerification.keys()) {
+      backgroundChanged =
+        (await this.recordFinishedBackgroundVerification(id)) || backgroundChanged;
+    }
+    if (backgroundChanged) await this.persistVerificationState();
+    // Edits return immediately; only the completion boundary waits for remaining
+    // checks. Queued timeouts stay explicitly unverified, never a false all-clear.
+    await this.lspManager?.flushDiagnostics(this.opts.signal);
+    if (this.opts.signal?.aborted) return null;
+    const diagnosticText = this.lspManager?.drainDiagnostics(
+      this.getVerificationProblem() !== null,
+    );
+    if (diagnosticText) this.eventBus.emit("diagnostics", { text: diagnosticText });
+    this.refreshVerificationArmed();
+    const diagnosticMessages: Message[] = diagnosticText
+      ? [
+          {
+            role: "user",
+            content: buildNotificationSteeringText([diagnosticText]),
+            provenance: { source: "runtime", kind: "notification", visibility: "hidden" },
+          },
+        ]
+      : [];
     const childCompletionFollowUp = buildSubAgentCompletionFollowUp(this.subAgentManager);
-    if (childCompletionFollowUp) return childCompletionFollowUp;
+    if (childCompletionFollowUp) return [...diagnosticMessages, ...childCompletionFollowUp];
 
     // Background processes started this run and never read block completion:
     // their progress/exit checkpoints only land on the steering path, which an
@@ -1684,7 +2173,7 @@ export class AgentSession {
       log("INFO", "process-gate", "Injecting background-process completion gate", {
         injected: String(this.processGateInjected),
       });
-      return processFollowUp;
+      return [...diagnosticMessages, ...processFollowUp];
     }
 
     // Verification gate: code was edited but nothing verified since the last
@@ -1695,17 +2184,29 @@ export class AgentSession {
       this.settingsManager.get("verificationGateEnabled") &&
       (!this.opts.allowedTools || this.opts.allowedTools.includes("bash"))
     ) {
+      const verificationReason = this.verificationGate.pendingReason();
       const verificationFollowUp = this.verificationGate.followUp();
       if (verificationFollowUp) {
         log("INFO", "verification-gate", "Injecting verification follow-up", {});
         // Announce, THEN disarm: clients release held text on disarm, so the
         // reverse order paints the draft and immediately deletes it — the exact
         // flash arming exists to prevent.
-        this.eventBus.emit("hook", { kind: "verification" });
+        this.eventBus.emit("hook", {
+          kind: "verification",
+          ...(verificationReason === "tamper"
+            ? { verificationReason: "check_review" as const }
+            : verificationReason === "recheck"
+              ? { verificationReason }
+              : {}),
+        });
         this.refreshHookArming();
-        return verificationFollowUp;
+        return [...diagnosticMessages, ...verificationFollowUp];
       }
     }
+
+    // Address real errors before review; unavailable checks share the existing
+    // verification demand above instead of manufacturing a separate hook.
+    if (diagnosticMessages.length > 0) return diagnosticMessages;
 
     if (this.opts.selfCorrectionHooks === false || this.idealReviewSuppressed) return null;
 
@@ -1719,8 +2220,20 @@ export class AgentSession {
         lspMissing: lspEvidence.missing,
       });
       if (coverage.missing.length > 0) {
+        // Announce like any other pre-final injection: this follow-up makes the
+        // model answer again, so the answer it interrupts is a draft and the
+        // hook event is what tells clients to discard it. Injecting silently is
+        // what let the pre-coverage answer paint above the reviewed one.
+        this.eventBus.emit("hook", {
+          kind: "ideal",
+          coverageExpected: coverage.expected,
+          coverageMissing: coverage.missing,
+        });
         if (this.reviewCoverageInjected < MAX_REVIEW_COVERAGE_INJECTIONS) {
           this.reviewCoverageInjected += 1;
+          // Stays armed (coverage is still outstanding) — this call is here so a
+          // client that missed the earlier edge is armed before the next draft.
+          this.refreshIdealReviewArmed();
           return [
             this.withReviewLspEvidence(buildReviewCoverageMessage(coverage.missing), lspEvidence),
           ];
@@ -1728,6 +2241,9 @@ export class AgentSession {
         // Budget spent: close the gate so the run cannot spin on a file that
         // never becomes readable, and require the gap be reported to the user.
         this.idealReviewPhase = "complete";
+        // The gate is shut, so this is the real disarm: the answer to the
+        // escalation is final and streams live.
+        this.refreshIdealReviewArmed();
         log("INFO", "ideal", "Ideal review coverage escalated after retry budget", {
           injected: String(this.reviewCoverageInjected),
           missing: coverage.missing,
@@ -1746,6 +2262,9 @@ export class AgentSession {
     const driftedFiles = detectTestDrift(this.hookFileEditCounts.keys(), this.cwd).slice(0, 5);
     if (!decision.shouldReview && driftedFiles.length === 0) return null;
 
+    // Independent reviewer first (async, bounded): its findings ride in the
+    // SAME follow-up batch as the in-thread review + coverage requirements, so
+    // addressing everything still costs one extra turn.
     this.reviewCoverage.start(this.hookFileEditCounts.keys());
     this.idealReviewPhase = "reviewing";
     const coverage = this.reviewCoverage.evidence();
@@ -1755,11 +2274,15 @@ export class AgentSession {
       coverageExpected: coverage.expected,
       coverageMissing: coverage.missing,
     });
-    // Disarm strictly AFTER the hook event. Clients release held text on
+    // Recompute strictly AFTER the hook event: clients release held text on
     // disarm, so the reverse order would paint the draft and then delete it —
-    // the exact flash arming exists to prevent. Leaving `idle` is what lets the
-    // reviewed final answer stream live instead of being held.
+    // the exact flash arming exists to prevent. Arming normally PERSISTS here,
+    // because review starts with every changed file uncovered and a stop while
+    // coverage is outstanding injects again. Disarm lands later, on the read
+    // that closes the last gap (or when the retry budget escalates).
     this.refreshIdealReviewArmed();
+    // Announce the phase before the reviewer starts, not after its bounded wait.
+    const independentMessages = await this.runIndependentReview(decision);
     log("INFO", "ideal", "Injecting ideal review before final response", {
       coverageExpected: coverage.expected,
       coverageMissing: coverage.missing,
@@ -1767,6 +2290,7 @@ export class AgentSession {
       lspMissing: lspEvidence.missing,
     });
     return [
+      ...independentMessages,
       this.withReviewLspEvidence(
         withReviewCoverageRequirements(
           buildIdealReviewMessage(decision.reasons, driftedFiles),
@@ -1814,6 +2338,10 @@ export class AgentSession {
 
   /** Auto-compact if needed, run agent loop with auth retry, and persist messages. */
   private async runLoop(options: { disableTools?: boolean } = {}): Promise<void> {
+    // Languages are re-detected at each task boundary so a project scaffolded
+    // during the previous turn gets its packs; the prompt is rebuilt only when
+    // the set grows, keeping the cached prefix stable otherwise.
+    if (this.refreshActiveLanguages()) await this.rebuildSystemPromptInPlace();
     this.refreshSystemPromptTail();
     // One-shot cache-key marker per session so turn_end cacheRead numbers
     // in the log can be traced back to a specific routing namespace —
@@ -1831,8 +2359,7 @@ export class AgentSession {
     // Reset self-correction hook state for this run; pin the latest user message
     // as the verbatim original request for post-compaction re-grounding.
     const lastUser = [...this.messages].reverse().find((m) => m.role === "user");
-    const originalRequest = typeof lastUser?.content === "string" ? lastUser.content : "";
-    this.resetHookState(originalRequest);
+    this.resetHookState(requestTextForRegrounding(lastUser));
 
     // Resolve OAuth credentials and run agent loop.
     // On 401, force-refresh the token and retry once — the provider may have
@@ -1853,6 +2380,10 @@ export class AgentSession {
     // of the public API model window. Failed/no-op attempts cool down across
     // prompts; provider overflow recovery still bypasses this path entirely.
     if (this.settingsManager.get("autoCompact") && Date.now() >= this.compactionRetryAfter) {
+      // A post-turn compaction may still be running in the background. Let it
+      // settle first: it usually already compacted this history, so the
+      // decision below turns into a no-op instead of duplicate work.
+      if (this.postTurnCompaction) await this.postTurnCompaction;
       const contextWindow = getContextWindow(this.model, {
         provider: this.provider,
         accountId: creds.accountId,
@@ -1885,7 +2416,15 @@ export class AgentSession {
         activeTokens: activeTokens === undefined ? "estimated" : String(activeTokens),
         triggerLimit: String(policy.targetTokens),
       });
-      if (shouldCompact(this.messages, contextWindow, policy.threshold, activeTokens)) {
+      if (
+        shouldCompact(
+          this.messages,
+          contextWindow,
+          policy.threshold,
+          activeTokens,
+          policy.targetTokens,
+        )
+      ) {
         try {
           await this.compact(creds, "automatic");
           if (this.lastCompactionCompacted) {
@@ -1925,7 +2464,13 @@ export class AgentSession {
         maxTokens: this.maxTokens,
         maxTurns: this.opts.maxTurns,
         maxTurnExtensions: this.opts.maxTurnExtensions,
-        thinking: this.thinkingLevel,
+        // Plan mode caps effort at medium (Codex `plan_mode_reasoning_effort`
+        // preset): read-only exploration doesn't need xhigh/max reasoning, and
+        // deep-reasoning models left at the ceiling burn enormous thinking
+        // budgets re-deriving context they cannot act on.
+        thinking: this.planModeRef.current
+          ? clampThinkingForPlanMode(this.thinkingLevel)
+          : this.thinkingLevel,
         apiKey,
         // Per-turn credential resolution. A run can span many minutes; if any
         // process sharing auth.json refreshes this grant meanwhile, the token
@@ -2049,7 +2594,15 @@ export class AgentSession {
               activeTokens: String(activeTokens),
               triggerLimit: String(policy.targetTokens),
             });
-            if (!shouldCompact(messages, contextWindow, policy.threshold, activeTokens))
+            if (
+              !shouldCompact(
+                messages,
+                contextWindow,
+                policy.threshold,
+                activeTokens,
+                policy.targetTokens,
+              )
+            )
               return messages;
           }
 
@@ -2222,9 +2775,17 @@ export class AgentSession {
       await this.persistMessage(this.messages[i]);
     }
     this.lastPersistedIndex = this.messages.length;
+
+    // Final response is delivered — compact in the background while the user
+    // reads it, instead of charging the summarizer latency to their next
+    // prompt. Detached by design; the pre-run path above remains the backstop.
+    this.maybeCompactPostTurn(creds);
   }
 
   async switchModel(provider: string, model: string): Promise<void> {
+    // The model-switch note is appended to `this.messages`; settle any
+    // background compaction first so the note cannot be swapped out.
+    await this.settlePostTurnCompaction();
     const prevProvider = this.provider;
     const prevModel = this.model;
     // Diff gate: a "switch" to the model already in use is not state change.
@@ -2304,7 +2865,7 @@ export class AgentSession {
       // Reconnect MCP servers ONLY when GLM is involved on either side — GLM
       // is the only provider with a different server set (Z.AI tools), so a
       // non-GLM switch keeps the identical set. Skipping the dispose/reconnect
-      // there avoids tearing down a live stdio child (e.g. kencode-search) and
+      // there avoids tearing down a live stdio child and
       // gambling on a `npx` re-spawn that could fail and drop the tools.
       const glmInvolved = this.provider === "glm" || prevProvider === "glm";
       if (this.mcpManager && glmInvolved) {
@@ -2440,10 +3001,116 @@ export class AgentSession {
     await this.rePersistKenTurns();
     await this.rePersistAutopilotMarkers();
     await this.rePersistAppMarkers();
+    await this.persistVerificationState();
     await this.persistAppMarker("compaction", {
       originalCount: result.originalCount,
       newCount: result.newCount,
     });
+  }
+
+  /**
+   * Wait out any in-flight post-turn background compaction before a new
+   * entry point mutates `this.messages` (prompt, attachments, model switch).
+   * The background compact() snapshots and then REPLACES the array, so a
+   * message pushed while it runs would be silently dropped from the live
+   * history — the pre-run await in runLoop() sits after the push and cannot
+   * protect it.
+   */
+  private async settlePostTurnCompaction(): Promise<void> {
+    if (this.postTurnCompaction) await this.postTurnCompaction;
+  }
+
+  /**
+   * Post-turn compaction: once the final response has been delivered, compact
+   * in the background while the user reads the answer, instead of making the
+   * next prompt pay the summarizer latency up front (the pre-run path stays as
+   * the backstop, so a skipped or failed attempt costs nothing). Mirrors the
+   * Codex `model_post_turn_compact_threshold_percent` guards: skip when user
+   * input is already queued (it would race the next turn), when the run was
+   * aborted, or during the failure cooldown — and never let a compaction
+   * error surface in the completed turn.
+   */
+  private maybeCompactPostTurn(creds: {
+    accessToken: string;
+    accountId?: string;
+    projectId?: string;
+    baseUrl?: string;
+  }): void {
+    if (!this.settingsManager.get("autoCompact")) return;
+    if (this.opts.signal?.aborted) return;
+    if (this.userQueue.length > 0) return;
+    if (this.postTurnCompaction) return;
+    if (Date.now() < this.compactionRetryAfter) return;
+    // One compaction per turn boundary: a pre-run or overflow-recovery
+    // compaction already shrank this run's history — re-probing right after
+    // the final response would only re-derive that decision.
+    if (this.compactionOccurred) return;
+    const contextWindow = getContextWindow(this.model, {
+      provider: this.provider,
+      accountId: creds.accountId,
+    });
+    const policy = resolveCompactionPolicy({
+      provider: this.provider,
+      model: this.model,
+      contextWindow,
+      threshold: this.settingsManager.get("compactThreshold"),
+      accountId: creds.accountId,
+      approvedPlanPath: this.approvedPlanPath,
+    });
+    let activeTokens: number | undefined;
+    if (this.providerContext) {
+      const anchorIndex = this.messages.lastIndexOf(this.providerContext.anchor);
+      if (anchorIndex >= 0) {
+        activeTokens = calculateActiveContextTokens(this.messages, {
+          usage: this.providerContext.usage,
+          pendingMessages: this.messages.slice(anchorIndex + 1),
+        });
+      }
+    }
+    if (
+      !shouldCompact(
+        this.messages,
+        contextWindow,
+        policy.threshold,
+        activeTokens,
+        policy.targetTokens,
+      )
+    )
+      return;
+    log("INFO", "compaction", "Post-turn compaction decision — compacting in background", {
+      provider: this.provider,
+      model: this.model,
+      transport: this.provider === "openai" && creds.accountId ? "codex_oauth" : "public_api",
+      contextWindow: String(contextWindow),
+      activeTokens: activeTokens === undefined ? "estimated" : String(activeTokens),
+      triggerLimit: String(policy.targetTokens),
+    });
+    this.postTurnCompaction = (async () => {
+      try {
+        await this.compact(creds, "automatic");
+        if (this.lastCompactionCompacted) {
+          // Arm re-grounding for the next turn. resetHookState clears
+          // compactionOccurred at run start, before the injection point, so
+          // park the signal for pickup there.
+          this.compactionArmedForNextRun = true;
+          this.compactionRetryAfter = 0;
+        } else {
+          this.compactionRetryAfter = Date.now() + 30_000;
+        }
+      } catch (error) {
+        this.compactionRetryAfter = Date.now() + 30_000;
+        if (isAbortError(error) || this.opts.signal?.aborted) return;
+        log(
+          "WARN",
+          "compaction",
+          `Post-turn compaction failed; cooling down for 30s: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      } finally {
+        this.postTurnCompaction = undefined;
+      }
+    })();
   }
 
   async compact(
@@ -2454,6 +3121,8 @@ export class AgentSession {
       baseUrl?: string;
     },
     mode: "manual" | "automatic" | "forced" = "manual",
+    /** User-stated focus (`/compact <focus>`): what must survive verbatim. */
+    focus?: string,
   ): Promise<void> {
     this.lastCompactionCompacted = false;
     const creds =
@@ -2489,6 +3158,7 @@ export class AgentSession {
         targetTokens: policy.targetTokens,
         signal: this.opts.signal,
         approvedPlanPath: this.approvedPlanPath,
+        focus,
       });
       contextSelection = output.result.contextSelection;
       return output;
@@ -2618,6 +3288,8 @@ export class AgentSession {
     // Approved-plan execution is a clean checkpoint of the same conversation;
     // explicit new sessions reset the conversation identity.
     if (!preserveConversation) {
+      this.verificationGate.reset();
+      this.backgroundVerification.clear();
       this.conversationId = "";
       this.checkpointGeneration = 0;
       this.sessionPreview = "";
@@ -2956,6 +3628,17 @@ export class AgentSession {
     return this.deferredBuiltinToolNames.filter((name) => !live.has(name));
   }
 
+  /**
+   * The environment about to be rendered into a prompt, remembered as the
+   * truth the model has been told. Pairs with the env-delta hook: whatever the
+   * prompt states, the model is only corrected when reality moves away from it.
+   */
+  private recordRenderedEnvironment(): SystemPromptEnvironment {
+    const environment = this.promptEnvironment();
+    this.renderedEnvironment = environment;
+    return environment;
+  }
+
   /** Environment facts that vary per session rather than per host. */
   private promptEnvironment(): SystemPromptEnvironment {
     const networkAllow =
@@ -2982,7 +3665,7 @@ export class AgentSession {
         toolNames,
         deferredToolNames,
         context: this.opts.agentContext,
-        environment: this.promptEnvironment(),
+        environment: this.recordRenderedEnvironment(),
         contextLimits: this.contextLimits,
       });
     }
@@ -2992,12 +3675,38 @@ export class AgentSession {
       planMode,
       approvedPlanPath,
       toolNames,
-      undefined,
+      this.activeLanguages,
       this.provider,
-      this.promptEnvironment(),
+      this.recordRenderedEnvironment(),
       deferredToolNames,
       this.contextLimits,
     );
+  }
+
+  /**
+   * Add newly detected project languages. Returns true when the set grew and
+   * the standard prompt therefore needs a rebuild. Custom and sub-agent
+   * prompts never render packs, so detection is skipped for them.
+   */
+  private refreshActiveLanguages(): boolean {
+    if (this.customSystemPrompt || this.agentPrompt !== undefined) return false;
+    let grew = false;
+    try {
+      for (const id of detectLanguages(this.cwd)) {
+        if (this.activeLanguages.has(id)) continue;
+        this.activeLanguages.add(id);
+        grew = true;
+      }
+    } catch (err) {
+      log("WARN", "language", `Language detection failed: ${(err as Error).message}`);
+      return false;
+    }
+    if (grew) {
+      log("INFO", "language", "Style packs active", {
+        active: [...this.activeLanguages].join(","),
+      });
+    }
+    return grew;
   }
 
   /** Rebuild messages[0] from current plan-mode + approved-plan state. */
@@ -3093,6 +3802,9 @@ export class AgentSession {
       },
     };
     this.turnMetrics.push(payload);
+    // Internal diagnostics piggyback on the authoritative per-turn metric —
+    // one source of truth, and the record flushes to disk every turn.
+    this.diagnosticsRecorder?.recordTurnMetric(payload);
     if (this.sessionPath) await this.sessionManager.appendTurnMetric(this.sessionPath, payload);
   }
 
@@ -3194,6 +3906,94 @@ export class AgentSession {
    * instead of dropping the marker or falling back to a raw verdict string.
    * No-op persistence for transient sessions (kept in memory only).
    */
+  private async recordFinishedBackgroundVerification(id: string): Promise<boolean> {
+    const started = this.backgroundVerification.get(id);
+    const proc = this.processManager?.list().find((entry) => entry.id === id);
+    if (!started || !proc || proc.exitCode === null) return false;
+    if (started.sourceSnapshot !== undefined) {
+      await this.finishSnapshotVerification(started, proc.exitCode === 0);
+    } else if (proc.exitCode === 0) {
+      this.verificationGate.recordVerification(started.revision, started.command);
+    } else {
+      this.verificationGate.recordFailedVerification(started.command, started.revision);
+    }
+    this.backgroundVerification.delete(id);
+    return true;
+  }
+
+  getVerificationEvidence(): VerificationEvidence[] {
+    return this.verificationGate.evidence();
+  }
+
+  /** Current request activity, separate from persistent workspace verification debt. */
+  getRunVerificationActivity(): {
+    changed: boolean;
+    checked: boolean;
+    evidence: VerificationEvidence[];
+  } {
+    return {
+      changed: this.verificationGate.changedThisRun,
+      checked: this.verificationGate.checkedThisRun,
+      evidence: this.verificationGate.evidence("run"),
+    };
+  }
+
+  private async finishSnapshotVerification(
+    check: { command: string; revision: number; sourceSnapshot?: string | null },
+    passed: boolean,
+  ): Promise<void> {
+    const after = check.sourceSnapshot
+      ? await captureVerificationSnapshot(this.opts.cwd, [...this.hookFileEditCounts.keys()])
+      : null;
+    if (after === null || after !== check.sourceSnapshot) {
+      this.verificationGate.requireFreshVerification(true, check.command);
+      this.verificationGate.recordRejectedCheck(
+        check.command,
+        after === null
+          ? "Workspace inputs could not be compared; run a read-only check after the command"
+          : "Command changed workspace inputs; run checks against the changed source",
+      );
+      if (!passed) this.verificationGate.recordFailedVerification(check.command);
+    } else if (passed) {
+      const classification = classifyVerificationCommand(check.command);
+      if (classification.snapshotPreserveOnly) {
+        this.verificationGate.recordRejectedCheck(check.command, classification.reason);
+      } else {
+        this.verificationGate.recordVerification(check.revision, check.command);
+      }
+    } else {
+      this.verificationGate.recordFailedVerification(check.command, check.revision);
+    }
+  }
+
+  getVerificationProblem(): string | null {
+    if ([...this.hookToolCalls.values()].some((call) => call.sourceSnapshot !== undefined)) {
+      return "Unverified: a build is still running or its workspace comparison is pending.";
+    }
+    return (
+      this.verificationGate.verificationProblem() ??
+      (this.backgroundVerification.size > 0
+        ? "Unverified: a background check is still running or its result has not been confirmed."
+        : null)
+    );
+  }
+
+  private async persistVerificationState(): Promise<void> {
+    if (!this.sessionPath) return;
+    const entry: CustomEntry = {
+      type: "custom",
+      kind: VERIFICATION_STATE_KIND,
+      id: crypto.randomUUID(),
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      data: {
+        ...this.verificationGate.snapshot(),
+        unknown: this.getVerificationProblem() !== null,
+      },
+    };
+    await this.sessionManager.appendEntry(this.sessionPath, entry);
+  }
+
   async persistAutopilotMarker(
     phase: AutopilotMarkerPayload["phase"],
     extra?: { reason?: string; body?: string },
@@ -3327,7 +4127,10 @@ export class AgentSession {
    */
   async enhancePrompt(text: string): Promise<EnhanceResult> {
     if (!text.trim()) return { enhanced: text, segments: [{ kind: "text", text }] };
-    const creds = await this.authStorage.resolveCredentials(this.provider, {
+    // Keep credentials and settings on the model selected at click time, even
+    // if the user switches models while credential resolution is pending.
+    const { provider, model, thinkingLevel, maxTokens, baseUrl } = this;
+    const creds = await this.authStorage.resolveCredentials(provider, {
       storageKeys: this.currentAuthStorageKeys(),
     });
     // Cheap, best-effort stack detection from the project root so terminology is
@@ -3339,12 +4142,16 @@ export class AgentSession {
       /* detection is best-effort — fall back to no stack hint */
     }
     return enhancePrompt({
-      provider: this.provider,
-      model: this.model,
+      provider,
+      model,
+      thinking: thinkingLevel,
+      maxTokens,
+      userAgent: provider === "anthropic" ? await getClaudeCliUserAgent() : undefined,
+      projectId: creds.projectId,
       prompt: text,
       stack,
       apiKey: creds.accessToken,
-      baseUrl: this.baseUrl ?? creds.baseUrl,
+      baseUrl: baseUrl ?? creds.baseUrl,
       accountId: creds.accountId,
       signal: this.opts.signal,
     });
@@ -3388,8 +4195,8 @@ export class AgentSession {
    * Ordered auth-storage keys the current (provider, model) pair tries, first
    * match wins. Almost always just the provider id; Xiaomi models can prefer
    * one endpoint and fall back to another the user configured instead (e.g.
-   * `mimo-v2.5-pro` prefers the Token Plan, falls back to API Credits; the
-   * API-only `mimo-v2.5-pro-ultraspeed` has no fallback).
+   * `mimo-v2.6-pro` prefers the Token Plan, falls back to API Credits; the
+   * API-only `mimo-v2.6-pro-ultraspeed` has no fallback).
    */
   private currentAuthStorageKeys(): string[] {
     return getAuthStorageKeys(this.provider, this.model);
@@ -3407,6 +4214,12 @@ export class AgentSession {
   }
 
   async dispose(): Promise<void> {
+    // Quiesce any in-flight post-turn compaction BEFORE tearing down state:
+    // the background compact() snapshots and replaces `this.messages`, so
+    // letting it run past this point would checkpoint a near-empty history
+    // and leak a junk session file after teardown.
+    if (this.postTurnCompaction) await this.postTurnCompaction;
+    this.diagnosticsRecorder?.finalize();
     this.managerAbortSignal?.removeEventListener("abort", this.managerAbortHandler);
     this.processManager?.shutdownAll();
     this.lspManager?.shutdownAll();
@@ -3451,6 +4264,30 @@ export class AgentSession {
     const loaded = await this.sessionManager.load(canonicalPath);
     // Use the leaf from the header to walk the correct branch
     const loadedMessages = this.sessionManager.getMessages(loaded.entries, loaded.header.leafId);
+    this.backgroundVerification.clear();
+    const savedVerification = [...loaded.entries]
+      .reverse()
+      .find((entry) => entry.type === "custom" && entry.kind === VERIFICATION_STATE_KIND);
+    if (savedVerification?.type === "custom") {
+      this.verificationGate.restore(savedVerification.data);
+    } else {
+      this.verificationGate.reset();
+      // Legacy sessions have no host checkpoint. Tool-authored code history is
+      // not proof of today's files; require fresh evidence before approval.
+      if (
+        loadedMessages.some(
+          (message) =>
+            message.role === "assistant" &&
+            Array.isArray(message.content) &&
+            message.content.some(
+              (part) =>
+                part.type === "tool_call" && (part.name === "edit" || part.name === "write"),
+            ),
+        )
+      ) {
+        this.verificationGate.requireFreshVerification();
+      }
+    }
     this.checkpointGeneration = loaded.header.generation ?? 0;
     this.conversationId = loaded.header.conversationId ?? loaded.header.id;
     const legacyLabel = [...loaded.entries]
@@ -3527,7 +4364,13 @@ export class AgentSession {
     });
     const needsLoadCompaction =
       this.settingsManager.get("autoCompact") &&
-      shouldCompact(this.messages, contextWindow, loadPolicy.threshold);
+      shouldCompact(
+        this.messages,
+        contextWindow,
+        loadPolicy.threshold,
+        undefined,
+        loadPolicy.targetTokens,
+      );
     if (needsLoadCompaction && this.opts.deferLoadCompaction) {
       // Canonicalize again immediately before the first prompt is persisted:
       // another process may create the shared checkpoint after this load.
@@ -3612,7 +4455,7 @@ export class AgentSession {
   private createSlashCommandContext(): SlashCommandContext {
     return {
       switchModel: (provider, model) => this.switchModel(provider, model),
-      compact: () => this.compact(undefined, "manual"),
+      compact: (focus?: string) => this.compact(undefined, "manual", focus),
       newSession: () => this.newSession(),
       listSessions: async () => {
         const sessions = await this.sessionManager.list(this.cwd);

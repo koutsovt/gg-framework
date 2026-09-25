@@ -17,6 +17,108 @@ describe("streamOpenAICodex", () => {
     vi.unstubAllGlobals();
   });
 
+  it.each(["invalid_encrypted_content", undefined])(
+    "recovers rejected reasoning (%s) without changing history",
+    async (code) => {
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              error: {
+                code,
+                message:
+                  "The encrypted content for item rs_old could not be verified. Reason: Encrypted content could not be decrypted or parsed.",
+              },
+            }),
+            { status: 400 },
+          ),
+        )
+        .mockResolvedValueOnce(createSseResponse([{ type: "response.completed", response: {} }]));
+      vi.stubGlobal("fetch", fetchMock);
+      const messages = [
+        {
+          role: "assistant" as const,
+          content: [
+            {
+              type: "raw" as const,
+              data: { type: "reasoning", id: "rs_old", encrypted_content: "ENC_OLD", summary: [] },
+            },
+            { type: "text" as const, text: "Keep this answer" },
+            { type: "tool_call" as const, id: "call_1|fc_1", name: "read", args: {} },
+          ],
+        },
+        {
+          role: "tool" as const,
+          content: [
+            {
+              type: "tool_result" as const,
+              toolCallId: "call_1|fc_1",
+              content: "Keep this result",
+            },
+          ],
+        },
+        { role: "user" as const, content: "Continue" },
+      ];
+      const original = structuredClone(messages);
+      const result = streamOpenAICodex({
+        provider: "openai",
+        model: "gpt-6-astra",
+        apiKey: "test",
+        messages,
+      });
+      await expect(result.response).resolves.toBeDefined();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const first = JSON.parse(fetchMock.mock.calls[0][1].body);
+      const second = JSON.parse(fetchMock.mock.calls[1][1].body);
+      expect(first.input[0].type).toBe("reasoning");
+      expect(second).toEqual({ ...first, input: first.input.slice(1) });
+      expect(messages).toEqual(original);
+    },
+  );
+
+  it.each([
+    { status: 400, code: "invalid_encrypted_content", reasoning: true, attempts: 2 },
+    { status: 400, code: "invalid_encrypted_content", reasoning: false, attempts: 1 },
+    { status: 401, code: "invalid_encrypted_content", reasoning: true, attempts: 1 },
+    { status: 400, code: "invalid_request_error", reasoning: true, attempts: 1 },
+  ])(
+    "bounds reasoning recovery: $status $code reasoning=$reasoning",
+    async ({ status, code, reasoning, attempts }) => {
+      const fetchMock = vi.fn(
+        async () =>
+          new Response(JSON.stringify({ error: { code, message: "Rejected" } }), { status }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const result = streamOpenAICodex({
+        provider: "openai",
+        model: "gpt-6-astra",
+        apiKey: "test",
+        messages: [
+          ...(reasoning
+            ? [
+                {
+                  role: "assistant" as const,
+                  content: [
+                    {
+                      type: "raw" as const,
+                      data: { type: "reasoning", id: "rs_old", encrypted_content: "ENC" },
+                    },
+                  ],
+                },
+              ]
+            : []),
+          { role: "user", content: "Continue" },
+        ],
+      });
+      await expect(result.response).rejects.toMatchObject({
+        statusCode: status,
+        message: "Rejected",
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(attempts);
+    },
+  );
+
   it("preserves streamed function call arguments", async () => {
     vi.stubGlobal(
       "fetch",
@@ -273,7 +375,7 @@ describe("streamOpenAICodex", () => {
     const fetchMock = vi.mocked(fetch);
     const result = streamOpenAICodex({
       provider: "openai",
-      model: "gpt-5.6-sol",
+      model: "gpt-6-sol",
       messages: [{ role: "user", content: longMessage }],
       apiKey: "test-credential",
       accountId: "acct",
@@ -490,7 +592,7 @@ describe("streamOpenAICodex", () => {
 
     const result = streamOpenAICodex({
       provider: "openai",
-      model: "gpt-5.6-luna",
+      model: "gpt-6-luna",
       messages: [{ role: "user", content: "hi" }],
       apiKey: "token",
       accountId: "acct",
@@ -503,6 +605,36 @@ describe("streamOpenAICodex", () => {
     await expect(result.response).resolves.toMatchObject({
       usage: { inputTokens: 1024, outputTokens: 8, cacheRead: 2048, cacheWrite: 1024 },
     });
+  });
+
+  it.each([
+    ["gpt-5.5", "none"],
+    ["gpt-6-luna", "low"],
+    ["gpt-6-sol", "low"],
+    ["gpt-6-astra", "low"],
+    ["gpt-5.6-terra", "low"],
+  ])("uses a supported default effort for %s without explicit thinking", async (model, effort) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        createSseResponse([
+          {
+            type: "response.completed",
+            response: { usage: { input_tokens: 1, output_tokens: 1 } },
+          },
+        ]),
+      ),
+    );
+    const result = streamOpenAICodex({
+      provider: "openai",
+      model,
+      messages: [{ role: "user", content: "Rewrite this prompt" }],
+      apiKey: "test-key",
+      accountId: "acct",
+    });
+    await result;
+    const body = JSON.parse(vi.mocked(fetch).mock.calls[0]?.[1]?.body as string);
+    expect(body.reasoning.effort).toBe(effort);
   });
 
   it("uses the official Codex Responses-Lite identity and request shape for GPT-5.6", async () => {
@@ -521,7 +653,7 @@ describe("streamOpenAICodex", () => {
     const fetchMock = vi.mocked(fetch);
     const result = streamOpenAICodex({
       provider: "openai",
-      model: "gpt-5.6-luna",
+      model: "gpt-6-luna",
       messages: [{ role: "user", content: "hi" }],
       apiKey: "token",
       accountId: "acct",
@@ -536,16 +668,46 @@ describe("streamOpenAICodex", () => {
     const body = JSON.parse(init.body as string) as Record<string, unknown>;
     expect(init.headers).toMatchObject({
       originator: "codex_cli_rs",
-      version: "0.144.1",
-      "User-Agent": "codex_cli_rs/0.144.1",
+      version: "0.155.1",
+      "User-Agent": "codex_cli_rs/0.155.1",
       "X-OpenAI-Internal-Codex-Responses-Lite": "true",
     });
     expect(body).toMatchObject({
-      model: "gpt-5.6-luna",
+      model: "gpt-6-luna",
       parallel_tool_calls: false,
       reasoning: { effort: "low", summary: "auto", context: "all_turns" },
+      // Catalog parity: responses-lite models declare default_verbosity "low".
+      text: { verbosity: "low" },
     });
   });
+
+  it.each([
+    [
+      "Unsupported value: 'none' is not supported with the 'gpt-6-astra' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.",
+      undefined,
+    ],
+    [
+      "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account.",
+      "This model is not available through your ChatGPT account. " +
+        "Switch to a model listed for OpenAI via the model selector, or check your ChatGPT usage limits.",
+    ],
+  ])(
+    "only gives account-access guidance for an actual entitlement error: %s",
+    async (message, hint) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => new Response(JSON.stringify({ error: { message } }), { status: 400 })),
+      );
+      const result = streamOpenAICodex({
+        provider: "openai",
+        model: "gpt-6-astra",
+        messages: [{ role: "user", content: "Review this work" }],
+        apiKey: "test-key",
+        accountId: "acct",
+      });
+      await expect(result.response).rejects.toMatchObject({ message, hint, statusCode: 400 });
+    },
+  );
 
   it("surfaces JSON detail fields from Codex HTTP errors", async () => {
     vi.stubGlobal(
@@ -591,7 +753,7 @@ describe("streamOpenAICodex", () => {
 
     const result = streamOpenAICodex({
       provider: "openai",
-      model: "gpt-5.6-sol",
+      model: "gpt-6-sol",
       messages: [{ role: "user", content: "hi" }],
       apiKey: "token",
       accountId: "acct",
@@ -1292,5 +1454,59 @@ describe("streamOpenAICodex", () => {
         ],
       },
     });
+  });
+});
+
+describe("toCodexTools strict sampling", () => {
+  it("marks strictifiable tools strict:true and falls back to strict:null otherwise", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        createSseResponse([
+          {
+            type: "response.completed",
+            response: { usage: { input_tokens: 1, output_tokens: 1 } },
+          },
+        ]),
+      ),
+    );
+    const raw = {
+      type: "object",
+      properties: { mode: { oneOf: [{ type: "string" }, { type: "number" }] } },
+      required: ["mode"],
+    };
+    const result = streamOpenAICodex({
+      provider: "openai",
+      model: "gpt-5.5",
+      messages: [{ role: "user", content: "hi" }],
+      apiKey: "k",
+      accountId: "acct",
+      tools: [
+        {
+          name: "read",
+          description: "read",
+          parameters: z.object({ path: z.string(), offset: z.number().optional() }),
+        },
+        {
+          name: "mcp_tool",
+          description: "mcp",
+          parameters: z.record(z.string(), z.unknown()),
+          rawInputSchema: raw,
+        },
+      ],
+    });
+    for await (const _event of result) {
+      /* consume */
+    }
+    const body = JSON.parse(vi.mocked(fetch).mock.calls[0]?.[1]?.body as string) as {
+      tools: Array<Record<string, unknown>>;
+    };
+    expect(body.tools[0]).toMatchObject({ name: "read", strict: true });
+    expect(body.tools[0].parameters).toMatchObject({
+      required: ["path", "offset"],
+      additionalProperties: false,
+    });
+    expect(body.tools[1]).toMatchObject({ name: "mcp_tool", strict: null });
+    expect(body.tools[1].parameters).toEqual(raw);
   });
 });

@@ -1,5 +1,313 @@
 # @kenkaiiii/gg-core
 
+## 5.64.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.64.1
+
+## 5.64.0
+
+### Minor Changes
+
+- 4800b0f: Add GPT-6 Sol (`gpt-6-sol`) and GPT-6 Luna (`gpt-6-luna`), released 2026-09-22, and retire the GPT-5.6 family (Sol, Terra, Luna). There is no GPT-6 Terra — OpenAI's Codex catalog upgrades 5.6 Terra to 6 Sol. Both new models get 1.05M context on the public Responses API and 272K on the ChatGPT OAuth/Codex route, 128K output, text+image input, and the responses-lite transport. Sol costs $2/$10 per MTok, defaults to `medium` effort, and runs the full ladder up to `ultra`, where it gets the proactive async-subagent orchestration prompt. Luna costs $0.10/$0.50 per MTok, defaults to `medium`, and tops out at `max`.
+
+  GPT-6 Sol is now the OpenAI default (registry, CLI, benchmarks), and GPT-6 Luna is the fast model for subagents. The login hub, footer names, README, and the "not in catalog" error hint list GPT-6 Astra, Sol, and Luna. A saved session still on a GPT-5.6 id falls back to the provider default on next start.
+
+### Patch Changes
+
+- Updated dependencies [4800b0f]
+  - @kenkaiiii/gg-ai@5.64.0
+
+## 5.63.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.63.0
+
+## 5.62.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.62.0
+
+## 5.61.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.61.1
+
+## 5.61.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.61.0
+
+## 5.60.9
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.9
+
+## 5.60.8
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.8
+
+## 5.60.7
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.7
+
+## 5.60.6
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.6
+
+## 5.60.5
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.5
+
+## 5.60.4
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.4
+
+## 5.60.3
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.3
+
+## 5.60.2
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.2
+
+## 5.60.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.1
+
+## 5.60.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.60.0
+
+## 5.59.4
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.59.4
+
+## 5.59.3
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.59.3
+
+## 5.59.2
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.59.2
+
+## 5.59.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.59.1
+
+## 5.59.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.59.0
+
+## 5.58.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.58.1
+
+## 5.58.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.58.0
+
+## 5.57.2
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.57.2
+
+## 5.57.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.57.1
+
+## 5.57.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.57.0
+
+## 5.56.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.56.1
+
+## 5.56.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.56.0
+
+## 5.55.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.55.1
+
+## 5.55.0
+
+### Minor Changes
+
+- 7ade77f: Fix GPT-6 Astra on the ChatGPT OAuth route. OpenAI gates Astra on the Codex client version (`minimal_client_version: 0.153.0`) and rejected our `0.144.1` header with "requires a newer version of Codex"; we now advertise `0.153.4`, the current openai/codex release. When a future model is gated the same way, the error guidance says plainly that GG Coder needs updating and to switch model meanwhile, instead of echoing OpenAI's "upgrade the app or CLI" as if it were the user's problem.
+
+  Remove GPT-5.5 from the model registry, footers, login hub, README, and CLI defaults (OpenAI now defaults to GPT-5.6 Sol everywhere, matching the registry). Sync the desktop login hub descriptions with the registry for every provider (Claude Fable 5.1, GPT-6 Astra, GLM-5.3-Flash, OpenRouter Qwen3.6-Plus). Drop the last slash-command reference from a generic error hint so guidance reads correctly in the app.
+
+### Patch Changes
+
+- Updated dependencies [7ade77f]
+  - @kenkaiiii/gg-ai@5.55.0
+
+## 5.54.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.54.1
+
+## 5.54.0
+
+### Minor Changes
+
+- 7ad7339: Add GPT-6 Astra (`gpt-6-astra`, released 2026-09-03) to the model registry — 1.05M context on the public Responses API, 272K on the ChatGPT OAuth/Codex route, 128k output, text+image input, $10/$50 MTok with cache reads at $1/MTok. It takes the full six-rung Codex effort ladder (low → medium → high → xhigh → max → ultra) and uses the same responses-lite transport and `prompt_cache_options` cache shape as the GPT-5.6 family; at `ultra` it receives the proactive async-subagent orchestration prompt, matching its `multi_agent v2` catalog entry.
+
+  Astra is still rolling out (`visibility: hide` in OpenAI's Codex catalog), so accounts without access get the existing "not in the current Codex catalog" hint, which now names Astra among the alternatives. Through a plain OpenAI API key, OpenAI requires the Responses API for tool calling on Astra, so the Chat Completions path stays text-only — the OAuth Codex route is the supported way to run it as an agent.
+
+### Patch Changes
+
+- Updated dependencies [7ad7339]
+  - @kenkaiiii/gg-ai@5.54.0
+
+## 5.53.3
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.53.3
+
+## 5.53.2
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.53.2
+
+## 5.53.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.53.1
+
+## 5.53.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.53.0
+
+## 5.52.0
+
+### Minor Changes
+
+- 17ca096: Add Claude Fable 5.1 (`claude-fable-5-1`, released 2026-09-01) to the model registry — 1M context, 128k output, image input, always-on adaptive thinking on the low→max ladder (no xhigh), $10/$50 MTok with cache reads at $0.25/MTok. It replaces Fable 5, which is retired from the registry and the model picker — a session still pinned to it falls back to the provider default on next start. Fable 5.1 rejects forced tool use (`tool_choice` `any`/`tool`) with a 400; gg-coder only ever sends `auto`/`none`, so no call path changes.
+
+  The login screen now derives its provider rows from `AUTH_PROVIDERS` instead of keeping a second hardcoded copy, and a new test pins every provider description to the model registry — which caught two stale ones: Z.AI now lists GLM-5.3-Flash alongside GLM-5.3, and OpenRouter names Qwen3.6-Plus rather than just "multi-provider gateway".
+
+### Patch Changes
+
+- Updated dependencies [17ca096]
+  - @kenkaiiii/gg-ai@5.52.0
+
+## 5.51.4
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.51.4
+
+## 5.51.3
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.51.3
+
+## 5.51.2
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.51.2
+
+## 5.51.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.51.1
+
+## 5.51.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.51.0
+
+## 5.50.0
+
+### Minor Changes
+
+- 10138dd: **Add GLM-5.3-Flash.** Z.AI's 320B-A18B natively multimodal sibling of GLM-5.3 (released 2026-08-26) is live on the coding endpoint and now selectable. It carries the same 1M context and `max` thinking ceiling, but is natively multimodal — images go inline instead of taking the `zai_vision` MCP detour — and at ~1/20th of 5.3's price with 3× the coding-plan quota it becomes the GLM provider's low-cost tier, so scout sub-agents and compaction summaries route to it instead of paying GLM-5.3 rates.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.50.0
+
+## 5.49.11
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.49.11
+
+## 5.49.10
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.49.10
+
+## 5.49.9
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.49.9
+
 ## 5.49.8
 
 ### Patch Changes

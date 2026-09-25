@@ -18,14 +18,20 @@ describe("prompt commands", () => {
     }
   });
 
-  it("tells commands that name kencode tools how to unlock deferred MCP", () => {
-    // `deferredMcpTools` defaults to true, so `mcp__kencode-search__*` sits in
-    // the tool_search catalog until promoted. A command that hard-names it must
-    // say how to unlock it, or the call fails on a default install.
+  it("defines /steroids as profile, discover, ask, then index only what was chosen", () => {
+    const cmd = PROMPT_COMMANDS.find((command) => command.name === "steroids");
+    expect(cmd?.prompt).toContain("Profile the project");
+    expect(cmd?.prompt).toContain("`discover` queries WITHOUT `add`");
+    expect(cmd?.prompt).toContain("`ask_user` tool");
+    expect(cmd?.prompt).toContain("Do not index anything until the user answers");
+    expect(cmd?.prompt).toContain("`steroids` `add`");
+  });
+
+  it("routes real-code comparison through the native steroids tool", () => {
     for (const name of ["compare", "expand"]) {
       const cmd = PROMPT_COMMANDS.find((command) => command.name === name);
-      expect(cmd?.prompt, name).toContain("mcp__kencode-search__");
-      expect(cmd?.prompt, name).toContain("call `tool_search`");
+      expect(cmd?.prompt, name).toContain("`steroids`");
+      expect(cmd?.prompt, name).not.toContain("kencode");
     }
   });
 
@@ -83,9 +89,15 @@ describe("prompt commands", () => {
     expect(expand?.prompt).toContain("validate it yourself before reporting");
     expect(expand?.prompt).toContain("The table must have exactly 3 columns");
     expect(expand?.prompt).toContain("Do not start implementing until the user chooses");
-    expect(expand?.prompt).toContain("A) Build all of these features in plan mode");
-    expect(expand?.prompt).toContain("B) Build only the top priority ones in plan mode");
-    expect(expand?.prompt).toContain("C) Other");
+    // The choice is offered through `ask_user` (clickable options in the app)
+    // and ONLY there: restating the options as text gave the user the same
+    // question twice, once clickable and once not. Prose is the fallback for
+    // hosts that cannot render the card at all.
+    expect(expand?.prompt).toContain("`ask_user` tool");
+    expect(expand?.prompt).toContain("Build all of these features in plan mode");
+    expect(expand?.prompt).toContain("Build only the top priority ones in plan mode");
+    expect(expand?.prompt).toContain("The card is the ONLY ask");
+    expect(expand?.prompt).toContain("Only if `ask_user` is unavailable");
     expect(expand?.prompt).toContain("call the enter_plan tool");
     expect(expand?.prompt).toContain("call exit_plan with the plan path");
     expect(expand?.prompt).not.toContain("Create a Goal");

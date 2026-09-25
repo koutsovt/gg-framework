@@ -35,6 +35,7 @@ const flushSubagents = async (): Promise<void> => {
 function setup(
   handleKenEvent: (e: SidecarEvent) => boolean = () => false,
   initialState: Partial<AgentState> = {},
+  handleAutopilotEvent: (e: SidecarEvent) => boolean = () => false,
 ) {
   let items: Item[] = [];
   let id = 0;
@@ -58,7 +59,7 @@ function setup(
   // model_change / ken_model_change spreads) apply against a base state.
   let agentState: AgentState | null = {
     provider: "anthropic",
-    model: "claude-opus-5",
+    model: "claude-opus-5-5",
     cwd: "/tmp/proj",
     running: false,
     ...initialState,
@@ -81,7 +82,8 @@ function setup(
     setItems: setItems as AgentEventsDeps["setItems"],
     nextId,
     handleKenEvent,
-    handleAutopilotEvent: () => false,
+    handleAutopilotEvent,
+    handleActivityEvent: vi.fn(),
     setState,
     setTasks: noop as unknown as AgentEventsDeps["setTasks"],
     setProjectTasks: noop as unknown as AgentEventsDeps["setProjectTasks"],
@@ -90,7 +92,7 @@ function setup(
     setLiveToolFeed,
     setTokens,
     setContextTokens: noop as unknown as AgentEventsDeps["setContextTokens"],
-    setDoneStatus: noop as unknown as AgentEventsDeps["setDoneStatus"],
+    setDoneStatus: vi.fn<AgentEventsDeps["setDoneStatus"]>(),
     setIsThinking: noop as unknown as AgentEventsDeps["setIsThinking"],
     setThinkingStartTs: noop as unknown as AgentEventsDeps["setThinkingStartTs"],
     setThinkingAccumMs: noop as unknown as AgentEventsDeps["setThinkingAccumMs"],
@@ -99,8 +101,8 @@ function setup(
     setPlanReview: ((u: string | null | ((p: string | null) => string | null)) => {
       planReview = typeof u === "function" ? u(planReview) : u;
     }) as AgentEventsDeps["setPlanReview"],
-    setQueuedCount: noop as unknown as AgentEventsDeps["setQueuedCount"],
-    setQueuedMessages: noop as unknown as AgentEventsDeps["setQueuedMessages"],
+    setQueuedCount: vi.fn<AgentEventsDeps["setQueuedCount"]>(),
+    setQueuedMessages: vi.fn<AgentEventsDeps["setQueuedMessages"]>(),
     setAttachments: noop as unknown as AgentEventsDeps["setAttachments"],
     setCommands: noop as unknown as AgentEventsDeps["setCommands"],
     setModels,
@@ -130,9 +132,120 @@ function setup(
 }
 
 describe("useAgentEvents", () => {
+  it("updates task activity before an autopilot delegate consumes its event", () => {
+    const { hook, deps } = setup(
+      () => false,
+      {},
+      () => true,
+    );
+    const review = ev("autopilot_review_start");
+    act(() => hook.result.current.handleEvent(review));
+    expect(deps.handleActivityEvent).toHaveBeenCalledWith(review);
+  });
+
+  it("shows Unverified instead of completion and does not finish an approved plan", () => {
+    const { hook, deps } = setup();
+    act(() => hook.result.current.handleEvent(ev("run_start", {})));
+    deps.planTotalRef.current = 2;
+    deps.planDoneRef.current = new Set([1, 2]);
+    act(() => hook.result.current.handleEvent(ev("run_end", { unverified: true })));
+    expect(deps.setDoneStatus).toHaveBeenLastCalledWith(expect.stringMatching(/^Unverified /));
+    expect(deps.planTotalRef.current).toBe(2);
+    expect(deps.planDoneRef.current).toEqual(new Set([1, 2]));
+  });
+
   beforeEach(() => vi.clearAllMocks());
 
   describe("queued pill lifecycle", () => {
+    it("removes the cancelled duplicate, not the identical message still pending", () => {
+      const { hook, getItems, pushUserItem } = setup();
+      pushUserItem("same", true);
+      pushUserItem("same", true);
+      const firstId = getItems()[0]!.id;
+      act(() =>
+        hook.result.current.handleEvent(
+          ev("queued", {
+            count: 2,
+            messages: [
+              { id: "a", text: "same" },
+              { id: "b", text: "same" },
+            ],
+          }),
+        ),
+      );
+      act(() =>
+        hook.result.current.handleEvent(
+          ev("queued", {
+            count: 1,
+            messages: [{ id: "a", text: "same" }],
+            cancelledId: "b",
+          }),
+        ),
+      );
+      expect(getItems()).toEqual([
+        expect.objectContaining({ id: firstId, text: "same", queued: true }),
+      ]);
+    });
+
+    it("keeps newer enqueues and drains after cancellation, including repeated cancellation events", () => {
+      const { hook, getItems, pushUserItem, deps } = setup();
+      pushUserItem("cancel me", true);
+      act(() =>
+        hook.result.current.handleEvent(
+          ev("queued", {
+            count: 1,
+            messages: [{ id: "a", text: "cancel me" }],
+          }),
+        ),
+      );
+      act(() =>
+        hook.result.current.handleEvent(
+          ev("queued", {
+            count: 0,
+            messages: [],
+            cancelledId: "a",
+          }),
+        ),
+      );
+      expect(getItems()).toEqual([]);
+      pushUserItem("newer", true);
+      const pending = [{ id: "b", text: "newer" }];
+      act(() => hook.result.current.handleEvent(ev("queued", { count: 1, messages: pending })));
+      act(() =>
+        hook.result.current.handleEvent(
+          ev("queued", {
+            count: 1,
+            messages: pending,
+            cancelledId: "a",
+          }),
+        ),
+      );
+      expect(deps.setQueuedMessages).toHaveBeenLastCalledWith(pending);
+      expect(getItems()).toEqual([expect.objectContaining({ text: "newer", queued: true })]);
+      act(() => hook.result.current.handleEvent(ev("queued", { count: 0, messages: [] })));
+      expect(deps.setQueuedCount).toHaveBeenLastCalledWith(0);
+      expect(deps.setQueuedMessages).toHaveBeenLastCalledWith([]);
+      expect(getItems()).toEqual([expect.objectContaining({ text: "newer", queued: false })]);
+    });
+
+    it("preserves consumed input when cancellation loses the race", () => {
+      const { hook, getItems, pushUserItem } = setup();
+      pushUserItem("already running", true);
+      act(() =>
+        hook.result.current.handleEvent(
+          ev("queued", {
+            count: 1,
+            messages: [{ id: "a", text: "already running" }],
+          }),
+        ),
+      );
+      act(() => hook.result.current.handleEvent(ev("queued", { count: 0, messages: [] })));
+      // Failed cancellation broadcasts the current list without a cancelled id.
+      act(() => hook.result.current.handleEvent(ev("queued", { count: 0, messages: [] })));
+      expect(getItems()).toEqual([
+        expect.objectContaining({ text: "already running", queued: false }),
+      ]);
+    });
     it("clears a bubble's queued pill as soon as the agent consumes it, mid-run", () => {
       const { hook, getItems, pushUserItem, setRunning } = setup();
       act(() => setRunning(true));
@@ -412,6 +525,25 @@ describe("useAgentEvents", () => {
     });
   });
 
+  it("merges CI updates, preserves them in partial frames, and clears them on null", () => {
+    const { hook, getState } = setup();
+    const ci: NonNullable<AgentState["gitHubCI"]> = {
+      key: "repo:sha:1.1",
+      url: "https://github.com/owner/repo/actions/runs/1",
+      active: true,
+      total: 6,
+      completed: 4,
+      failed: 0,
+      conclusion: null,
+    };
+    act(() => hook.result.current.handleEvent(ev("extras", { gitHubCI: ci })));
+    expect(getState()?.gitHubCI).toEqual(ci);
+    act(() => hook.result.current.handleEvent(ev("extras", { gitDirtyFileCount: 1 })));
+    expect(getState()?.gitHubCI).toEqual(ci);
+    act(() => hook.result.current.handleEvent(ev("extras", { gitHubCI: null })));
+    expect(getState()?.gitHubCI).toBeNull();
+  });
+
   it("text_delta streams assistant text into a single item", () => {
     const { hook, getItems } = setup();
     act(() => {
@@ -433,6 +565,53 @@ describe("useAgentEvents", () => {
     expect(items[0]).toMatchObject({ kind: "assistant", text: "Hello world" });
   });
 
+  it("keeps raw diagnostics out of chat without interrupting plan progress", () => {
+    const { hook, getItems } = setup();
+    act(() => {
+      hook.result.current.handleEvent(ev("text_delta", { text: "[DONE:2]" }));
+      hook.result.current.handleEvent(
+        ev("diagnostics", { text: "Diagnostics in a.ts: type mismatch" }),
+      );
+      hook.result.current.handleEvent(ev("text_delta", { text: "Continuing step 3." }));
+      hook.result.current.endStreamingText();
+    });
+    expect(getItems()).toEqual([
+      expect.objectContaining({ kind: "assistant", text: "[DONE:2]Continuing step 3." }),
+    ]);
+  });
+
+  it("does not add chat rows for repeated diagnostic or timeout notices", () => {
+    const { hook, getItems } = setup();
+    act(() => {
+      for (const text of [
+        "Post-edit diagnostics for the latest queued changes:\nL16:30 Expected 1 arguments, but got 4.",
+        "a.ts: diagnostics timeout; not verified. Run the project checks.",
+        "a.ts: diagnostics timeout; not verified. Run the project checks.",
+      ]) {
+        hook.result.current.handleEvent(ev("diagnostics", { text }));
+      }
+    });
+    expect(getItems()).toEqual([]);
+  });
+
+  it("does not release an armed final draft when diagnostics arrive", () => {
+    const { hook, getItems } = setup();
+    act(() => {
+      hook.result.current.handleEvent(ev("hook_armed", { kind: "verification", armed: true }));
+      hook.result.current.handleEvent(ev("text_delta", { text: "Unverified draft" }));
+      hook.result.current.handleEvent(
+        ev("diagnostics", { text: "Diagnostics in a.ts: type mismatch" }),
+      );
+    });
+    expect(getItems()).toEqual([]);
+    act(() => {
+      hook.result.current.handleEvent(ev("hook", { kind: "verification" }));
+      hook.result.current.handleEvent(ev("hook_armed", { kind: "verification", armed: false }));
+      hook.result.current.endStreamingText();
+    });
+    expect(getItems().some((item) => item.kind === "assistant")).toBe(false);
+  });
+
   it("discards a draft the late-arming fallback could not hold back", () => {
     const { hook, getItems } = setup();
 
@@ -450,6 +629,109 @@ describe("useAgentEvents", () => {
     expect(getItems()).toEqual([
       expect.objectContaining({ kind: "hook", hook: "ideal" }),
       expect.objectContaining({ kind: "assistant", text: "Reviewed final" }),
+    ]);
+  });
+
+  it("discards every repeated draft but shows the review notice once", () => {
+    // One review injects up to four times (the read-coverage retries and their
+    // escalation). Each injection must kill the draft it interrupts, but the
+    // notice is the same sentence — stacking copies says nothing new.
+    const { hook, getItems } = setup();
+
+    act(() => {
+      hook.result.current.handleEvent(ev("hook", { kind: "ideal" }));
+      hook.result.current.handleEvent(ev("text_delta", { text: "Draft two" }));
+      hook.result.current.handleEvent(ev("hook", { kind: "ideal" }));
+      hook.result.current.handleEvent(ev("text_delta", { text: "Draft three" }));
+      hook.result.current.handleEvent(ev("hook", { kind: "ideal" }));
+    });
+    expect(getItems()).toEqual([expect.objectContaining({ kind: "hook", hook: "ideal" })]);
+
+    act(() => {
+      hook.result.current.handleEvent(ev("text_delta", { text: "Reviewed final" }));
+      hook.result.current.endStreamingText();
+    });
+    expect(getItems()).toEqual([
+      expect.objectContaining({ kind: "hook", hook: "ideal" }),
+      expect.objectContaining({ kind: "assistant", text: "Reviewed final" }),
+    ]);
+  });
+
+  it("distinguishes a post-edit recheck while deduplicating repeated recheck notices", () => {
+    const { hook, getItems } = setup();
+    act(() => {
+      hook.result.current.handleEvent(ev("hook", { kind: "verification" }));
+      hook.result.current.handleEvent(
+        ev("hook", { kind: "verification", verificationReason: "recheck" }),
+      );
+      hook.result.current.handleEvent(
+        ev("hook", { kind: "verification", verificationReason: "recheck" }),
+      );
+    });
+    expect(getItems()).toHaveLength(2);
+    expect(getItems()[1]).toMatchObject({ hook: "verification", verificationReason: "recheck" });
+  });
+
+  it("keeps check-review notices distinct and shows the completed outcome after the hook", () => {
+    const { hook, getItems } = setup();
+    act(() => {
+      hook.result.current.handleEvent(ev("hook", { kind: "verification" }));
+      hook.result.current.handleEvent(ev("hook_armed", { kind: "verification", armed: true }));
+      hook.result.current.handleEvent(ev("text_delta", { text: "Unreviewed draft" }));
+      hook.result.current.handleEvent(
+        ev("hook", { kind: "verification", verificationReason: "check_review" }),
+      );
+      hook.result.current.handleEvent(
+        ev("hook", { kind: "verification", verificationReason: "check_review" }),
+      );
+      hook.result.current.handleEvent(ev("hook_armed", { kind: "verification", armed: false }));
+      hook.result.current.handleEvent(
+        ev("text_delta", {
+          text: "Two fixes complete. Tests pass. Commit and push remain paused.",
+        }),
+      );
+      hook.result.current.endStreamingText();
+    });
+    expect(getItems()).toEqual([
+      expect.objectContaining({ kind: "hook", hook: "verification" }),
+      expect.objectContaining({
+        kind: "hook",
+        hook: "verification",
+        verificationReason: "check_review",
+      }),
+      expect.objectContaining({
+        kind: "assistant",
+        text: "Two fixes complete. Tests pass. Commit and push remain paused.",
+      }),
+    ]);
+  });
+
+  it("retains an evidence limitation on an approved plan marker", () => {
+    const { hook, getItems } = setup();
+    act(() =>
+      hook.result.current.handleEvent(
+        ev("autopilot_plan_accepted", { reason: "Corpus unavailable." }),
+      ),
+    );
+    expect(getItems()).toContainEqual(
+      expect.objectContaining({
+        kind: "autopilot",
+        phase: "plan_approved",
+        reason: "Corpus unavailable.",
+      }),
+    );
+  });
+
+  it("still shows a second notice when a DIFFERENT hook follows", () => {
+    const { hook, getItems } = setup();
+
+    act(() => {
+      hook.result.current.handleEvent(ev("hook", { kind: "verification" }));
+      hook.result.current.handleEvent(ev("hook", { kind: "ideal" }));
+    });
+    expect(getItems()).toEqual([
+      expect.objectContaining({ kind: "hook", hook: "verification" }),
+      expect.objectContaining({ kind: "hook", hook: "ideal" }),
     ]);
   });
 
@@ -654,7 +936,7 @@ describe("useAgentEvents", () => {
       kenModel: "gpt-5.5",
       kenModelOverride: true,
       // GG Coder's own model is untouched by a Ken pin.
-      model: "claude-opus-5",
+      model: "claude-opus-5-5",
       provider: "anthropic",
     });
 
@@ -663,12 +945,12 @@ describe("useAgentEvents", () => {
       hook.result.current.handleEvent(
         ev("ken_model_change", {
           kenProvider: "anthropic",
-          kenModel: "claude-opus-5",
+          kenModel: "claude-opus-5-5",
           kenModelOverride: false,
         }),
       );
     });
-    expect(getState()).toMatchObject({ kenModel: "claude-opus-5", kenModelOverride: false });
+    expect(getState()).toMatchObject({ kenModel: "claude-opus-5-5", kenModelOverride: false });
   });
 
   it("plan_exit opens the human review modal when autopilot is off", () => {
@@ -903,7 +1185,7 @@ describe("models_change", () => {
     // Connecting a provider unlocks its models; the sidecar fans models_change
     // out to every window because ~/.gg/auth.json is shared, not per-session.
     const unlocked = [
-      { id: "claude-opus-5", name: "Claude Opus 5", provider: "anthropic" },
+      { id: "claude-opus-5-5", name: "Claude Opus 5.5", provider: "anthropic" },
       { id: "gpt-6", name: "GPT-6", provider: "openai" },
     ];
     vi.mocked(listModels).mockResolvedValue(unlocked as never);
@@ -918,7 +1200,7 @@ describe("models_change", () => {
   });
 
   it("keeps the existing list when the refresh itself fails", async () => {
-    const seeded = [{ id: "claude-opus-5", name: "Claude Opus 5", provider: "anthropic" }];
+    const seeded = [{ id: "claude-opus-5-5", name: "Claude Opus 5.5", provider: "anthropic" }];
     vi.mocked(listModels).mockResolvedValue(seeded as never);
     const { hook, getModels } = setup();
     await act(async () => {
@@ -939,7 +1221,7 @@ describe("models_change", () => {
   });
 
   it("clears the picker when the last provider is disconnected", async () => {
-    const seeded = [{ id: "claude-opus-5", name: "Claude Opus 5", provider: "anthropic" }];
+    const seeded = [{ id: "claude-opus-5-5", name: "Claude Opus 5.5", provider: "anthropic" }];
     vi.mocked(listModels).mockResolvedValue(seeded as never);
     const { hook, getModels } = setup();
     await act(async () => {
@@ -957,5 +1239,57 @@ describe("models_change", () => {
     });
 
     expect(getModels()).toEqual([]);
+  });
+
+  describe("ask_user band", () => {
+    const question = {
+      id: "flag",
+      question: "Flip the flag for everyone now?",
+      kind: "confirm",
+      options: [{ label: "Yes" }, { label: "No" }],
+    };
+
+    it("renders a question the agent is parked on", () => {
+      const { hook, getItems } = setup();
+      act(() => {
+        hook.result.current.handleEvent(ev("ask_user", { id: "ask-1", questions: [question] }));
+      });
+      expect(getItems()).toEqual([
+        expect.objectContaining({ kind: "ask", prompt: { id: "ask-1", questions: [question] } }),
+      ]);
+    });
+
+    it("drops a malformed frame instead of rendering an unanswerable band", () => {
+      const { hook, getItems } = setup();
+      act(() => {
+        hook.result.current.handleEvent(ev("ask_user", { id: "ask-1", questions: [] }));
+        hook.result.current.handleEvent(ev("ask_user", { questions: [question] }));
+      });
+      expect(getItems()).toEqual([]);
+    });
+
+    // The sidecar releases parked questions only on a real abort, so only a
+    // cancelled run may close a band.
+    it("closes an unanswered band when the run is cancelled", () => {
+      const { hook, getItems } = setup();
+      act(() => {
+        hook.result.current.handleEvent(ev("ask_user", { id: "ask-1", questions: [question] }));
+        hook.result.current.handleEvent(ev("run_end", { cancelled: true }));
+      });
+      expect(getItems()).toEqual([expect.objectContaining({ kind: "ask", cancelled: true })]);
+    });
+
+    // Autopilot emits a run_end per injected round while the tool call is still
+    // parked; closing there would kill a question the user can still answer and
+    // strand the agent until its ten-minute timeout.
+    it("leaves the band live across a normal run_end", () => {
+      const { hook, getItems } = setup();
+      act(() => {
+        hook.result.current.handleEvent(ev("ask_user", { id: "ask-1", questions: [question] }));
+        hook.result.current.handleEvent(ev("run_end", {}));
+        hook.result.current.handleEvent(ev("run_end", {}));
+      });
+      expect(getItems()).toEqual([expect.not.objectContaining({ cancelled: true })]);
+    });
   });
 });

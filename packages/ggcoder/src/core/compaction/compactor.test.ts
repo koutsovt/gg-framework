@@ -14,6 +14,11 @@ import {
   extractFileOperations,
   splitTrackedModifiedFiles,
   buildModifiedFilesSection,
+  extractFailingTests,
+  extractTestSignals,
+  splitTrackedFailingTests,
+  buildFailingTestsSection,
+  MAX_TRACKED_FAILING_TESTS,
   resolveSummaryOutputTokens,
   HISTORICAL_TOOL_ARG_MAX_CHARS,
   MAX_TRACKED_MODIFIED_FILES,
@@ -23,7 +28,14 @@ import {
 } from "./compactor.js";
 import { remapAnchorForCompaction } from "../session-history.js";
 import { estimateConversationTokens } from "./token-estimator.js";
-import { MODELS, getContextWindow } from "@kenkaiiii/gg-core";
+import {
+  MODELS,
+  getContextWindow,
+  registerRuntimeModels,
+  clearRuntimeModels,
+  toModelInfo,
+  DEFAULT_LOCAL_ENDPOINTS,
+} from "@kenkaiiii/gg-core";
 import type { Message, ContentPart, ToolResult } from "@kenkaiiii/gg-ai";
 
 // ── Helpers ────────────────────────────────────────────────
@@ -120,7 +132,7 @@ describe("shouldCompact", () => {
     }
     const estimated = estimateConversationTokens(messages);
 
-    const opusContext = getContextWindow("claude-opus-5");
+    const opusContext = getContextWindow("claude-opus-5-5");
     const kimiContext = getContextWindow("kimi-k2.7-code");
 
     // Sanity: Opus has 1M, Kimi has 256k
@@ -142,6 +154,17 @@ describe("shouldCompact", () => {
     expect(shouldCompact(messages, 200_000, 0.8, 170_000)).toBe(true);
     // actualTokens under threshold — no compact despite same messages
     expect(shouldCompact(messages, 200_000, 0.8, 100_000)).toBe(false);
+  });
+
+  it("honors an explicit latency-capped trigger limit over window × threshold", () => {
+    // The GLM latency-cap path: a 1M window at 0.85 would never fire at
+    // 150K tokens, but the policy's capped target (176K × 0.85 ≈ 149.6K)
+    // must — this is exactly the 2026-09-22 session that ran 60 minutes.
+    const messages = [makeMessage("system", "sys"), makeMessage("user", "hello")];
+    expect(shouldCompact(messages, 1_000_000, 0.85, 150_000, 149_600)).toBe(true);
+    expect(shouldCompact(messages, 1_000_000, 0.85, 149_599, 149_600)).toBe(false);
+    // Without the explicit limit, the old behavior holds (no compaction)
+    expect(shouldCompact(messages, 1_000_000, 0.85, 150_000)).toBe(false);
   });
 
   it("falls back to char-based estimate when actualTokens is undefined", () => {
@@ -175,13 +198,16 @@ describe("shouldCompact", () => {
     expect(getCompactionReserveTokens(16_384)).toBe(21_384);
   });
 
-  it("does not let an output-token reserve move the percentage boundary", () => {
+  it("does not let theoretical output size move the percentage boundary", () => {
+    // The old deprecated `_reserveTokens` parameter is gone: output-token
+    // ceilings no longer affect the trigger at all — there is no slot to
+    // smuggle one through.
     const messages = [makeMessage("user", "x")];
     const contextWindow = 272_000;
     const boundary = Math.ceil(contextWindow * 0.8);
 
-    expect(shouldCompact(messages, contextWindow, 0.8, boundary - 1, 128_000)).toBe(false);
-    expect(shouldCompact(messages, contextWindow, 0.8, boundary, 128_000)).toBe(true);
+    expect(shouldCompact(messages, contextWindow, 0.8, boundary - 1)).toBe(false);
+    expect(shouldCompact(messages, contextWindow, 0.8, boundary)).toBe(true);
   });
 });
 
@@ -208,13 +234,14 @@ describe("compaction thresholds across all models", () => {
   });
 
   it.each(MODELS)("$id ignores theoretical output size at the boundary", (model) => {
+    // Output-token ceilings do not move the boundary — the deprecated
+    // reserve parameter is gone, so there is no slot to smuggle one through.
     const contextWindow = getContextWindow(model.id, { provider: model.provider });
     const boundary = Math.ceil(contextWindow * 0.8);
+    expect(model.maxOutputTokens).toBeGreaterThan(0);
 
-    expect(shouldCompact(messages, contextWindow, 0.8, boundary - 1, model.maxOutputTokens)).toBe(
-      false,
-    );
-    expect(shouldCompact(messages, contextWindow, 0.8, boundary, model.maxOutputTokens)).toBe(true);
+    expect(shouldCompact(messages, contextWindow, 0.8, boundary - 1)).toBe(false);
+    expect(shouldCompact(messages, contextWindow, 0.8, boundary)).toBe(true);
   });
 
   it("unknown models fall back to a 200k context window", () => {
@@ -222,10 +249,9 @@ describe("compaction thresholds across all models", () => {
   });
 
   const openAITransportCases = [
-    { id: "gpt-5.6-sol", publicWindow: 1_050_000, codexWindow: 272_000 },
-    { id: "gpt-5.6-terra", publicWindow: 1_050_000, codexWindow: 272_000 },
-    { id: "gpt-5.6-luna", publicWindow: 1_050_000, codexWindow: 272_000 },
-    { id: "gpt-5.5", publicWindow: 1_050_000, codexWindow: 272_000 },
+    { id: "gpt-6-astra", publicWindow: 1_050_000, codexWindow: 272_000 },
+    { id: "gpt-6-sol", publicWindow: 1_050_000, codexWindow: 272_000 },
+    { id: "gpt-6-luna", publicWindow: 1_050_000, codexWindow: 272_000 },
   ] as const;
 
   it.each(openAITransportCases)("$id uses its public API window without accountId", (testCase) => {
@@ -645,7 +671,7 @@ vi.mock("@kenkaiiii/gg-ai", async (importOriginal) => {
 });
 
 // Must import stream AFTER mock setup
-import { stream } from "@kenkaiiii/gg-ai";
+import { stream, StreamResult } from "@kenkaiiii/gg-ai";
 
 describe("compact", () => {
   const baseOptions = {
@@ -708,6 +734,53 @@ describe("compact", () => {
     expect(result.result.originalCount).toBe(3);
     expect(result.result.newCount).toBe(3);
     expect(result.messages).toHaveLength(3);
+  });
+
+  it("caps local summaries at the discovered model output allowance", async () => {
+    const model = toModelInfo(
+      {
+        rawId: "small-context",
+        endpointId: "ollama",
+        contextWindow: 4096,
+        contextWindowKnown: true,
+        supportsTools: true,
+        supportsImages: false,
+        supportsThinking: false,
+      },
+      DEFAULT_LOCAL_ENDPOINTS[0]!,
+    );
+    registerRuntimeModels([model]);
+    const mockStream = vi.mocked(stream);
+    mockStream.mockClear();
+    mockStream.mockImplementation(
+      () =>
+        new StreamResult(
+          (async function* () {
+            yield { type: "text_delta", text: "Conversation summary." };
+            return {
+              message: { role: "assistant", content: "Conversation summary." },
+              stopReason: "end_turn",
+              usage: { inputTokens: 100, outputTokens: 10 },
+            };
+          })(),
+        ),
+    );
+    try {
+      await compact(buildConversation(30), {
+        ...baseOptions,
+        provider: "local",
+        model: model.id,
+        contextWindow: model.contextWindow,
+      });
+      expect(mockStream).toHaveBeenCalled();
+      for (const [options] of mockStream.mock.calls) {
+        expect(options.maxTokens).toBe(model.maxOutputTokens);
+        expect(options.maxTokens).toBeLessThan(MIN_SUMMARY_OUTPUT_TOKENS);
+      }
+    } finally {
+      clearRuntimeModels();
+      mockStream.mockReset();
+    }
   });
 
   it("produces summary message with LLM response", async () => {
@@ -1379,5 +1452,141 @@ describe("resolveSummaryOutputTokens", () => {
   it("scales with the window and caps at the maximum", () => {
     expect(resolveSummaryOutputTokens(200_000)).toBe(6000);
     expect(resolveSummaryOutputTokens(1_000_000)).toBe(MAX_SUMMARY_OUTPUT_TOKENS);
+  });
+});
+
+// ── failing-test carry-forward ─────────────────────────────
+
+function resultMessage(content: string, isError = false): Message {
+  return {
+    role: "tool",
+    content: [
+      {
+        type: "tool_result",
+        toolCallId: "call_1",
+        content,
+        ...(isError ? { isError: true } : {}),
+      },
+    ],
+  };
+}
+
+describe("extractFailingTests", () => {
+  it("recognises jest/vitest, pytest, and Go test failure lines", () => {
+    const failing = extractFailingTests([
+      resultMessage(
+        "FAIL src/auth/refresh.test.ts\n" +
+          "  ✕ refresh::rejects-expired-token (42 ms)\n" +
+          "FAILED tests/payments.py::test_refund_partial\n" +
+          "--- FAIL: TestQueueConsumer\n" +
+          "1 failed",
+        true,
+      ),
+    ]);
+
+    expect(failing).toContain("refresh::rejects-expired-token");
+    expect(failing).toContain("tests/payments.py::test_refund_partial");
+    expect(failing).toContain("TestQueueConsumer");
+  });
+
+  it("strips the jest duration suffix from the test name", () => {
+    const failing = extractFailingTests([resultMessage("✕ parses nested config (1.5 ms)", true)]);
+    expect(failing).toEqual(["parses nested config"]);
+  });
+
+  it("reverses a failure when a later result shows the test passing", () => {
+    const failing = extractFailingTests([
+      resultMessage("✕ refresh::rejects-expired-token (42 ms)", true),
+      resultMessage("✓ refresh::rejects-expired-token (38 ms)"),
+    ]);
+    expect(failing).toEqual([]);
+  });
+
+  it("keeps the failure when the pass came before it", () => {
+    const failing = extractFailingTests([
+      resultMessage("✓ refresh::rejects-expired-token"),
+      resultMessage("✕ refresh::rejects-expired-token (42 ms)", true),
+    ]);
+    expect(failing).toEqual(["refresh::rejects-expired-token"]);
+  });
+
+  it("ignores ordinary error output that is not a test report", () => {
+    const signals = extractTestSignals([
+      resultMessage("Error: ECONNREFUSED 127.0.0.1:5432\n    at connect (net.js:1:1)", true),
+    ]);
+    expect(signals.failing).toEqual([]);
+    expect(signals.passed).toEqual([]);
+  });
+
+  it("reads text parts inside array tool-result content", () => {
+    const failing = extractFailingTests([
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool_result",
+            toolCallId: "call_1",
+            content: [{ type: "text", text: "✕ array-case fails" }],
+          },
+        ],
+      } as Message,
+    ]);
+    expect(failing).toEqual(["array-case fails"]);
+  });
+});
+
+describe("splitTrackedFailingTests", () => {
+  it("extracts carried names and strips the block from the prose", () => {
+    const { text, tests, omitted } = splitTrackedFailingTests(
+      "Prose body.\n\n<failing-tests>\nrefresh::rejects-expired-token\n[... 3 earlier failing tests omitted]\n</failing-tests>",
+    );
+    expect(text).toBe("Prose body.");
+    expect(tests).toEqual(["refresh::rejects-expired-token"]);
+    expect(omitted).toBe(3);
+  });
+
+  it("leaves prose without a failing-tests block untouched", () => {
+    const { text, tests, omitted } = splitTrackedFailingTests("Just a summary.");
+    expect(text).toBe("Just a summary.");
+    expect(tests).toEqual([]);
+    expect(omitted).toBe(0);
+  });
+});
+
+describe("buildFailingTestsSection", () => {
+  it("returns empty string when nothing fails", () => {
+    expect(buildFailingTestsSection([])).toBe("");
+  });
+
+  it("dedupes carried and fresh names into a single block", () => {
+    const section = buildFailingTestsSection(["test-a", "test-b", "test-a"]);
+    expect(section.match(/test-a/gu)).toHaveLength(1);
+    expect(section).toContain("test-b");
+  });
+
+  it("keeps the most recent names on overflow and reports the count", () => {
+    const names = Array.from({ length: MAX_TRACKED_FAILING_TESTS + 5 }, (_v, i) => `test-${i}`);
+    const section = buildFailingTestsSection(names);
+    expect(section).toContain(`test-${names.length - 1}`);
+    expect(section).toContain("[... 5 earlier failing tests omitted]");
+  });
+
+  it("still reports prior omissions when nothing survives the merge", () => {
+    expect(buildFailingTestsSection([], 4)).toContain("[... 4 earlier failing tests omitted]");
+  });
+
+  it("survives repeated build/split generations without stacking notes", () => {
+    let section = buildFailingTestsSection(
+      Array.from({ length: MAX_TRACKED_FAILING_TESTS + 5 }, (_v, i) => `test-${i}`),
+    );
+    let carried = splitTrackedFailingTests(`Prose.${section}`);
+    for (let gen = 0; gen < 3; gen++) {
+      expect(carried.tests).toHaveLength(MAX_TRACKED_FAILING_TESTS);
+      expect(carried.tests.some((t) => t.startsWith("[..."))).toBe(false);
+      section = buildFailingTestsSection([...carried.tests, `fresh-${gen}`], carried.omitted);
+      carried = splitTrackedFailingTests(`Prose.${section}`);
+    }
+    expect(section.match(/earlier failing tests omitted/gu)).toHaveLength(1);
+    expect(section).toContain("[... 8 earlier failing tests omitted]");
   });
 });
