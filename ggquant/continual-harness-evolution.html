@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Continual Harness — How the Harness Evolves</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#15151b; --bg2:#1b1b23; --panel:#21212b; --panel2:#262630;
+    --line:#34343f; --ink:#ece9e0; --dim:#8e8c86; --faint:#5c5b58;
+    --p:#e8a33d; --g:#e3604f; --k:#45c2b4; --m:#6fa8e6;
+    --created:#7cc977; --updated:#e3a13d; --repaired:#54bcd0; --retired:#e0594a;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{background:var(--bg);color:var(--ink);
+    font-family:'IBM Plex Sans',sans-serif;-webkit-font-smoothing:antialiased}
+  body{
+    background:
+      radial-gradient(900px 500px at 80% -8%,rgba(232,163,61,.07),transparent 60%),
+      radial-gradient(700px 500px at -5% 110%,rgba(111,168,230,.06),transparent 60%),
+      var(--bg);
+    background-attachment:fixed;
+    min-height:100vh;padding:26px 16px 60px;
+  }
+  .wrap{max-width:880px;margin:0 auto}
+
+  /* ---- header ---- */
+  header{border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:22px}
+  .kicker{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.22em;
+    text-transform:uppercase;color:var(--p);margin-bottom:10px}
+  h1{font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:25px;
+    line-height:1.25;letter-spacing:-.01em}
+  h1 .e{color:var(--dim)}
+  .sub{color:var(--dim);font-size:14px;margin-top:9px;max-width:60ch;line-height:1.55}
+  .sub code{font-family:'IBM Plex Mono',monospace;color:var(--ink);font-size:12.5px}
+
+  /* ---- section label ---- */
+  .slabel{font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.2em;
+    text-transform:uppercase;color:var(--faint);margin:26px 0 10px;
+    display:flex;align-items:center;gap:10px}
+  .slabel::after{content:"";flex:1;height:1px;background:var(--line)}
+
+  /* ---- loop diagram ---- */
+  .diagram{background:var(--bg2);border:1px solid var(--line);border-radius:12px;
+    padding:6px}
+  .diagram svg{display:block;width:100%;height:auto}
+  .flow{stroke-dasharray:5 5;animation:dash 1.1s linear infinite}
+  @keyframes dash{to{stroke-dashoffset:-20}}
+
+  /* ---- console / controls ---- */
+  .console{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:16px 16px 18px;margin-top:6px}
+  .ctrls{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  button{font-family:'IBM Plex Mono',monospace;font-size:13px;cursor:pointer;
+    background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+    border-radius:8px;padding:9px 14px;transition:.15s}
+  button:hover:not(:disabled){border-color:var(--p);color:var(--p)}
+  button:disabled{opacity:.35;cursor:not-allowed}
+  button.play{background:var(--p);color:#1a1407;border-color:var(--p);font-weight:600}
+  button.play:hover{filter:brightness(1.08);color:#1a1407}
+  button.play.on{background:var(--g);border-color:var(--g)}
+  .genread{margin-left:auto;text-align:right;font-family:'IBM Plex Mono',monospace}
+  .genread .big{font-size:15px;color:var(--ink)}
+  .genread .small{font-size:11px;color:var(--dim);margin-top:2px}
+
+  /* ---- timeline ---- */
+  .tl{margin-top:16px}
+  .tlbar{position:relative;height:46px}
+  .tltrack{position:absolute;left:0;right:0;top:21px;height:4px;
+    background:var(--line);border-radius:2px}
+  .tlwarm{position:absolute;top:21px;height:4px;border-radius:2px;
+    background:repeating-linear-gradient(90deg,var(--faint) 0 4px,transparent 4px 8px)}
+  .tlphase{position:absolute;top:33px;font-family:'IBM Plex Mono',monospace;
+    font-size:9px;letter-spacing:.08em;color:var(--faint);text-transform:uppercase}
+  .tlboundary{position:absolute;top:8px;width:1px;height:30px;
+    background:var(--g);opacity:.5}
+  .tick{position:absolute;top:14px;width:18px;height:18px;margin-left:-9px;
+    border-radius:50%;background:var(--bg2);border:2px solid var(--line);
+    cursor:pointer;transition:.18s;display:flex;align-items:center;
+    justify-content:center}
+  .tick span{font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--dim)}
+  .tick:hover{border-color:var(--dim)}
+  .tick.done{border-color:var(--p);background:rgba(232,163,61,.16)}
+  .tick.done span{color:var(--p)}
+  .tick.active{border-color:var(--p);background:var(--p);transform:scale(1.32)}
+  .tick.active span{color:#1a1407;font-weight:600}
+  .tlstep{position:absolute;top:-3px;font-family:'IBM Plex Mono',monospace;
+    font-size:9px;color:var(--faint);margin-left:-9px;width:34px;text-align:center}
+
+  /* ---- signatures ---- */
+  .sigbox{margin-top:14px;background:var(--bg2);border:1px solid var(--line);
+    border-left:3px solid var(--g);border-radius:8px;padding:12px 14px}
+  .sighd{font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--g);margin-bottom:8px}
+  .sigbox ul{list-style:none;display:flex;flex-direction:column;gap:6px}
+  .sigbox li{font-size:13px;color:var(--ink);padding-left:16px;position:relative;
+    line-height:1.45}
+  .sigbox li::before{content:"!";position:absolute;left:0;color:var(--g);
+    font-family:'IBM Plex Mono',monospace;font-weight:600}
+
+  /* ---- 4 component panels ---- */
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:6px}
+  .comp{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    overflow:hidden;display:flex;flex-direction:column}
+  .comphd{display:flex;align-items:center;gap:9px;padding:11px 13px;
+    border-bottom:1px solid var(--line)}
+  .glyph{font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:16px;
+    width:26px;height:26px;border-radius:6px;display:flex;align-items:center;
+    justify-content:center;flex-shrink:0}
+  .comphd .nm{font-family:'IBM Plex Mono',monospace;font-size:12.5px;font-weight:600}
+  .comphd .ct{margin-left:auto;font-family:'IBM Plex Mono',monospace;
+    font-size:10px;color:var(--dim)}
+  .body{padding:10px 11px;display:flex;flex-direction:column;gap:6px;flex:1;
+    min-height:118px}
+  .empty{color:var(--faint);font-size:12px;font-style:italic;margin:auto;
+    font-family:'IBM Plex Sans'}
+
+  .entry{background:var(--bg2);border:1px solid var(--line);border-radius:7px;
+    padding:7px 9px;transition:.2s}
+  .entry.hot{box-shadow:0 0 0 1px rgba(232,163,61,.5);
+    border-color:rgba(232,163,61,.5);animation:pop .4s ease}
+  @keyframes pop{from{transform:translateY(4px);opacity:.4}to{transform:none;opacity:1}}
+  .entry.gone{opacity:.4}
+  .erow{display:flex;align-items:center;gap:7px}
+  .ename{font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--ink)}
+  .entry.gone .ename{text-decoration:line-through;color:var(--dim)}
+  .badge{font-family:'IBM Plex Mono',monospace;font-size:8.5px;letter-spacing:.06em;
+    text-transform:uppercase;padding:2px 5px;border-radius:4px;font-weight:600;
+    flex-shrink:0}
+  .b-created{background:rgba(124,201,119,.16);color:var(--created)}
+  .b-updated{background:rgba(227,161,61,.16);color:var(--updated)}
+  .b-repaired{background:rgba(84,188,208,.16);color:var(--repaired)}
+  .b-retired{background:rgba(224,89,74,.16);color:var(--retired)}
+  .tag{font-family:'IBM Plex Mono',monospace;font-size:8.5px;color:var(--k);
+    border:1px solid rgba(69,194,180,.4);border-radius:4px;padding:1px 4px}
+  .edet{font-size:11.5px;color:var(--dim);margin-top:4px;line-height:1.4}
+  .dots{margin-left:auto;display:flex;gap:2.5px;flex-shrink:0}
+  .dot{width:5px;height:5px;border-radius:50%;background:var(--line)}
+  .dot.on{background:var(--m)}
+
+  /* prompt panel special */
+  .pver{font-family:'IBM Plex Mono',monospace;font-size:13px;color:var(--p);
+    font-weight:600}
+  .prev{font-size:11.5px;color:var(--dim);padding:6px 9px;border-radius:7px;
+    background:var(--bg2);border:1px solid var(--line);line-height:1.4;
+    display:flex;gap:8px}
+  .prev.hot{border-color:rgba(232,163,61,.5);
+    box-shadow:0 0 0 1px rgba(232,163,61,.5);animation:pop .4s ease}
+  .prev .vtag{font-family:'IBM Plex Mono',monospace;color:var(--p);flex-shrink:0;
+    font-weight:600;font-size:11px}
+
+  /* legend */
+  .legend{display:flex;flex-wrap:wrap;gap:7px 14px;margin-top:16px;
+    padding-top:14px;border-top:1px solid var(--line)}
+  .lg{display:flex;align-items:center;gap:6px;font-family:'IBM Plex Mono',monospace;
+    font-size:10.5px;color:var(--dim)}
+  .lgsw{width:11px;height:11px;border-radius:3px}
+
+  .foot{margin-top:24px;font-size:11.5px;color:var(--faint);line-height:1.6;
+    border-top:1px solid var(--line);padding-top:14px}
+  .foot code{font-family:'IBM Plex Mono',monospace;color:var(--dim)}
+
+  @media(max-width:560px){
+    .grid{grid-template-columns:1fr}
+    h1{font-size:21px}
+    .genread{margin-left:0;width:100%;text-align:left;
+      display:flex;gap:10px;align-items:baseline}
+    .genread .small{margin-top:0}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="kicker">Continual Harness · Karten et al. 2026</div>
+    <h1>How the harness evolves <span class="e">— mid-episode, reset-free</span></h1>
+    <p class="sub">A Refiner reads the recent trajectory window every <code>F</code> steps,
+    detects failure signatures, and applies CRUD edits to four harness components:
+    the system prompt <code>p</code>, sub-agents <code>𝒢</code>, skills <code>𝒦</code>,
+    and memory <code>ℳ</code>. Step through the refinement generations below.</p>
+  </header>
+
+  <!-- ===== LOOP DIAGRAM ===== -->
+  <div class="slabel">Two-loop architecture</div>
+  <div class="diagram">
+    <svg viewBox="0 0 680 286" role="img" aria-label="Continual Harness two-loop architecture">
+      <defs>
+        <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3"
+          orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#8e8c86"/></marker>
+        <marker id="arp" markerWidth="9" markerHeight="9" refX="7" refY="3"
+          orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#e8a33d"/></marker>
+      </defs>
+
+      <!-- HARNESS -->
+      <rect x="232" y="20" width="216" height="60" rx="9"
+        fill="#21212b" stroke="#34343f"/>
+      <text x="244" y="40" font-family="IBM Plex Mono" font-size="11"
+        fill="#ece9e0" font-weight="600">HARNESS ℋ</text>
+      <text x="244" y="53" font-family="IBM Plex Mono" font-size="8.5"
+        fill="#5c5b58">refined components</text>
+      <g font-family="IBM Plex Mono" font-size="12" font-weight="600">
+        <rect x="244" y="58" width="22" height="16" rx="4" fill="#2a2114" stroke="#e8a33d"/>
+        <text x="255" y="70" fill="#e8a33d" text-anchor="middle">p</text>
+        <rect x="300" y="58" width="22" height="16" rx="4" fill="#2a1714" stroke="#e3604f"/>
+        <text x="311" y="70" fill="#e3604f" text-anchor="middle">𝒢</text>
+        <rect x="356" y="58" width="22" height="16" rx="4" fill="#13261f" stroke="#45c2b4"/>
+        <text x="367" y="70" fill="#45c2b4" text-anchor="middle">𝒦</text>
+        <rect x="412" y="58" width="22" height="16" rx="4" fill="#161f2a" stroke="#6fa8e6"/>
+        <text x="423" y="70" fill="#6fa8e6" text-anchor="middle">ℳ</text>
+      </g>
+
+      <!-- ENVIRONMENT -->
+      <rect x="34" y="138" width="150" height="74" rx="9"
+        fill="#1b1b23" stroke="#34343f"/>
+      <text x="109" y="170" font-family="IBM Plex Mono" font-size="11.5"
+        fill="#ece9e0" font-weight="600" text-anchor="middle">ENVIRONMENT</text>
+      <text x="109" y="186" font-family="IBM Plex Mono" font-size="8.5"
+        fill="#5c5b58" text-anchor="middle">frames · ASCII map</text>
+
+      <!-- AGENT -->
+      <rect x="244" y="138" width="192" height="74" rx="9"
+        fill="#1b1b23" stroke="#34343f"/>
+      <text x="340" y="170" font-family="IBM Plex Mono" font-size="11.5"
+        fill="#ece9e0" font-weight="600" text-anchor="middle">AGENT  M ∘ ℋ</text>
+      <text x="340" y="186" font-family="IBM Plex Mono" font-size="8.5"
+        fill="#5c5b58" text-anchor="middle">acts every step</text>
+
+      <!-- REFINER -->
+      <rect x="496" y="138" width="150" height="74" rx="9"
+        fill="#1b1b23" stroke="#e8a33d" stroke-opacity=".55"/>
+      <text x="571" y="170" font-family="IBM Plex Mono" font-size="11.5"
+        fill="#e8a33d" font-weight="600" text-anchor="middle">REFINER</text>
+      <text x="571" y="186" font-family="IBM Plex Mono" font-size="8.5"
+        fill="#8e8c86" text-anchor="middle">same model M</text>
+
+      <!-- harness wraps agent -->
+      <line x1="340" y1="80" x2="340" y2="136" stroke="#8e8c86"
+        stroke-width="1.5" marker-end="url(#ar)"/>
+      <text x="348" y="112" font-family="IBM Plex Mono" font-size="8.5"
+        fill="#8e8c86">wraps</text>
+
+      <!-- inner loop: agent action -> env -->
+      <path d="M244,162 L186,162" fill="none" stroke="#8e8c86"
+        stroke-width="1.5" marker-end="url(#ar)"/>
+      <text x="215" y="156" font-family="IBM Plex Mono" font-size="8.5"
+        fill="#8e8c86" text-anchor="middle">action aₜ</text>
+      <!-- inner loop: env observation -> agent -->
+      <path d="M186,190 L242,190" fill="none" stroke="#8e8c86"
+        stroke-width="1.5" marker-end="url(#ar)"/>
+      <text x="214" y="204" font-family="IBM Plex Mono" font-size="8.5"
+        fill="#8e8c86" text-anchor="middle">obs sₜ</text>
+      <text x="135" y="246" font-family="IBM Plex Mono" font-size="9"
+        fill="#5c5b58" text-anchor="middle">— inner loop · every step —</text>
+
+      <!-- outer loop: agent trajectory -> refiner -->
+      <path class="flow" d="M436,176 L494,176" fill="none" stroke="#8e8c86"
+        stroke-width="1.5" marker-end="url(#ar)"/>
+      <text x="465" y="170" font-family="IBM Plex Mono" font-size="8.5"
+        fill="#8e8c86" text-anchor="middle">τ window</text>
+
+      <!-- outer loop: refiner -> harness (delta) -->
+      <path class="flow" d="M571,136 C571,96 540,62 451,56" fill="none"
+        stroke="#e8a33d" stroke-width="1.6" marker-end="url(#arp)"/>
+      <text x="566" y="106" font-family="IBM Plex Mono" font-size="9"
+        fill="#e8a33d" text-anchor="middle">Δ = (Δp,Δ𝒢,Δ𝒦,Δℳ)</text>
+      <text x="497" y="248" font-family="IBM Plex Mono" font-size="9"
+        fill="#8e8c86" text-anchor="middle">— outer loop · every F steps —</text>
+    </svg>
+  </div>
+
+  <!-- ===== CONSOLE ===== -->
+  <div class="slabel">Refinement timeline</div>
+  <div class="console">
+    <div class="ctrls">
+      <button id="prev">◀ Prev</button>
+      <button id="play" class="play">▶ Play</button>
+      <button id="next">Next ▶</button>
+      <div class="genread">
+        <div class="big" id="genBig">Generation 0</div>
+        <div class="small" id="genSmall">step 25 · early phase</div>
+      </div>
+    </div>
+
+    <div class="tl">
+      <div class="tlbar" id="tlbar"></div>
+    </div>
+
+    <div class="sigbox">
+      <div class="sighd">Failure signatures detected in τ window</div>
+      <ul id="sigs"></ul>
+    </div>
+  </div>
+
+  <!-- ===== COMPONENT PANELS ===== -->
+  <div class="slabel">Harness state ℋ — accumulated edits</div>
+  <div class="grid">
+    <div class="comp">
+      <div class="comphd">
+        <div class="glyph" style="background:#2a2114;color:var(--p)">p</div>
+        <div class="nm" style="color:var(--p)">System prompt</div>
+        <div class="ct" id="ct-p"></div>
+      </div>
+      <div class="body" id="panel-p"></div>
+    </div>
+    <div class="comp">
+      <div class="comphd">
+        <div class="glyph" style="background:#2a1714;color:var(--g)">𝒢</div>
+        <div class="nm" style="color:var(--g)">Sub-agents</div>
+        <div class="ct" id="ct-g"></div>
+      </div>
+      <div class="body" id="panel-g"></div>
+    </div>
+    <div class="comp">
+      <div class="comphd">
+        <div class="glyph" style="background:#13261f;color:var(--k)">𝒦</div>
+        <div class="nm" style="color:var(--k)">Skills</div>
+        <div class="ct" id="ct-k"></div>
+      </div>
+      <div class="body" id="panel-k"></div>
+    </div>
+    <div class="comp">
+      <div class="comphd">
+        <div class="glyph" style="background:#161f2a;color:var(--m)">ℳ</div>
+        <div class="nm" style="color:var(--m)">Memory</div>
+        <div class="ct" id="ct-m"></div>
+      </div>
+      <div class="body" id="panel-m"></div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <div class="lg"><span class="lgsw" style="background:var(--created)"></span>created</div>
+    <div class="lg"><span class="lgsw" style="background:var(--updated)"></span>updated / rewritten</div>
+    <div class="lg"><span class="lgsw" style="background:var(--repaired)"></span>repaired (code fix)</div>
+    <div class="lg"><span class="lgsw" style="background:var(--retired)"></span>retired</div>
+    <div class="lg"><span class="tag" style="position:static">code</span>executable skill</div>
+  </div>
+
+  <p class="foot">
+    Illustrative trace built from the <code>continualharness</code> scaffold logic in
+    <code>agents/utils/harness_evolver.py</code> — adaptive frequency (every 25 steps for
+    the first 200, then every 100), four independent CRUD passes per generation, and
+    monotonic accumulation of harness state with no episode resets. Edits compound:
+    a skill the Refiner repairs in one generation is reused — and re-diagnosed — in the next.
+  </p>
+
+</div>
+
+<script>
+/* ---- refinement generations: faithful CRUD trace ---- */
+const GENS = [
+  { step:25, phase:"early",
+    sigs:["navigation loops at Route 101 — same tile revisited 3×",
+          "missed exploration — 4 unvisited map exits"],
+    p:{v:2,note:"adds an explicit 'do not revisit recent tiles' rule"},
+    g:[{act:"created",name:"navigator",det:"looping handler for multi-tile routes, max 25 turns"}],
+    k:[{act:"created",name:"move_to_coords",code:true,det:"greedy step-toward-target routine"}],
+    m:[{act:"created",name:"Route 101 layout",imp:4,det:"tall grass corridor, exits N/S"}] },
+
+  { step:50, phase:"early",
+    sigs:["tool-call failure — move_to_coords raised KeyError on state dict",
+          "antipattern — run_code called 5×, run_skill 0×"],
+    p:{v:3,note:"clarifies the tools['name'](...) call syntax for skill code"},
+    g:[],
+    k:[{act:"repaired",name:"move_to_coords",code:true,det:"fixed wrong player_position field"},
+       {act:"created",name:"menu_navigate",code:true,det:"codified from repeated run_code scripts"}],
+    m:[{act:"created",name:"Petalburg City",imp:3,det:"PokéMart present, gym entrance locked"}] },
+
+  { step:75, phase:"early",
+    sigs:["stalled objective — Rustboro Gym, 0 progress over 18 steps",
+          "two consecutive battle losses"],
+    p:null,
+    g:[{act:"created",name:"battle_handler",det:"looping sub-agent for turn-by-turn combat"}],
+    k:[{act:"created",name:"type_matchup_lookup",code:false,det:"text heuristic for type advantage"}],
+    m:[{act:"updated",name:"team composition",imp:5,det:"Treecko Lv12, low on potions"}] },
+
+  { step:100, phase:"early",
+    sigs:["navigation loops in Petalburg Woods — dense obstacles",
+          "missed exploration — hidden items not checked"],
+    p:{v:4,note:"adds a woods-traversal heuristic and item-sweep reminder"},
+    g:[{act:"updated",name:"navigator",det:"directive now includes obstacle-avoidance pass"}],
+    k:[{act:"repaired",name:"move_to_coords",code:true,det:"adds variance fallback when blocked"}],
+    m:[{act:"updated",name:"Route 101 layout",imp:2,det:"importance demoted — area cleared"}] },
+
+  { step:125, phase:"early",
+    sigs:["battle_handler hit its max_turns cap 3× — runaway loops"],
+    p:null,
+    g:[{act:"updated",name:"battle_handler",det:"tighter return condition on faint/win"},
+       {act:"retired",name:"reflect_stub",det:"0 productive invocations — removed"}],
+    k:[{act:"created",name:"heal_party",code:true,det:"routine: open bag, apply potions"}],
+    m:[{act:"created",name:"Rustboro Gym",imp:4,det:"Rock-type, leader Roxanne, Geodude+Nosepass"}] },
+
+  { step:150, phase:"early",
+    sigs:["skill error — open-field hopping in move_to_coords fails inside caves"],
+    p:null,
+    g:[],
+    k:[{act:"updated",name:"move_to_coords",code:true,det:"full rewrite — BFS over obstacle grid"}],
+    m:[{act:"created",name:"Granite Cave",imp:3,det:"dark interior, multi-level, needs Flash"}] },
+
+  { step:200, phase:"early→stable",
+    sigs:["minor — memory entry 'team composition' stale after evolution"],
+    p:{v:5,note:"consolidates battle + navigation guidance into one section"},
+    g:[{act:"updated",name:"battle_handler",det:"absorbs type lookup inline — fewer hops"}],
+    k:[{act:"updated",name:"type_matchup_lookup",code:false,det:"effectiveness rated low → high"}],
+    m:[{act:"updated",name:"team composition",imp:5,det:"Grovyle Lv18, Marshtomp Lv16"},
+       {act:"updated",name:"Petalburg City",imp:2,det:"importance demoted — area passed"}] },
+
+  { step:300, phase:"stable",
+    sigs:["stalled objective — Dewford Gym tunnel puzzle"],
+    p:null,
+    g:[{act:"created",name:"puzzle_solver",det:"sub-agent for switch / boulder puzzles"}],
+    k:[{act:"created",name:"boulder_push_sequence",code:true,det:"directional push routine"}],
+    m:[{act:"created",name:"Dewford Town",imp:3,det:"Fighting-type gym, leader Brawly"}] }
+];
+
+/* ---- state ---- */
+let cur = 0, timer = null;
+const $ = id => document.getElementById(id);
+
+/* build timeline ticks once */
+(function buildTimeline(){
+  const bar = $("tlbar"), MAX = 330;
+  const pct = s => (s / MAX) * 100;
+  bar.innerHTML =
+    '<div class="tltrack"></div>' +
+    '<div class="tlwarm" style="left:0;width:'+pct(25)+'%"></div>' +
+    '<div class="tlboundary" style="left:'+pct(200)+'%"></div>' +
+    '<div class="tlphase" style="left:2%">warm-up</div>' +
+    '<div class="tlphase" style="left:'+(pct(25)+2)+'%">F=25</div>' +
+    '<div class="tlphase" style="left:'+(pct(200)+1.5)+'%">F=100</div>';
+  GENS.forEach((g,i)=>{
+    const t = document.createElement("div");
+    t.className = "tick"; t.style.left = pct(g.step)+"%";
+    t.dataset.i = i;
+    t.innerHTML = '<span>'+i+'</span>';
+    t.addEventListener("click",()=>{ stop(); cur=i; render(); });
+    bar.appendChild(t);
+    const lbl = document.createElement("div");
+    lbl.className = "tlstep"; lbl.style.left = pct(g.step)+"%";
+    lbl.textContent = g.step;
+    bar.appendChild(lbl);
+  });
+})();
+
+/* replay CRUD ops up to generation `upto` */
+function replay(upto){
+  const st = { p:{v:1,revs:[{gen:-1,v:1,note:"base H_min orchestrator policy"}]},
+               g:new Map(), k:new Map(), m:new Map() };
+  for(let i=0;i<=upto;i++){
+    const G = GENS[i];
+    if(G.p){ st.p.v=G.p.v; st.p.revs.push({gen:i,v:G.p.v,note:G.p.note}); }
+    G.g.forEach(o=>{
+      const e = st.g.get(o.name) || {name:o.name};
+      e.det=o.det; e.status=(o.act==="retired")?"retired":"active";
+      e.op=o.act; e.gen=i; st.g.set(o.name,e);
+    });
+    G.k.forEach(o=>{
+      const e = st.k.get(o.name) || {name:o.name};
+      e.det=o.det; e.code=o.code; e.op=o.act; e.gen=i; st.k.set(o.name,e);
+    });
+    G.m.forEach(o=>{
+      const e = st.m.get(o.name) || {name:o.name};
+      e.det=o.det; e.imp=o.imp; e.op=o.act; e.gen=i; st.m.set(o.name,e);
+    });
+  }
+  return st;
+}
+
+function badge(op){
+  const map={created:"b-created",updated:"b-updated",rewritten:"b-updated",
+    repaired:"b-repaired",retired:"b-retired"};
+  return '<span class="badge '+(map[op]||"b-updated")+'">'+op+'</span>';
+}
+
+function render(){
+  const G = GENS[cur], st = replay(cur);
+
+  /* readout */
+  $("genBig").textContent = "Generation "+cur;
+  $("genSmall").textContent = "step "+G.step+" · "+G.phase+" phase";
+
+  /* timeline ticks */
+  document.querySelectorAll(".tick").forEach(t=>{
+    const i=+t.dataset.i;
+    t.classList.toggle("done", i<=cur);
+    t.classList.toggle("active", i===cur);
+  });
+
+  /* signatures */
+  $("sigs").innerHTML = G.sigs.map(s=>"<li>"+s+"</li>").join("");
+
+  /* prompt panel */
+  const pc = $("panel-p");
+  pc.innerHTML = '<div class="pver">p — v'+st.p.v+'</div>';
+  st.p.revs.slice().reverse().forEach(r=>{
+    const hot = r.gen===cur;
+    pc.innerHTML += '<div class="prev'+(hot?' hot':'')+'">'+
+      '<span class="vtag">v'+r.v+'</span><span>'+
+      (r.gen<0?'initial — ':'')+r.note+'</span></div>';
+  });
+  $("ct-p").textContent = "v"+st.p.v;
+
+  /* generic store renderer */
+  function drawStore(panelId,countId,store,kind){
+    const el=$(panelId);
+    const items=[...store.values()];
+    $(countId).textContent=items.filter(e=>e.status!=="retired").length+
+      (kind==="g"?" active":" entries");
+    if(!items.length){ el.innerHTML='<div class="empty">— empty —</div>'; return; }
+    el.innerHTML=items.map(e=>{
+      const hot=e.gen===cur;
+      const gone=e.status==="retired";
+      let right="";
+      if(kind==="k"&&e.code) right='<span class="tag">code</span>';
+      if(kind==="m"){
+        let d="";for(let i=1;i<=5;i++)d+='<span class="dot'+(i<=e.imp?' on':'')+'"></span>';
+        right='<span class="dots">'+d+'</span>';
+      }
+      return '<div class="entry'+(hot?' hot':'')+(gone?' gone':'')+'">'+
+        '<div class="erow">'+
+        (hot?badge(e.op):'')+
+        '<span class="ename">'+e.name+'</span>'+right+'</div>'+
+        '<div class="edet">'+e.det+'</div></div>';
+    }).join("");
+  }
+  drawStore("panel-g","ct-g",st.g,"g");
+  drawStore("panel-k","ct-k",st.k,"k");
+  drawStore("panel-m","ct-m",st.m,"m");
+
+  /* controls */
+  $("prev").disabled = cur===0;
+  $("next").disabled = cur===GENS.length-1;
+}
+
+/* ---- controls ---- */
+function stop(){ if(timer){clearInterval(timer);timer=null;}
+  $("play").classList.remove("on"); $("play").textContent="▶ Play"; }
+function step(){ if(cur<GENS.length-1){cur++;render();} else stop(); }
+
+$("prev").onclick=()=>{ stop(); if(cur>0){cur--;render();} };
+$("next").onclick=()=>{ stop(); step(); };
+$("play").onclick=()=>{
+  if(timer){ stop(); return; }
+  if(cur===GENS.length-1){ cur=0; render(); }
+  $("play").classList.add("on"); $("play").textContent="❚❚ Pause";
+  timer=setInterval(step,2300);
+};
+
+render();
+</script>
+</body>
+</html>

@@ -1,0 +1,39 @@
+{
+  "name": "@kenkaiiii/ggquant",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Deterministic instrument for validating ICT trading setup edges",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kenkaiiii/gg-framework.git",
+    "directory": "packages/ggquant"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "check": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.4"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

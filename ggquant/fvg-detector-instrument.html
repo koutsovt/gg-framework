@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FVG Detector — Instrument Scope</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0c0e0d; --panel:#131615; --panel2:#191d1b; --line:#262b29;
+    --ink:#dfe4e1; --dim:#7e8783; --faint:#525a56;
+    --cyan:#28d6c4; --amber:#f4b740; --mint:#6bcf9f; --red:#e0726a;
+    --grey:#6b7280;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{background:var(--bg);color:var(--ink);
+    font-family:'Outfit',sans-serif;-webkit-font-smoothing:antialiased}
+  body{
+    background:
+      linear-gradient(rgba(40,214,196,.022) 1px,transparent 1px) 0 0/100% 3px,
+      radial-gradient(800px 460px at 88% -10%,rgba(40,214,196,.06),transparent 65%),
+      radial-gradient(700px 460px at -8% 108%,rgba(244,183,64,.05),transparent 62%),
+      var(--bg);
+    background-attachment:fixed;
+    min-height:100vh;padding:24px 15px 56px;
+  }
+  .wrap{max-width:860px;margin:0 auto}
+  .mono{font-family:'JetBrains Mono',monospace}
+
+  /* header */
+  header{border-bottom:1px solid var(--line);padding-bottom:16px;margin-bottom:18px}
+  .kick{font-family:'JetBrains Mono',monospace;font-size:10.5px;letter-spacing:.24em;
+    text-transform:uppercase;color:var(--cyan);margin-bottom:9px}
+  h1{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:23px;
+    line-height:1.25;letter-spacing:-.01em}
+  h1 .d{color:var(--dim);font-weight:400}
+  .sub{color:var(--dim);font-size:13.5px;margin-top:8px;max-width:64ch;line-height:1.55}
+  .sub b{color:var(--ink);font-weight:600}
+
+  /* pipeline strip */
+  .pipe{display:flex;gap:6px;margin:18px 0 6px;flex-wrap:wrap}
+  .stage{flex:1;min-width:120px;background:var(--panel);border:1px solid var(--line);
+    border-radius:7px;padding:8px 10px;position:relative}
+  .stage .n{font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--faint)}
+  .stage .t{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--dim);
+    margin-top:3px;line-height:1.3}
+  .stage.here{border-color:var(--cyan);background:rgba(40,214,196,.07)}
+  .stage.here .t{color:var(--cyan)}
+  .stage.here .n{color:var(--cyan)}
+  .stage.here::after{content:"◀ scope";position:absolute;right:9px;top:8px;
+    font-family:'JetBrains Mono',monospace;font-size:8.5px;color:var(--cyan)}
+
+  .slabel{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.2em;
+    text-transform:uppercase;color:var(--faint);margin:24px 0 9px;
+    display:flex;align-items:center;gap:10px}
+  .slabel::after{content:"";flex:1;height:1px;background:var(--line)}
+
+  /* scope */
+  .scope{background:var(--panel);border:1px solid var(--line);border-radius:11px;
+    padding:7px 7px 0}
+  .scope svg{display:block;width:100%;height:auto}
+
+  /* controls */
+  .ctrl{background:var(--panel);border:1px solid var(--line);border-radius:11px;
+    padding:14px;margin-top:8px}
+  .row{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+  button{font-family:'JetBrains Mono',monospace;font-size:12.5px;cursor:pointer;
+    background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+    border-radius:7px;padding:8px 13px;transition:.15s}
+  button:hover:not(:disabled){border-color:var(--cyan);color:var(--cyan)}
+  button:disabled{opacity:.32;cursor:not-allowed}
+  button.go{background:var(--cyan);color:#06201d;border-color:var(--cyan);font-weight:700}
+  button.go:hover{filter:brightness(1.08);color:#06201d}
+  button.go.on{background:var(--amber);border-color:var(--amber);color:#241803}
+  .cursorread{margin-left:auto;font-family:'JetBrains Mono',monospace;
+    font-size:12px;color:var(--dim)}
+  .cursorread b{color:var(--amber)}
+
+  /* slider */
+  .sld{margin-top:14px;padding-top:13px;border-top:1px solid var(--line)}
+  .sldtop{display:flex;align-items:baseline;gap:8px;margin-bottom:8px}
+  .sldtop .lbl{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--dim)}
+  .sldtop .val{font-family:'JetBrains Mono',monospace;font-size:14px;
+    color:var(--cyan);font-weight:700}
+  .sldtop .cnt{margin-left:auto;font-family:'JetBrains Mono',monospace;
+    font-size:11px;color:var(--dim)}
+  .sldtop .cnt b{color:var(--mint)}
+  input[type=range]{-webkit-appearance:none;width:100%;height:4px;border-radius:2px;
+    background:linear-gradient(90deg,var(--cyan),var(--faint));outline:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;
+    border-radius:50%;background:var(--cyan);cursor:pointer;border:2px solid var(--bg)}
+  input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;
+    background:var(--cyan);cursor:pointer;border:2px solid var(--bg)}
+  .sldnote{font-size:11.5px;color:var(--faint);margin-top:8px;line-height:1.5}
+  .sldnote code{font-family:'JetBrains Mono',monospace;color:var(--dim)}
+
+  /* readout */
+  .read{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+    margin-top:13px;overflow:hidden}
+  .readhd{display:flex;align-items:center;gap:9px;padding:9px 12px;
+    border-bottom:1px solid var(--line)}
+  .readhd .ttl{font-family:'JetBrains Mono',monospace;font-size:10.5px;
+    letter-spacing:.13em;text-transform:uppercase;color:var(--dim)}
+  .verdict{margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:11px;
+    font-weight:700;padding:3px 9px;border-radius:5px;letter-spacing:.06em}
+  .v-pass{background:rgba(107,207,159,.15);color:var(--mint)}
+  .v-rej{background:rgba(107,114,128,.18);color:var(--grey)}
+  .v-none{background:rgba(126,135,131,.12);color:var(--faint)}
+  .readbody{padding:11px 12px;font-family:'JetBrains Mono',monospace;font-size:12px}
+  .cmp{display:flex;flex-direction:column;gap:5px}
+  .cmp .ln{color:var(--dim);line-height:1.5}
+  .cmp .ln b{color:var(--ink)}
+  .cmp .ln .ok{color:var(--mint)}
+  .cmp .ln .no{color:var(--grey)}
+  .evt{margin-top:9px;padding:9px 11px;background:#0e1110;border:1px solid var(--line);
+    border-radius:7px;border-left:2px solid var(--cyan);
+    font-size:11.5px;color:var(--cyan);line-height:1.65;white-space:pre-wrap}
+  .evt.empty{border-left-color:var(--faint);color:var(--faint)}
+
+  /* contract */
+  .contract{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .clause{background:var(--panel);border:1px solid var(--line);border-radius:9px;
+    padding:11px 12px}
+  .clause .cn{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--cyan);
+    font-weight:700}
+  .clause .ch{font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--ink);
+    margin-top:5px;font-weight:500}
+  .clause .cd{font-size:11.5px;color:var(--dim);margin-top:4px;line-height:1.5}
+  .clause.wide{grid-column:1/-1}
+
+  /* probe */
+  .probe{background:var(--panel);border:1px solid var(--line);border-radius:11px;
+    padding:14px}
+  .probe p{font-size:12.5px;color:var(--dim);line-height:1.55;margin-bottom:11px}
+  .probe p code{font-family:'JetBrains Mono',monospace;color:var(--ink);font-size:11.5px}
+  .probeout{margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;
+    padding:10px 12px;border-radius:8px;background:var(--panel2);
+    border:1px solid var(--line);color:var(--faint);line-height:1.6}
+  .probeout.ran{border-left:3px solid var(--mint);color:var(--mint)}
+
+  .foot{margin-top:24px;font-size:11.5px;color:var(--faint);line-height:1.65;
+    border-top:1px solid var(--line);padding-top:13px}
+  .foot code{font-family:'JetBrains Mono',monospace;color:var(--dim)}
+
+  @media(max-width:560px){
+    .contract{grid-template-columns:1fr}
+    h1{font-size:19px}
+    .cursorread{margin-left:0;width:100%}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="kick">ICT Validation Instrument · Detector Scope</div>
+    <h1>Fair Value Gap detector <span class="d">— bars in, labelled events out</span></h1>
+    <p class="sub">A detector reports <b>what is on the chart</b>, never what to do about it.
+    Step the three-bar frame across the candles below: at each position the detector applies
+    one rule — <span class="mono">bar1.high &lt; bar3.low</span> — and emits a typed event only
+    when the gap clears the size threshold. Entry, target and stops live in the setup, not here.</p>
+  </header>
+
+  <!-- pipeline -->
+  <div class="pipe">
+    <div class="stage"><div class="n">01</div><div class="t">Definition<br>Layer</div></div>
+    <div class="stage here"><div class="n">02</div><div class="t">Detector<br>Registry</div></div>
+    <div class="stage"><div class="n">03</div><div class="t">Trajectory<br>Simulator</div></div>
+    <div class="stage"><div class="n">04</div><div class="t">Honesty<br>Harness</div></div>
+    <div class="stage"><div class="n">05</div><div class="t">Decision<br>Log</div></div>
+  </div>
+
+  <!-- scope -->
+  <div class="slabel">Scope — fvg(min_size_atr, atr_period=3)</div>
+  <div class="scope"><div id="chart"></div></div>
+
+  <!-- controls -->
+  <div class="ctrl">
+    <div class="row">
+      <button id="reset">⟲ Reset</button>
+      <button id="prev">◀ Step</button>
+      <button id="go" class="go">▶ Run frame</button>
+      <button id="next">Step ▶</button>
+      <div class="cursorread">frame bar&nbsp;3 → <b id="curIdx">2</b> / 12</div>
+    </div>
+
+    <div class="sld">
+      <div class="sldtop">
+        <span class="lbl">min_size_atr</span>
+        <span class="val" id="multVal">0.50×</span>
+        <span class="cnt">detected FVGs: <b id="fvgCount">0</b></span>
+      </div>
+      <input type="range" id="mult" min="0.1" max="2.0" step="0.1" value="0.5">
+      <div class="sldnote">Sweeping this single bound parameter <i>is</i> the degrees-of-freedom
+      audit. A robust setup keeps a stable detection count across a broad plateau; one whose
+      results hinge on a knife-edge <code>min_size_atr</code> is overfit.</div>
+    </div>
+
+    <!-- readout -->
+    <div class="read">
+      <div class="readhd">
+        <span class="ttl">Frame evaluation · bars [<span id="frameBars">0,1,2</span>]</span>
+        <span class="verdict v-none" id="verdict">IDLE</span>
+      </div>
+      <div class="readbody">
+        <div class="cmp" id="cmp"></div>
+        <div class="evt empty" id="evt">— no event emitted at this frame —</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- contract -->
+  <div class="slabel">The detector contract — five clauses</div>
+  <div class="contract">
+    <div class="clause">
+      <div class="cn">01</div>
+      <div class="ch">Pure function</div>
+      <div class="cd">Bars in, events out. No state, no I/O, no randomness — same input gives
+      identical output, which is what makes the honesty harness reproducible.</div>
+    </div>
+    <div class="clause">
+      <div class="cn">02</div>
+      <div class="ch">No lookahead</div>
+      <div class="cd">At bar <i>t</i> the detector reads bar <i>t</i> and earlier — never
+      <i>t+1</i>. Enforced structurally: it is handed a left-bounded window only.</div>
+    </div>
+    <div class="clause">
+      <div class="cn">03</div>
+      <div class="ch">Events, not booleans</div>
+      <div class="cd">Output is typed objects with a time index and price geometry. No
+      "strength" score — that is a discretion word wearing a number.</div>
+    </div>
+    <div class="clause">
+      <div class="cn">04</div>
+      <div class="ch">Maturity timestamp</div>
+      <div class="cd">Each event carries the bar at which it became <i>confirmed</i>. An FVG
+      spans three bars but is only knowable once bar 3 closes — the zone appears on the scope
+      exactly then.</div>
+    </div>
+    <div class="clause wide">
+      <div class="cn">05</div>
+      <div class="ch">Self-parameterised</div>
+      <div class="cd">Every threshold arrives as an explicit argument bound by the setup. The
+      detector ships no defaults — if <code class="mono">min_size_atr</code> is not passed, it
+      does not run. That is what lets the Definition Layer reject an unbound parameter before
+      any data is touched.</div>
+    </div>
+  </div>
+
+  <!-- probe -->
+  <div class="slabel">Lookahead probe — the guardrail behind clause 02</div>
+  <div class="probe">
+    <p>The single most common way a backtest manufactures a fake edge is a detector quietly
+    reading the future. The probe runs the detector on the candle window, then re-runs it on
+    the <i>same</i> window with future candles appended, and asserts the labels over the shared
+    region are <code>byte-identical</code>. If they differ, every backtest using this detector
+    is fiction.</p>
+    <div class="row">
+      <button id="runProbe">▶ Run lookahead probe</button>
+    </div>
+    <div class="probeout" id="probeOut">probe not yet run</div>
+  </div>
+
+  <p class="foot">
+    Worked example for the detector registry stage. The FVG rule is fixed to the candle —
+    <code>bar1.high &lt; bar3.low</code> for bullish, mirrored for bearish — gap height measured
+    against <code>ATR(3)</code> at the formation bar. The detector labels geometry and stops
+    there; whether to enter at the midpoint is the setup's decision, tested separately by the
+    honesty harness. Build one detector to this contract — contract, implementation, unit tests,
+    lookahead probe — before adding the next.
+  </p>
+
+</div>
+
+<script>
+/* ---- candle data: O,H,L,C ---- */
+const C = [
+  {o:100,  h:102.5,l:99,   c:101.5},
+  {o:101.5,h:103,  l:100.5,c:102.5},
+  {o:102.5,h:107,  l:102,  c:106.5},
+  {o:108,  h:110.5,l:107.5,c:110},
+  {o:109,  h:110.5,l:107,  c:109.5},
+  {o:110,  h:112,  l:109.5,c:111.5},
+  {o:111.5,h:112.5,l:110.8,c:112},
+  {o:112,  h:112.6,l:111.4,c:111.8},
+  {o:111.5,h:112,  l:106,  c:106.5},
+  {o:106,  h:107,  l:104,  c:104.8},
+  {o:104.8,h:106,  l:104,  c:105.5},
+  {o:105.5,h:107.2,l:105.2,c:107},
+  {o:107,  h:108.3,l:106.9,c:108}
+];
+/* ghost candles for the lookahead probe */
+const GHOST = [
+  {o:108,  h:109.5,l:107.6,c:109},
+  {o:109,  h:110.4,l:108.5,c:110},
+  {o:110,  h:111.2,l:109.4,c:110.6}
+];
+
+/* ---- ATR(period), no lookahead ---- */
+function atrSeries(bars,period){
+  const tr=[],atr=[];
+  for(let i=0;i<bars.length;i++){
+    const b=bars[i];
+    tr[i]= i===0 ? b.h-b.l
+      : Math.max(b.h-b.l, Math.abs(b.h-bars[i-1].c), Math.abs(b.l-bars[i-1].c));
+    const s=Math.max(0,i-period+1);
+    let sum=0; for(let k=s;k<=i;k++) sum+=tr[k];
+    atr[i]=sum/(i-s+1);
+  }
+  return atr;
+}
+
+/* ---- evaluate the 3-bar frame ending at index i ---- */
+function evalFrame(bars,atr,i,mult){
+  if(i<2) return {state:"idle"};
+  const b1=bars[i-2], b3=bars[i];
+  const thr=atr[i]*mult;
+  let dir=null,upper,lower;
+  if(b1.h<b3.l){ dir="bullish"; lower=b1.h; upper=b3.l; }
+  else if(b1.l>b3.h){ dir="bearish"; upper=b1.l; lower=b3.h; }
+  if(!dir) return {state:"none",b1:i-2,b2:i-1,b3:i,atr:atr[i],thr};
+  const gap=upper-lower;
+  const pass=gap>=thr;
+  return {state:pass?"pass":"reject",dir,gap,thr,atr:atr[i],
+    upper,lower,mid:(upper+lower)/2,b1:i-2,b2:i-1,b3:i,gapAtr:gap/atr[i]};
+}
+
+/* ---- all matured (passing) FVGs across a window ---- */
+function detectAll(bars,mult){
+  const atr=atrSeries(bars,3),out=[];
+  for(let i=2;i<bars.length;i++){
+    const e=evalFrame(bars,atr,i,mult);
+    if(e.state==="pass") out.push(e);
+  }
+  return out;
+}
+
+/* ---- state ---- */
+let cur=2, mult=0.5, timer=null;
+const $=id=>document.getElementById(id);
+
+/* ---- chart geometry ---- */
+const VW=660, VH=300, PADL=48, PADR=12, PADT=16, PADB=52;
+const PLOTW=VW-PADL-PADR, PLOTH=VH-PADT-PADB;
+const SLOT=PLOTW/C.length, BODYW=Math.min(17,SLOT*0.46);
+let LO,HI;
+(function bounds(){
+  LO=Math.min(...C.map(b=>b.l)); HI=Math.max(...C.map(b=>b.h));
+  const pad=(HI-LO)*0.07; LO-=pad; HI+=pad;
+})();
+const cx=i=>PADL+SLOT*(i+0.5);
+const py=p=>PADT+(HI-p)/(HI-LO)*PLOTH;
+
+function drawChart(){
+  const atr=atrSeries(C,3);
+  const fvgs=detectAll(C,mult);
+  const shown=fvgs.filter(f=>f.b3<=cur);
+  const frame=evalFrame(C,atr,cur,mult);
+  let s='';
+
+  /* gridlines + price axis */
+  for(let k=0;k<=4;k++){
+    const p=LO+(HI-LO)*k/4, y=py(p);
+    s+=`<line x1="${PADL}" y1="${y.toFixed(1)}" x2="${VW-PADR}" y2="${y.toFixed(1)}"
+      stroke="#1d211f" stroke-width="1"/>`;
+    s+=`<text x="${PADL-6}" y="${(y+3).toFixed(1)}" text-anchor="end"
+      font-family="JetBrains Mono" font-size="9" fill="#525a56">${p.toFixed(1)}</text>`;
+  }
+
+  /* current frame cursor band */
+  if(cur>=2){
+    const x0=PADL+SLOT*(cur-2)+SLOT*0.08;
+    const w=SLOT*3-SLOT*0.16;
+    s+=`<rect x="${x0.toFixed(1)}" y="${PADT}" width="${w.toFixed(1)}"
+      height="${PLOTH}" fill="rgba(244,183,64,.07)"
+      stroke="rgba(244,183,64,.45)" stroke-width="1" stroke-dasharray="3 3" rx="4"/>`;
+    s+=`<text x="${(x0+w/2).toFixed(1)}" y="${PADT+PLOTH+30}" text-anchor="middle"
+      font-family="JetBrains Mono" font-size="8.5" fill="#f4b740">3-BAR FRAME</text>`;
+  }
+
+  /* matured FVG zones */
+  shown.forEach(f=>{
+    const isNew=f.b3===cur;
+    const x0=cx(f.b1)-BODYW/2;
+    const x1=cx(f.b3)+BODYW/2;
+    const yT=py(f.upper), yB=py(f.lower);
+    const col=isNew?"#28d6c4":"rgba(40,214,196,.85)";
+    const fill=isNew?"rgba(40,214,196,.20)":"rgba(40,214,196,.10)";
+    s+=`<rect x="${x0.toFixed(1)}" y="${yT.toFixed(1)}"
+      width="${(x1-x0).toFixed(1)}" height="${(yB-yT).toFixed(1)}"
+      fill="${fill}" stroke="${col}" stroke-width="${isNew?1.4:1}" rx="2"/>`;
+    /* extension line to the right */
+    s+=`<line x1="${x1.toFixed(1)}" y1="${((yT+yB)/2).toFixed(1)}"
+      x2="${(VW-PADR).toFixed(1)}" y2="${((yT+yB)/2).toFixed(1)}"
+      stroke="${col}" stroke-width="1" stroke-dasharray="2 3" opacity="${isNew?.8:.4}"/>`;
+    const arrow=f.dir==="bullish"?"\u25B2":"\u25BC";
+    s+=`<text x="${(x1+5).toFixed(1)}" y="${(yT-4).toFixed(1)}"
+      font-family="JetBrains Mono" font-size="8.5" font-weight="700"
+      fill="${col}">FVG ${arrow} #${f.b3}</text>`;
+  });
+
+  /* candles */
+  C.forEach((b,i)=>{
+    const x=cx(i);
+    const up=b.c>=b.o;
+    const col=up?"#6bcf9f":"#e0726a";
+    const dim=i>cur?0.32:1;
+    s+=`<g opacity="${dim}">`;
+    s+=`<line x1="${x.toFixed(1)}" y1="${py(b.h).toFixed(1)}"
+      x2="${x.toFixed(1)}" y2="${py(b.l).toFixed(1)}"
+      stroke="${col}" stroke-width="1.4"/>`;
+    const yo=py(b.o), yc=py(b.c);
+    const top=Math.min(yo,yc), h=Math.max(1.5,Math.abs(yo-yc));
+    s+=`<rect x="${(x-BODYW/2).toFixed(1)}" y="${top.toFixed(1)}"
+      width="${BODYW}" height="${h.toFixed(1)}"
+      fill="${up?col:'#0c0e0d'}" stroke="${col}" stroke-width="1.3" rx="1"/>`;
+    s+=`</g>`;
+    /* index label */
+    const lc=(i===cur)?"#f4b740":(i<=cur?"#7e8783":"#3a403d");
+    s+=`<text x="${x.toFixed(1)}" y="${(PADT+PLOTH+15).toFixed(1)}" text-anchor="middle"
+      font-family="JetBrains Mono" font-size="9" fill="${lc}"
+      font-weight="${i===cur?700:400}">${i}</text>`;
+  });
+
+  /* roles of the 3 frame bars */
+  if(cur>=2){
+    [["1",cur-2],["2",cur-1],["3",cur]].forEach(([r,i])=>{
+      s+=`<text x="${cx(i).toFixed(1)}" y="${(PADT+PLOTH+44).toFixed(1)}"
+        text-anchor="middle" font-family="JetBrains Mono" font-size="8"
+        fill="#f4b740">bar ${r}</text>`;
+    });
+  }
+
+  $("chart").innerHTML=
+    `<svg viewBox="0 0 ${VW} ${VH}" role="img" aria-label="FVG detector scope">${s}</svg>`;
+
+  /* count + slider readouts */
+  $("fvgCount").textContent=fvgs.length;
+  return frame;
+}
+
+/* ---- readout panel ---- */
+function drawReadout(f){
+  $("frameBars").textContent = cur>=2 ? `${cur-2},${cur-1},${cur}` : "—";
+  $("curIdx").textContent=cur;
+  const v=$("verdict"), cmp=$("cmp"), evt=$("evt");
+
+  if(f.state==="idle"){
+    v.className="verdict v-none"; v.textContent="IDLE";
+    cmp.innerHTML='<div class="ln">Frame needs three bars — step forward.</div>';
+    evt.className="evt empty"; evt.textContent="— no event emitted at this frame —";
+    return;
+  }
+  if(f.state==="none"){
+    v.className="verdict v-none"; v.textContent="NO GEOMETRY";
+    cmp.innerHTML=
+      `<div class="ln">bullish test &nbsp;<b>bar1.high &lt; bar3.low</b> &nbsp;`+
+      `<span class="no">\u2715 ranges overlap</span></div>`+
+      `<div class="ln">bearish test &nbsp;<b>bar1.low &gt; bar3.high</b> &nbsp;`+
+      `<span class="no">\u2715 ranges overlap</span></div>`;
+    evt.className="evt empty";
+    evt.textContent="— no gap between bar 1 and bar 3 · detector emits nothing —";
+    return;
+  }
+  /* gap exists */
+  const isBull=f.dir==="bullish";
+  const test=isBull
+    ? `bar1.high(${f.lower.toFixed(1)}) &lt; bar3.low(${f.upper.toFixed(1)})`
+    : `bar1.low(${f.upper.toFixed(1)}) &gt; bar3.high(${f.lower.toFixed(1)})`;
+  cmp.innerHTML=
+    `<div class="ln">geometry &nbsp;<b>${f.dir}</b> &nbsp;<span class="ok">\u2713 ${test}</span></div>`+
+    `<div class="ln">gap height &nbsp;<b>${f.gap.toFixed(2)}</b> &nbsp;`+
+      `( ${f.gapAtr.toFixed(2)}× ATR )</div>`+
+    `<div class="ln">threshold &nbsp;<b>${f.thr.toFixed(2)}</b> &nbsp;`+
+      `= ATR(${f.atr.toFixed(2)}) × ${mult.toFixed(1)}</div>`+
+    `<div class="ln">size gate &nbsp;<b>${f.gap.toFixed(2)} ${f.gap>=f.thr?'\u2265':'<'} ${f.thr.toFixed(2)}</b> &nbsp;`+
+      (f.gap>=f.thr?'<span class="ok">\u2713 admit</span>':'<span class="no">\u2715 below threshold</span>')+
+      `</div>`;
+
+  if(f.state==="pass"){
+    v.className="verdict v-pass"; v.textContent="EVENT EMITTED";
+    evt.className="evt";
+    evt.textContent=
+`{ type: "fvg",  dir: "${f.dir}",
+  bars:  [${f.b1}, ${f.b2}, ${f.b3}],
+  upper: ${f.upper.toFixed(2)},   lower: ${f.lower.toFixed(2)},
+  mid:   ${f.mid.toFixed(2)},   gap_atr: ${f.gapAtr.toFixed(2)}×,
+  maturity: ${f.b3}   ← confirmed only when bar ${f.b3} closes }`;
+  } else {
+    v.className="verdict v-rej"; v.textContent="REJECTED";
+    evt.className="evt empty";
+    evt.textContent="— gap geometry valid but sub-threshold · no event · detector stays silent —";
+  }
+}
+
+function render(){
+  const f=drawChart();
+  drawReadout(f);
+  $("prev").disabled=cur<=2;
+  $("next").disabled=cur>=C.length-1;
+}
+
+/* ---- lookahead probe (genuinely recomputes) ---- */
+function runProbe(){
+  const base=detectAll(C,mult);
+  const ext=detectAll(C.concat(GHOST),mult).filter(f=>f.b3<C.length);
+  const key=a=>a.map(f=>`${f.b3}:${f.dir}:${f.upper.toFixed(3)}:${f.lower.toFixed(3)}`).join("|");
+  const identical = key(base)===key(ext);
+  const out=$("probeOut");
+  out.className="probeout ran";
+  out.textContent=
+`detector run A  · window = bars 0–${C.length-1}        → ${base.length} FVG labels
+detector run B  · window = bars 0–${C.length-1} + 3 ghost bars → ${ext.length} FVG labels (shared region)
+labels over shared region:  ${identical?"IDENTICAL \u2713":"DIVERGED \u2715"}
+verdict: ${identical?"PASS — detector reads no future bars.":"FAIL — lookahead leak detected."}`;
+}
+
+/* ---- controls ---- */
+function stop(){ if(timer){clearInterval(timer);timer=null;}
+  $("go").classList.remove("on"); $("go").textContent="▶ Run frame"; }
+function step(){ if(cur<C.length-1){cur++;render();} else stop(); }
+
+$("prev").onclick=()=>{ stop(); if(cur>2){cur--;render();} };
+$("next").onclick=()=>{ stop(); step(); };
+$("reset").onclick=()=>{ stop(); cur=2; render(); };
+$("go").onclick=()=>{
+  if(timer){ stop(); return; }
+  if(cur>=C.length-1){ cur=2; render(); }
+  $("go").classList.add("on"); $("go").textContent="❚❚ Pause";
+  timer=setInterval(step,1150);
+};
+$("mult").oninput=e=>{
+  mult=parseFloat(e.target.value);
+  $("multVal").textContent=mult.toFixed(2)+"×";
+  render();
+};
+$("runProbe").onclick=runProbe;
+
+render();
+</script>
+</body>
+</html>
