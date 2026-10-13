@@ -3,7 +3,7 @@
 // long sessions — tool results are capped at 50KB each but accumulate
 // across thousands of turns, and Ink/React state plus the SDK clients
 // share the same heap. 8GB gives ample headroom; --expose-gc is unused
-// today but matches gg-boss for consistency. NODE_OPTIONS overrides via
+// today but kept so manual heap debugging works. NODE_OPTIONS overrides via
 // Node's standard flag merge.
 
 // Catch stray abort-related promise rejections that escape the normal error
@@ -80,8 +80,8 @@ import { PROMPT_COMMANDS } from "./core/prompt-commands.js";
 import { matchPromptCommand } from "./core/prompt-command-expansion.js";
 import { createTools } from "./tools/index.js";
 import { cleanupToolOutputs } from "./tools/overflow.js";
+import { spawnedTasks, type SpawnedTaskArgs } from "./tools/subagent-shared.js";
 import { CheckpointStore } from "./core/checkpoint-store.js";
-import { ReviewCoverageTracker } from "./core/ideal-review.js";
 import { shouldCompact, compact } from "./core/compaction/compactor.js";
 import {
   createCompactedSessionCheckpoint,
@@ -118,16 +118,7 @@ import chalk from "chalk";
 import { checkAndAutoUpdate } from "./core/auto-update.js";
 
 import { routeCliCommandInput, type CliSubcommandName } from "./cli/command-routing.js";
-
-const THINKING_LEVELS = new Set<ThinkingLevel>(["low", "medium", "high", "xhigh", "max", "ultra"]);
-
-export function parseThinkingLevel(value: string | undefined): ThinkingLevel | undefined {
-  if (value === undefined) return undefined;
-  if (THINKING_LEVELS.has(value as ThinkingLevel)) return value as ThinkingLevel;
-  throw new Error(
-    `Invalid --thinking value "${value}". Expected low, medium, high, xhigh, max, or ultra.`,
-  );
-}
+import { parseThinkingLevel } from "./cli/thinking-arg.js";
 
 function printHelp(): void {
   // Clear the visible viewport for a clean look without erasing scrollback.
@@ -399,14 +390,14 @@ function main(): void {
   const provider: Provider = saved.provider ?? "anthropic";
 
   function getHardcodedDefault(p: string): string {
-    if (p === "openai") return "gpt-6-sol";
+    if (p === "openai") return "gpt-6.1-sol";
     if (p === "gemini") return "gemini-3.1-flash-lite";
     if (p === "glm") return "glm-5.3";
     if (p === "moonshot") return "kimi-k3";
     if (p === "minimax") return "MiniMax-M3";
     if (p === "deepseek") return "deepseek-v4-pro";
-    if (p === "huggingface") return "Qwen/Qwen3-Coder-480B-A35B-Instruct";
-    if (p === "openrouter") return "qwen/qwen3.6-plus";
+    if (p === "huggingface") return "moonshotai/Kimi-K2.7-Code";
+    if (p === "openrouter") return "qwen/qwen3.8-max";
     if (p === "sakana") return "fugu";
     if (p === "xai") return "grok-4.7";
     return "claude-opus-5-5";
@@ -561,20 +552,22 @@ async function runInkTUI(opts: {
     if (sameProviderModel) {
       model = sameProviderModel;
     } else {
-      const fallback = loggedInProviders.find((p) => resolvableModelFor(p));
-      if (!fallback) {
+      const fallback = loggedInProviders
+        .map((p) => ({ provider: p, model: resolvableModelFor(p) }))
+        .find((candidate) => candidate.model !== undefined);
+      if (!fallback?.model) {
         throw new Error(
           'All logged-in providers expired or failed to authenticate. Run "ggcoder login" to re-authenticate.',
         );
       }
       console.warn(
         chalk.yellow(
-          `⚠ ${displayName(preferredProvider)} session expired — switched to ${displayName(fallback)} for this launch.\n` +
+          `⚠ ${displayName(preferredProvider)} session expired — switched to ${displayName(fallback.provider)} for this launch.\n` +
             `  Run "ggcoder login" to re-authenticate ${displayName(preferredProvider)}.`,
         ),
       );
-      provider = fallback;
-      model = resolvableModelFor(fallback)!;
+      provider = fallback.provider;
+      model = fallback.model;
     }
   } else if (expiredProviders.length > 0) {
     console.warn(
@@ -632,38 +625,40 @@ async function runInkTUI(opts: {
   // Holder so the (cwd-bound) tools can snapshot pre-mutation file state for
   // /rewind. The store is created once the session id is known (below).
   const checkpointRef: { current: CheckpointStore | null } = { current: null };
-  const reviewCoverageTracker = new ReviewCoverageTracker(cwd);
   const onPreFileMutation = (filePath: string): Promise<void> =>
     checkpointRef.current?.recordPreMutation(filePath) ?? Promise.resolve();
   let activeProvider = provider;
   let activeModel = model;
-  let activeThinking = opts.thinkingLevel;
+  let activeThinkingLevel = opts.thinkingLevel;
 
-  const { tools, processManager, rebuildReadTool, lspManager, subAgentManager } = await createTools(
-    cwd,
-    {
-      agents,
-      skills,
-      provider,
-      model,
-      planModeRef,
-      onPreFileMutation,
-      onFileRead: (filePath) => reviewCoverageTracker.recordRead(filePath),
-      onFileMutated: (filePath) => reviewCoverageTracker.recordChanged(filePath),
-      lspDiagnostics: opts.lspDiagnostics,
-      getWriteGuardSettings: () => ({
-        allowOutsideWorkspaceWrites: opts.allowOutsideWorkspaceWrites ?? false,
-      }),
-      authStorage,
-      onEnterPlan: (reason) => planToolCallbacks.onEnterPlan?.(reason),
-      onExitPlan: (planPath) =>
-        planToolCallbacks.onExitPlan?.(planPath) ?? Promise.resolve("Plan review is unavailable."),
-      getProvider: () => activeProvider,
-      getModel: () => activeModel,
-      getThinkingLevel: () => activeThinking,
-      getMaxPerModel: () => opts.subagentMaxPerModel,
-    },
-  );
+  const {
+    tools,
+    processManager,
+    rebuildReadTool,
+    clearReadTracker,
+    lspManager,
+    debugManager,
+    subAgentManager,
+  } = await createTools(cwd, {
+    agents,
+    skills,
+    provider,
+    model,
+    planModeRef,
+    onPreFileMutation,
+    lspDiagnostics: opts.lspDiagnostics,
+    getWriteGuardSettings: () => ({
+      allowOutsideWorkspaceWrites: opts.allowOutsideWorkspaceWrites ?? false,
+    }),
+    authStorage,
+    onEnterPlan: (reason) => planToolCallbacks.onEnterPlan?.(reason),
+    onExitPlan: (planPath) =>
+      planToolCallbacks.onExitPlan?.(planPath) ?? Promise.resolve("Plan review is unavailable."),
+    getProvider: () => activeProvider,
+    getModel: () => activeModel,
+    getThinkingLevel: () => activeThinkingLevel,
+    getMaxPerModel: () => opts.subagentMaxPerModel,
+  });
 
   // MCP startup can involve `npx` installing/booting servers. Do it after the
   // TUI paints so a slow network or npm cache never looks like "nothing happens".
@@ -707,6 +702,7 @@ async function runInkTUI(opts: {
     subAgentManager?.shutdownAllNow();
     processManager.shutdownAll();
     lspManager?.shutdownAll();
+    debugManager?.shutdown();
     mcpManager.dispose().catch(() => {});
   });
 
@@ -980,8 +976,6 @@ async function runInkTUI(opts: {
     sessionId,
     processManager,
     subAgentManager,
-    lspManager,
-    reviewCoverageTracker,
     settingsFile: paths.settingsFile,
     mcpManager,
     authStorage,
@@ -990,12 +984,13 @@ async function runInkTUI(opts: {
     checkpointStore: checkpointRef.current ?? undefined,
     idealReviewEnabled: opts.idealReviewEnabled,
     rebuildReadTool,
+    clearReadTracker,
     connectInitialMcpTools,
     planCallbacks: planToolCallbacks,
     onRuntimeStateChange: (updates) => {
       if (updates.provider) activeProvider = updates.provider;
       if (updates.model) activeModel = updates.model;
-      if ("thinking" in updates) activeThinking = updates.thinking;
+      if ("thinking" in updates) activeThinkingLevel = updates.thinking;
     },
   });
 
@@ -1026,13 +1021,13 @@ async function runSessions(): Promise<void> {
   const provider: Provider = saved2.provider ?? "anthropic";
 
   function getDefault(p: string): string {
-    if (p === "openai") return "gpt-6-sol";
+    if (p === "openai") return "gpt-6.1-sol";
     if (p === "gemini") return "gemini-3.1-flash-lite";
     if (p === "glm") return "glm-5.3";
     if (p === "moonshot") return "kimi-k3";
     if (p === "minimax") return "MiniMax-M3";
     if (p === "deepseek") return "deepseek-v4-pro";
-    if (p === "huggingface") return "Qwen/Qwen3-Coder-480B-A35B-Instruct";
+    if (p === "huggingface") return "moonshotai/Kimi-K2.7-Code";
     if (p === "sakana") return "fugu";
     if (p === "xai") return "grok-4.7";
     return "claude-opus-5-5";
@@ -1532,10 +1527,7 @@ async function resolveActiveProvider(
 
 function extractText(content: string | Array<{ type: string; text?: string }>): string {
   if (typeof content === "string") return content;
-  return content
-    .filter((b) => b.type === "text" && b.text)
-    .map((b) => b.text!)
-    .join("\n");
+  return content.flatMap((b) => (b.type === "text" && b.text ? [b.text] : [])).join("\n");
 }
 
 function restoredPromptCommandDisplayText(text: string): string | null {
@@ -1642,24 +1634,27 @@ export function messagesToHistoryItems(msgs: Message[]): CompletedItem[] {
             flushText();
             const result = toolResults.get(block.id);
             if (block.name === "subagent" || block.name === "spawn_agent") {
+              // One row per child: a batch spawn_agent call starts several.
+              const spawned: SpawnedTaskArgs[] =
+                block.name === "spawn_agent" ? spawnedTasks(block.args) : [{}];
               items.push({
                 kind: "subagent_group",
-                agents: [
-                  {
-                    toolCallId: block.id,
-                    task: String(
-                      block.name === "spawn_agent"
-                        ? (block.args.task_name ?? block.args.task ?? "Async agent")
-                        : (block.args.task ?? "Sub-agent"),
-                    ),
-                    agentName: String(block.args.agent ?? "default"),
-                    status: result?.isError ? "error" : "done",
-                    toolUseCount: 0,
-                    tokenUsage: { input: 0, output: 0 },
-                    result: result?.content ?? "",
-                    durationMs: 0,
-                  },
-                ],
+                agents: spawned.map((spawn, index) => ({
+                  toolCallId: spawned.length > 1 ? `${block.id}:${index}` : block.id,
+                  task: String(
+                    block.name === "spawn_agent"
+                      ? (spawn.task_name ?? spawn.task ?? "Async agent")
+                      : (block.args.task ?? "Sub-agent"),
+                  ),
+                  agentName: String(
+                    (block.name === "spawn_agent" ? spawn.agent : block.args.agent) ?? "default",
+                  ),
+                  status: result?.isError ? "error" : "done",
+                  toolUseCount: 0,
+                  tokenUsage: { input: 0, output: 0 },
+                  result: result?.content ?? "",
+                  durationMs: 0,
+                })),
                 id: `restore-${id++}`,
               });
             } else {

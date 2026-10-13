@@ -55,10 +55,11 @@ export const theme = {
   // body text on the dark canvas. Distinct from the GG Coder blue dot and the
   // greener `info` teal: the color IS the only signal that a reply is Ken's.
   ken: "var(--ken)",
-} as const;
 
-// User-message chip background: mirrors USER_MESSAGE_BACKGROUND in the TUI.
-export const USER_MESSAGE_BACKGROUND = "#26272c";
+  // Critters (sub-agents, compaction): pink while a critter is busy, so its
+  // rows read apart from the periwinkle hooks and the green "done" state.
+  critter: "var(--critter)",
+} as const;
 
 const VAR_REF = /^var\((--[\w-]+)\)$/;
 

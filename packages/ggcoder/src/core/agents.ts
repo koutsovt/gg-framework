@@ -1,18 +1,19 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { stripBom } from "../utils/text.js";
+import { cleanInstructionText } from "../utils/text.js";
 import { parseFrontmatter } from "./frontmatter.js";
 import { log } from "./logger.js";
 import { BUILTIN_TOOL_NAMES } from "../tools/prompt-hints.js";
 import { BUNDLED_AGENTS } from "./bundled-agents.js";
 
 /**
- * Which model a sub-agent runs on.
+ * Which model a sub-agent runs on. Every sub-agent runs at the LOWEST thinking
+ * level of that model (never off), whatever the parent uses.
  *
- * - `"inherit"` (default) — the parent's model, so a delegated task is not
- *   silently downgraded.
- * - `"fast"` — the provider's cheap tier (`getFastModel`), for genuinely
- *   mechanical recon.
+ * - `"inherit"` (default) — the parent's model, so a delegated task is never
+ *   moved to a weaker model.
+ * - `"fast"` — legacy alias of `"inherit"`, still accepted so older agent files
+ *   load. It no longer swaps in a cheaper model.
  * - any other string — an explicit model id.
  */
 export type AgentModelPreference = "inherit" | "fast" | (string & {});
@@ -164,12 +165,21 @@ async function loadAgentsFromDir(
  * ```
  */
 export function parseAgentFile(rawInput: string, source: "global" | "project"): AgentDefinition {
-  // A BOM before `---` would otherwise silently kill frontmatter parsing.
-  const { fields, body: systemPrompt } = parseFrontmatter(stripBom(rawInput));
+  // A BOM before `---` would otherwise silently kill frontmatter parsing, and a
+  // project agent file can hide instructions in invisible text.
+  const cleaned = cleanInstructionText(rawInput);
+  const { fields, body: systemPrompt } = parseFrontmatter(cleaned.text);
   // Unknown keys are ignored on purpose: agent files stay forward-compatible
   // with fields a newer ggcoder understands.
   const name = fields.name ?? "";
   const description = fields.description ?? "";
+  if (cleaned.stripped > 0) {
+    log("WARN", "agents", "Stripped invisible characters from an agent file", {
+      name,
+      source,
+      stripped: cleaned.stripped,
+    });
+  }
   const tools = (fields.tools ?? "")
     .replace(/^\[|\]$/g, "")
     .split(",")

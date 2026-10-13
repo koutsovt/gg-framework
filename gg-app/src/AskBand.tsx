@@ -41,9 +41,9 @@ const Check = (): React.ReactElement => (
 const valueOf = (option: AskOption): string => option.value ?? option.label;
 
 /**
- * Free text is offered everywhere except when the model opts out. There is no
- * button for it: a `text` question hands straight over to the composer, and on
- * any other question typing a character does the same.
+ * Free text is offered everywhere except when the model opts out. A `text`
+ * question has its own field in the band; on any other question typing a
+ * character hands over to the composer.
  */
 const allowsText = (q: AskQuestion): boolean => q.kind === "text" || q.allowOther !== false;
 
@@ -53,15 +53,42 @@ type Answers = Record<string, string | string[]>;
  * An answered question, collapsed. Reuses the transcript's shimmer label (the
  * same treatment as the "ideal?" hook) so a resolved ask reads as one of the
  * app's own quiet status lines rather than a green form-validation tick.
+ *
+ * The shimmer marks the moment of answering: it sweeps a couple of times when
+ * the answer lands (`live`) and then rests. It used to loop forever, so every
+ * answered question in a long chat kept animating, and opening history
+ * replayed them all.
  */
-function AnsweredLine({ text }: { text: string }): React.ReactElement {
+function AnsweredLine({ text, live }: { text: string; live: boolean }): React.ReactElement {
   return (
     <div className="ask-answered" aria-live="polite">
-      <span className="user-msg ask-answered-bubble">
+      <span className={`user-msg ask-answered-bubble${live ? " is-live" : ""}`}>
         <span className="shimmer-text">{text}</span>
       </span>
     </div>
   );
+}
+
+/**
+ * The keyboard hint under an open band, for the first unanswered question (the
+ * one the number keys and typing go to). Typing your own answer has no button
+ * of its own, so without this line nobody finds it.
+ */
+function keyHint(question: AskQuestion | undefined): string | null {
+  if (!question || question.kind === "text") return null;
+  const count = Math.min(question.options?.length ?? 0, 9);
+  const pick =
+    question.kind === "multi"
+      ? "Pick any that apply, then confirm"
+      : count > 1
+        ? `Press 1–${count} to choose`
+        : count === 1
+          ? "Press 1 to choose"
+          : null;
+  const type = allowsText(question) ? "start typing to answer in your own words" : null;
+  if (pick && type) return `${pick}, or ${type}.`;
+  if (pick) return `${pick}.`;
+  return type ? `${type.charAt(0).toUpperCase()}${type.slice(1)}.` : null;
 }
 
 /** One question: a heading and its stack of option rows. */
@@ -85,16 +112,20 @@ function Question({
   const multi = question.kind === "multi";
   const [draft, setDraft] = useState<string[]>();
 
-  // A text-only question has nothing to click, so it sends the user straight to
-  // the composer rather than rendering an empty band. The ref keeps that to one
-  // hand-off per question: `onTypeInstead` is a fresh closure every render, and
-  // re-running this would yank focus back mid-typing.
-  const routed = useRef<string | null>(null);
-  useEffect(() => {
-    if (question.kind !== "text" || routed.current === question.id) return;
-    routed.current = question.id;
-    onTypeInstead();
-  }, [question.kind, question.id, onTypeInstead]);
+  // A question that asks for information (a URL, a name) has nothing to click:
+  // it gets its own field right under the question, so the answer is typed
+  // where it's asked. It used to hand off to the chat composer, which in a
+  // card of several questions left the user looking for where to type.
+  const isText = question.kind === "text";
+  const saved = typeof answer === "string" ? answer : "";
+  // null until the user types, so a saved answer (from history, or given
+  // already) shows in the field without being copied into local state.
+  const [typedDraft, setTypedDraft] = useState<string | null>(null);
+  const shown = typedDraft ?? saved;
+  const submitTyped = (): void => {
+    const value = shown.trim();
+    if (value && value !== saved) onAnswer(value);
+  };
 
   // A multi-select parks its picks locally: "two of these three" is not an
   // answer until the user says they are done, and nothing else in the band can
@@ -123,7 +154,19 @@ function Question({
   const optionButton = (option: AskOption, position: number): React.ReactElement => {
     const value = valueOf(option);
     const on = isOn(value);
-    const index = position <= 9 ? <span className="ask-num">{position}</span> : null;
+    // One leading slot for every kind, so labels line up across a band: a
+    // keycap with the number key for a single choice, a checkbox for a multi.
+    const lead = multi ? (
+      <span className={`ask-box${on ? " is-on" : ""}`} aria-hidden="true">
+        {on && <Check />}
+      </span>
+    ) : position <= 9 ? (
+      <span className="ask-num" aria-hidden="true">
+        {position}
+      </span>
+    ) : (
+      <span className="ask-num ask-num-empty" aria-hidden="true" />
+    );
     // Green: the recommendation is the one affirmative signal in the list, and
     // a neutral pill was indistinguishable from the row's own raised fill. On a
     // selected pill it switches to the fill's own ink — light green on the
@@ -140,7 +183,7 @@ function Question({
         {...(multi ? {} : { "data-ask-option": true })}
         onClick={() => (multi ? toggle(value) : onAnswer(value))}
       >
-        {multi ? on && <Check /> : index}
+        {lead}
         {option.hint ? (
           <span className="ask-row-main">
             <span>{option.label}</span>
@@ -159,13 +202,16 @@ function Question({
   // which is also the only way back out of one.
 
   const typed =
-    typeof answer === "string" && !options.some((option) => valueOf(option) === answer) ? (
+    !isText &&
+    typeof answer === "string" &&
+    !options.some((option) => valueOf(option) === answer) ? (
       <button
         type="button"
         className="btn btn-sm btn-primary"
         aria-pressed="true"
         onClick={onTypeInstead}
       >
+        <span className="ask-num ask-num-empty" aria-hidden="true" />
         <span>{answer}</span>
       </button>
     ) : null;
@@ -189,6 +235,34 @@ function Question({
           {options.map((option, i) => optionButton(option, i + 1))}
           {typed}
         </div>
+      )}
+      {isText && (
+        <form
+          className="ask-text"
+          onSubmit={(e) => {
+            e.preventDefault();
+            submitTyped();
+          }}
+        >
+          <input
+            className="modal-input ask-text-input"
+            aria-label={question.question}
+            placeholder="Type your answer"
+            value={shown}
+            autoComplete="off"
+            spellCheck={false}
+            onChange={(e) => setTypedDraft(e.target.value)}
+            // Typing here belongs to this field, not the band's number keys.
+            onKeyDown={(e) => e.stopPropagation()}
+          />
+          <button
+            type="submit"
+            className="btn btn-sm btn-primary"
+            disabled={!shown.trim() || shown.trim() === saved}
+          >
+            {saved && shown.trim() === saved ? "Answered" : "Answer"}
+          </button>
+        </form>
       )}
       {/* The one control the band keeps. A multi-select is the only kind whose
           selection cannot commit itself: "Tests and Build" and "Tests, so far"
@@ -214,7 +288,9 @@ export function AskBand({
   prompt,
   answers = {},
   sent,
+  answeredLive,
   cancelled,
+  deferred,
   onAnswer,
   onTypeInstead,
 }: {
@@ -227,8 +303,19 @@ export function AskBand({
   answers?: Answers;
   /** The answers have been sent to the blocked tool call — collapse the band. */
   sent?: boolean;
+  /**
+   * Answered just now in this window. The answered band moves to the end of the
+   * chat as a new row, so it mounts already sent; this keeps its shimmer (the
+   * mark of the moment of answering) instead of treating it as restored.
+   */
+  answeredLive?: boolean;
   /** The run ended without an answer — the question is dead, say so quietly. */
   cancelled?: boolean;
+  /**
+   * The soft deadline passed and the agent continued on its best guess. The
+   * band stays fully answerable — a later answer is sent as a message.
+   */
+  deferred?: boolean;
   /** Report answered questions. App merges, then settles once none are left. */
   onAnswer: (delta: Answers) => void;
   /** The user wants to write their own answer: focus the composer, seeded. */
@@ -237,6 +324,11 @@ export function AskBand({
   const bandRef = useRef<HTMLDivElement | null>(null);
   const questions = prompt.questions;
   const done = sent === true;
+  // Collapsing to the answered/cancelled line dissolves in, but only when it
+  // happens while the band is on screen; a restored, already-settled question
+  // lands as it is.
+  const [settledAtMount] = useState(done || Boolean(cancelled));
+  const settleClass = settledAtMount ? "" : " dissolve-in";
 
   // Number accelerators + type-to-open. Both are deliberately inert while the
   // user is typing anywhere else (the composer is a focused textarea), so the
@@ -248,9 +340,17 @@ export function AskBand({
       // The target is the document itself when nothing is focused, so this
       // cannot assume an Element.
       const target = e.target;
+      // The app keeps the composer focused, so an EMPTY composer still lets
+      // the number keys pick (live: "Press 1–2 to choose" never worked).
+      // Once anything is typed there, digits are part of the message.
+      const emptyComposer =
+        target instanceof HTMLTextAreaElement &&
+        target.hasAttribute("data-composer-input") &&
+        target.value === "";
       if (
         target instanceof Element &&
-        target.closest("input, textarea, [contenteditable='true']")
+        target.closest("input, textarea, [contenteditable='true']") &&
+        !(emptyComposer && /^[1-9]$/.test(e.key))
       ) {
         return;
       }
@@ -291,7 +391,7 @@ export function AskBand({
 
   if (cancelled && !done) {
     return (
-      <div className="ask-band is-closed">
+      <div className={`ask-band is-closed${settleClass}`}>
         <span className="ask-closed">
           This question was cancelled, so it no longer needs an answer.
         </span>
@@ -308,8 +408,8 @@ export function AskBand({
       .filter(Boolean)
       .join(" · ");
     return (
-      <div className="ask-band is-done">
-        <AnsweredLine text={text} />
+      <div className={`ask-band is-done${settleClass}`}>
+        <AnsweredLine text={text} live={!settledAtMount || answeredLive === true} />
       </div>
     );
   }
@@ -317,9 +417,22 @@ export function AskBand({
   // Several questions are numbered so the accelerator keys have something to
   // refer to; a lone question needs no "1.".
   const numbered = questions.length > 1;
+  const hint = keyHint(questions.find((q) => answers[q.id] === undefined));
 
   return (
-    <div className="ask-band" ref={bandRef} role="group" aria-label="GG Coder needs your answer">
+    <div
+      className="ask-band"
+      ref={bandRef}
+      role="group"
+      aria-label="GG Coder needs your answer"
+      data-ask-prompt={prompt.id}
+    >
+      {/* A status note about the run, set apart from the question below it. */}
+      {deferred && (
+        <p className="ask-deferred-note" role="status">
+          Agent continued with its best guess — your answer will still be sent
+        </p>
+      )}
       {questions.map((q, i) => (
         <Question
           key={q.id}
@@ -331,6 +444,7 @@ export function AskBand({
           onTypeInstead={() => onTypeInstead(q.id)}
         />
       ))}
+      {hint && <p className="ask-hint">{hint}</p>}
     </div>
   );
 }

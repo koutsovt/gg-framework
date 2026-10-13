@@ -1,10 +1,19 @@
-import { memo, useCallback, useContext, useMemo, useRef, useState, createContext } from "react";
+import {
+  memo,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  createContext,
+} from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
-import { Check, Copy, CornerDownLeft } from "lucide-react";
-import { openUrl } from "@tauri-apps/plugin-opener";
-import { openProjectPath, sendPrompt } from "./agent";
+import { CheckIcon, CopyIcon, ArrowElbowDownLeftIcon } from "@phosphor-icons/react";
+import { openProjectPath, openUrl, sendPrompt } from "./agent";
+import { toast } from "./toast";
 import { codeLanguage, codeNodeText } from "./markdown-prompt";
 import { collapsedCode, shouldCollapseCode, visibleBlockCount } from "./collapse";
 import { marked } from "marked";
@@ -20,6 +29,8 @@ interface Props {
    * again once the stream settles, so finished prose carries no extra DOM.
    */
   animate?: boolean;
+  /** Lets streaming content settle existing word effects on Activity return. */
+  contentRef?: React.RefObject<HTMLDivElement | null>;
 }
 
 function isExternalHref(href: string): boolean {
@@ -43,7 +54,14 @@ function ExternalLink({
     <a
       href={href}
       onClick={(e) => {
-        if (!href || href.startsWith("#")) return;
+        // No usable address: a link still streaming in (its placeholder is
+        // blanked by react-markdown's URL filter), an unsafe one the filter
+        // removed, or `[x]()`. Following an empty href would reload the app.
+        if (!href) {
+          e.preventDefault();
+          return;
+        }
+        if (href.startsWith("#")) return;
         e.preventDefault();
         if (isExternalHref(href)) {
           void openUrl(href);
@@ -54,6 +72,46 @@ function ExternalLink({
     >
       {children}
     </a>
+  );
+}
+
+/**
+ * A markdown table inside its own sideways-scrolling frame. Cells wrap only
+ * between words (see `.md-table-scroll` in App.css), so when the columns'
+ * narrowest readable widths add up to more than the chat is wide, the frame
+ * scrolls instead of squeezing columns down to a letter each. The table keeps
+ * `display: table` (a block-display table loses its table semantics for
+ * VoiceOver), and the frame is focusable so a keyboard can scroll it.
+ */
+function ScrollTable({ children }: { children?: React.ReactNode }): React.ReactElement {
+  return (
+    <div className="md-table-scroll" tabIndex={0} role="region" aria-label="Table">
+      <table>{children}</table>
+    </div>
+  );
+}
+
+/** Cells with at least this much text are sentences, not labels. */
+const PROSE_CELL_CHARS = 24;
+
+/**
+ * A body cell. Sentence-length cells get a readable minimum width
+ * (`.md-cell-prose`), so a wide table scrolls instead of squeezing them into a
+ * word per line; short labels ("Low", "Done") keep their natural width. Only
+ * `style` (GFM column alignment) is carried over from the parser.
+ */
+function TableCell({
+  children,
+  style,
+}: {
+  children?: React.ReactNode;
+  style?: React.CSSProperties;
+}): React.ReactElement {
+  const prose = codeNodeText(children).length >= PROSE_CELL_CHARS;
+  return (
+    <td className={prose ? "md-cell-prose" : undefined} style={style}>
+      {children}
+    </td>
   );
 }
 
@@ -124,10 +182,11 @@ const PromptReadyContext = createContext(true);
 /**
  * Handler the "Send to GG Coder" button calls when clicked. App provides one
  * that pushes a shimmering "Sent to GG Coder" user bubble into the transcript
- * (like a slash command renders) and then sends the prompt. Defaults to null, in
- * which case the button falls back to sending directly with no transcript row
- * (safe for any render outside App). */
-const PromptSendContext = createContext<((text: string) => void) | null>(null);
+ * (like a slash command renders) and then sends the prompt. Resolves false when
+ * the prompt never reached the agent, so the button can offer it again. Defaults
+ * to null, in which case the button falls back to sending directly with no
+ * transcript row (safe for any render outside App). */
+const PromptSendContext = createContext<((text: string) => Promise<boolean>) | null>(null);
 
 /**
  * A Ken-recommended GG Coder prompt. Ken wraps every runnable prompt in a
@@ -146,9 +205,20 @@ function PromptBlock({ body }: { body: string }): React.ReactElement {
     // Route through App so it can render the shimmering "Sent to GG Coder" user
     // bubble; fall back to a direct send if no handler is provided. Stays "Sent"
     // (disabled) afterward so the user can see it landed and can't double-fire.
-    if (onSend) onSend(text);
-    else void sendPrompt(text).catch(() => {});
+    // A send that failed re-enables the button so the prompt isn't lost.
     setSent(true);
+    const delivered = onSend
+      ? onSend(text)
+      : sendPrompt(text).then(
+          () => true,
+          () => {
+            toast("Couldn't send the prompt to GG Coder. Try again.", "error");
+            return false;
+          },
+        );
+    void delivered.then((ok) => {
+      if (!ok) setSent(false);
+    });
   }, [body, onSend]);
   return (
     <div className="ken-prompt-block">
@@ -161,7 +231,7 @@ function PromptBlock({ body }: { body: string }): React.ReactElement {
           disabled={sent}
           title={sent ? "Sent to GG Coder" : "Send this prompt to GG Coder"}
         >
-          {sent ? <Check size={12} /> : <CornerDownLeft size={12} />}
+          {sent ? <CheckIcon size={12} /> : <ArrowElbowDownLeftIcon size={12} />}
           {sent ? "Sent" : "Send to GG Coder"}
         </button>
       )}
@@ -192,13 +262,13 @@ function CodeBlock({ children }: { children?: React.ReactNode }): React.ReactEle
   const [copied, setCopied] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const blockRef = useRef<HTMLDivElement>(null);
-  const captureHeight = useAnimatedHeight(blockRef, expanded);
 
   // Raw text drives both the copy fallback and the fold decision. The rendered
   // `children` is the highlighted tree; while folded we deliberately do NOT
   // mount it, so a thousand-line dump costs seven lines of DOM instead of a
   // thousand highlighted spans. That withheld markup is the memory win.
   const text = codeNodeText(children);
+  const captureHeight = useAnimatedHeight(blockRef, expanded, expanded ? text : undefined);
   const collapsible = shouldCollapseCode(text);
   const folded = collapsible && !expanded;
   const { preview, hiddenLines } = collapsedCode(text);
@@ -215,7 +285,7 @@ function CodeBlock({ children }: { children?: React.ReactNode }): React.ReactEle
         setCopied(true);
         setTimeout(() => setCopied(false), 1500);
       })
-      .catch(() => {});
+      .catch(() => toast("Couldn't copy to the clipboard.", "error"));
   }, [text]);
 
   return (
@@ -227,7 +297,7 @@ function CodeBlock({ children }: { children?: React.ReactNode }): React.ReactEle
         aria-label={copied ? "Copied" : "Copy code"}
         title={copied ? "Copied" : "Copy code"}
       >
-        {copied ? <Check size={12} /> : <Copy size={12} />}
+        {copied ? <CheckIcon size={12} /> : <CopyIcon size={12} />}
         {copied ? "Copied" : "Copy"}
       </button>
       <pre
@@ -289,7 +359,14 @@ function isPromptBlockComplete(raw: string): boolean {
 }
 
 const ANIMATED_PLUGINS = [rehypeHighlight, rehypeAnimateWords];
+/**
+ * How long a block keeps its word spans after a newer block starts below it.
+ * Covers the reveal catching up plus the word fade (`--dur-row`, 220ms), so the
+ * last words of a finished paragraph finish fading instead of snapping solid.
+ */
+const WORD_FADE_HOLD_MS = 450;
 const PLUGINS = [rehypeHighlight];
+const COMPONENTS = { a: ExternalLink, pre: PreBlock, table: ScrollTable, td: TableCell };
 
 const MemoizedMarkdownBlock = memo(
   function MarkdownBlock({
@@ -307,7 +384,7 @@ const MemoizedMarkdownBlock = memo(
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           rehypePlugins={animate ? ANIMATED_PLUGINS : PLUGINS}
-          components={{ a: ExternalLink, pre: PreBlock }}
+          components={COMPONENTS}
         >
           {normalized}
         </ReactMarkdown>
@@ -332,17 +409,42 @@ const MemoizedMarkdownBlock = memo(
 export const Markdown = memo(function Markdown({
   children,
   animate = false,
+  contentRef,
 }: Props): React.ReactElement {
   const blocks = useMemo(() => parseMarkdownIntoBlocks(children), [children]);
   const [rowExpanded, setRowExpanded] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
-  const captureHeight = useAnimatedHeight(rootRef, rowExpanded);
+  const ownRootRef = useRef<HTMLDivElement>(null);
+  const rootRef = contentRef ?? ownRootRef;
+  const captureHeight = useAnimatedHeight(rootRef, rowExpanded, rowExpanded ? children : undefined);
   // Oversized content mounts only its leading blocks. Fenced-code folding above
   // handles one huge block; this handles the other shape, hundreds of ordinary
   // blocks in a single row, which no per-block rule would catch.
   const visibleCount = useMemo(() => visibleBlockCount(blocks), [blocks]);
   const rowFolded = !rowExpanded && visibleCount < blocks.length;
   const visible = rowFolded ? blocks.slice(0, visibleCount) : blocks;
+  const lastIndex = visible.length - 1;
+  // Blocks from `spanFrom` on carry word spans while the row animates. A block
+  // that stops being the last one keeps them for WORD_FADE_HOLD_MS, so its
+  // final words finish fading; dropping them at once cut those fades short and
+  // the words snapped solid at the end of every paragraph. Blocks already on
+  // screen at mount (history) never get spans.
+  const [spanFrom, setSpanFrom] = useState(() => Math.max(0, lastIndex));
+  const holdTimers = useRef(new Set<number>());
+  useEffect(() => {
+    if (!animate || lastIndex <= spanFrom) return;
+    const timer = window.setTimeout(() => {
+      holdTimers.current.delete(timer);
+      setSpanFrom((prev) => Math.max(prev, lastIndex));
+    }, WORD_FADE_HOLD_MS);
+    holdTimers.current.add(timer);
+    // Not cleared on the next block: each finished block gets its full hold.
+  }, [animate, lastIndex, spanFrom]);
+  useEffect(() => {
+    const timers = holdTimers.current;
+    return () => {
+      for (const timer of timers) clearTimeout(timer);
+    };
+  }, []);
   return (
     <div ref={rootRef} className="markdown">
       {visible.map((block, index) => (
@@ -354,9 +456,10 @@ export const Markdown = memo(function Markdown({
           key={index}
           content={block}
           promptReady={isPromptBlockComplete(block)}
-          // Only the trailing block is still growing, so only it needs word
-          // spans; earlier blocks stay memoized and span-free.
-          animate={animate && index === visible.length - 1}
+          // Only the trailing block is still growing; the ones just above it
+          // keep their spans briefly so their last words finish fading. Older
+          // blocks stay memoized and span-free.
+          animate={animate && index >= spanFrom}
         />
       ))}
       {rowFolded && (

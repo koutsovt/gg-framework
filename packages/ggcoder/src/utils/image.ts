@@ -11,10 +11,10 @@ const execFileAsync = promisify(execFile);
 /**
  * Lazy `sharp` resolver — sharp is a hefty native module (libvips). Loading
  * it at module init pulls it into every consumer's bundle, which forces
- * downstream packages that don't actually need image manipulation (gg-boss)
+ * downstream packages that don't actually need image manipulation
  * to either ship it or break their bundlers. By gating the require behind
  * a function called only by the image-handling helpers, we let unused code
- * paths skip the import entirely — which lets gg-boss tsup-bundle cleanly
+ * paths skip the import entirely — which lets them bundle cleanly
  * without `sharp` in its dependency tree.
  *
  * Cached after first call so repeated image operations don't re-hit the
@@ -540,6 +540,24 @@ export async function downscaleForPreview(buffer: Buffer): Promise<Buffer> {
   } catch {
     return buffer;
   }
+}
+
+/**
+ * Inline previews (`details.imagePreviews`) for image blocks a tool returns
+ * without a file of its own (MCP servers). The chat only
+ * renders tool images from these previews, so a tool that skips them shows
+ * nothing live and only surfaces its images after a session reload.
+ */
+export async function previewsForImageBlocks(
+  blocks: readonly { type: string; mediaType?: string; data?: string }[],
+): Promise<{ base64: string; mediaType: string }[]> {
+  const previews: { base64: string; mediaType: string }[] = [];
+  for (const block of blocks) {
+    if (block.type !== "image" || !block.mediaType || !block.data) continue;
+    const preview = await downscaleForPreview(Buffer.from(block.data, "base64"));
+    previews.push({ base64: preview.toString("base64"), mediaType: block.mediaType });
+  }
+  return previews;
 }
 
 /**

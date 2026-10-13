@@ -1,5 +1,345 @@
 # @kenkaiiii/ggcoder
 
+## 5.79.4
+
+### Patch Changes
+
+- Updated dependencies
+  - @kenkaiiii/gg-core@5.79.4
+  - @kenkaiiii/gg-ai@5.79.4
+  - @kenkaiiii/gg-agent@5.79.4
+
+## 5.79.3
+
+### Patch Changes
+
+- Report the Steroids corpus size on disk, and give GG Goals' builder and checker workers the `steroids` tool with guidance to use it
+  - @kenkaiiii/gg-ai@5.79.3
+  - @kenkaiiii/gg-agent@5.79.3
+  - @kenkaiiii/gg-core@5.79.3
+
+## 5.79.2
+
+### Patch Changes
+
+- 6325d41: Fix three problems found in a long GG Goals run. A worker resumed with `followup_task` now gets folders attached to the goal after it started, so its write tool can reach them instead of the worker editing through the shell. Adding or removing a folder mid-conversation no longer rewrites the cached system prompt (which re-sent ~75k tokens uncached); the model is told through the environment-change note instead. Stale tool output is now pruned only once the context reaches half the compaction limit, since below that each prune re-sent far more uncached tokens than it freed.
+- Updated dependencies
+  - @kenkaiiii/gg-ai@5.79.2
+  - @kenkaiiii/gg-agent@5.79.2
+  - @kenkaiiii/gg-core@5.79.2
+
+## 5.79.1
+
+### Patch Changes
+
+- Give the agent style packs for languages detected mid-session through an appended update message (keeping the cached prompt intact), give code-writing sub-agents the same language guidance, make local endpoint saves lock-guarded and atomic so other gg-app.json settings are never lost, point Goal windows' git state at their attached project folder, and move auth provider metadata into `@kenkaiiii/gg-core` (re-exported from ggcoder).
+  - @kenkaiiii/gg-ai@5.79.1
+  - @kenkaiiii/gg-agent@5.79.1
+  - @kenkaiiii/gg-core@5.79.1
+
+## 5.79.0
+
+### Minor Changes
+
+- Add GG Goals (beta): a goal orchestrator that briefs with you, then drives the work itself or with a team of builder, scout, researcher and checker workers, with goal storage, sidecar goal routes, and questions that survive reload. The write tool now overwrites instead of refusing, listing and backing up unseen lines it removes, and sed/head line views count as reads.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.79.0
+- @kenkaiiii/gg-agent@5.79.0
+- @kenkaiiii/gg-core@5.79.0
+
+## 5.78.0
+
+### Minor Changes
+
+- Add a built-in `/commit` that runs the project's checks and tests, reviews, commits and pushes, and make it the verification point so plain replies no longer show unchecked edits as Unverified. Give Claude models a flat edit tool schema, cache Anthropic tool-loop turns at 5 minutes (1 hour kept on user messages), keep the working directory out of the cached system prompt, count checks with read-only commands around them as verification, and retry Cloudflare 520-524 provider errors.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.78.0
+- @kenkaiiii/gg-agent@5.78.0
+- @kenkaiiii/gg-core@5.78.0
+
+## 5.77.0
+
+### Patch Changes
+
+- Updated dependencies [60a2495]
+  - @kenkaiiii/gg-ai@5.77.0
+  - @kenkaiiii/gg-agent@5.77.0
+  - @kenkaiiii/gg-core@5.77.0
+
+## 5.76.0
+
+### Minor Changes
+
+- Add a Project Health scan and 0–100 score (file size, repo hygiene, safety net, debt markers) served to the app, let checklist records carry owner-accepted findings that no longer block a pass, and remove dead TUI code.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.76.0
+- @kenkaiiii/gg-agent@5.76.0
+- @kenkaiiii/gg-core@5.76.0
+
+## 5.75.1
+
+### Patch Changes
+
+- Share git/GitHub repo pollers across app windows on the same repo, recover Haiku 5.5's split `edits`/`new_text` edit arguments, and request "omitted" Anthropic adaptive thinking for faster Haiku 5.5 output.
+  - @kenkaiiii/gg-ai@5.75.1
+  - @kenkaiiii/gg-agent@5.75.1
+  - @kenkaiiii/gg-core@5.75.1
+
+## 5.75.0
+
+### Minor Changes
+
+- Add Claude Haiku 5.5 (1M context, 128K output, full low→max thinking) in place of Haiku 4.5, Kimi K2.7 Code HighSpeed on Moonshot, and Kimi K2.7 Code plus DeepSeek V4.1 Flash on Hugging Face (replacing Qwen3 Coder 480B). Anthropic thinking now streams as readable summaries instead of empty blocks, and Codex reasoning sections are separated. The system prompt shrank from ~31.5K to ~9.2K characters: rarely used tools are deferred and load automatically the first time the model calls them, and follow-up tools (`wait_agent`, `task_output`) are promoted as soon as their trigger runs. Checklist findings are flagged when the code has changed since they were recorded.
+
+### Patch Changes
+
+- 4f763ed: Add a "Don't embarrass me" checklist item. It reviews the project the way an experienced developer taking it over would. It flags rookie and unreviewed-AI tells such as committed junk, leftover AI notes and comments, duplicated libraries, silenced type checks and hard-coded values. Findings are ranked by how quickly a reviewer would spot them.
+- 4f763ed: Packages now declare Node.js 22 or newer as their supported runtime, matching what CI tests. `ggcoder` no longer ships its internal benchmark scripts in the npm tarball, and `gg-core` now has a README covering the model registry, auth storage and local-model discovery.
+- Updated dependencies [4f763ed]
+  - @kenkaiiii/gg-ai@5.75.0
+  - @kenkaiiii/gg-agent@5.75.0
+  - @kenkaiiii/gg-core@5.75.0
+
+## 5.74.3
+
+### Patch Changes
+
+- Fix plans getting stuck awaiting approval: the desktop review box now opens once a submitted plan is genuinely waiting on the user (including after autopilot hands it back, errors, or is skipped, and on reconnect), a run that stops mid-plan is reminded to submit, plan revisions run in read-only plan mode, and accepting a plan waits for background compaction.
+  - @kenkaiiii/gg-ai@5.74.3
+  - @kenkaiiii/gg-agent@5.74.3
+  - @kenkaiiii/gg-core@5.74.3
+
+## 5.74.2
+
+### Patch Changes
+
+- Skip verification feedback on exploration commands, accept harmless stderr redirects and `python -m ruff/mypy/pyright` as checks, defer `steroids`/`subagent` tools to cut the per-request prefix, and run only user-named checks
+  - @kenkaiiii/gg-ai@5.74.2
+  - @kenkaiiii/gg-agent@5.74.2
+  - @kenkaiiii/gg-core@5.74.2
+
+## 5.74.1
+
+### Patch Changes
+
+- Align OpenAI Ultra with Codex: Astra/Sol send `xhigh` effort for Ultra, OpenAI sub-agents inherit the parent's thinking level (capped to the child model's ladder), and the live system prompt's delegation policy refreshes when effort or model changes.
+  - @kenkaiiii/gg-ai@5.74.1
+  - @kenkaiiii/gg-agent@5.74.1
+  - @kenkaiiii/gg-core@5.74.1
+
+## 5.74.0
+
+### Minor Changes
+
+- Add a persistent project health checklist, clearer chat errors and recovery guidance, reliable plan-review handoffs, fail-fast verification feedback, and reference lookup for configless JavaScript projects.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.74.0
+- @kenkaiiii/gg-agent@5.74.0
+- @kenkaiiii/gg-core@5.74.0
+
+## 5.73.0
+
+### Minor Changes
+
+- Add a multi-file `files` form to the `edit` tool and tighten agent prompts (edit batching, bug fixes with a small regression test, preloaded instruction files, leaner skill loading) to cut model round trips; GG now edges out Codex on gpt-6-astra.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.73.0
+- @kenkaiiii/gg-agent@5.73.0
+- @kenkaiiii/gg-core@5.73.0
+
+## 5.72.0
+
+### Minor Changes
+
+- OpenAI requests (ChatGPT login and API key) now default to the faster request shape: gpt-5.6/gpt-6 models on the Codex route drop the Responses-Lite shape, so a response can carry several tool calls instead of one, and tools are sent without strict schemas, so calls no longer spell out every optional argument as null. Two new settings, `codexResponsesLite` and `codexStrictTools` (`auto`/`on`/`off`), restore the previous behaviour. Gemini no longer rejects every request whose tools use exclusive numeric bounds (zod `.positive()`/`.lt()`); they are rewritten to inclusive ones. In the desktop app, the `subagent` tool no longer crashes with "Unknown option '--thinking'": the sidecar's JSON mode now accepts the flag, and the flag-parity test covers it. `web_search` moves to the on-demand tool catalog, the `subagent` description points at `spawn_agent`'s agent roster instead of repeating it, and the system prompt, tool hints, Motion prompt and Motion skills are tightened.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.72.0
+- @kenkaiiii/gg-agent@5.72.0
+- @kenkaiiii/gg-core@5.72.0
+
+## 5.71.0
+
+### Minor Changes
+
+- Motion mode gains a shared animation kit (`library/kit/moves.js`) and new tools. The cue export (`bin/cues.mjs`) loads a composition in HyperFrames' Chrome and writes the sounds it marked with `kit.cue(tl, at, sfx)` to `cues.json` in root-timeline time, with the camera's speed curve, so retiming the animation moves every sound with its event. `bin/motion-blur.mjs` renders real motion blur, `bin/music-fit.mjs` cuts a music track to the picture's length on whole bars, and `bin/reference-study.mjs` measures a reference video's pace and cuts. The library adds 10 pieces (camera rig, chain knock, gather to logo, morph carry, one-shape journey, open from subject, request to result, scale dive, screen replica steps, zoom into card), and the Motion references and skills are expanded. The automatic Ideal review, the verification gate and the Motion check tool are removed, which makes turns shorter and cheaper; the `idealReviewEnabled` setting keeps its name and now switches only the loop-break and re-grounding nudges. A full-file `cat` in `bash` now counts as reading the file, so `edit`/`write` no longer ask for a redundant `read`. Images returned by MCP tools now show as previews, and restored sessions keep tool images clickable. OAuth token requests time out after 30 seconds instead of holding the auth lock forever, and the Telegram bot no longer hangs on a dead connection or spins on API errors. The bundled skills are refreshed.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.71.0
+- @kenkaiiii/gg-agent@5.71.0
+- @kenkaiiii/gg-core@5.71.0
+
+## 5.70.0
+
+### Minor Changes
+
+- Add a Node `debug` tool (breakpoints, stepping, evaluate), parent-set acceptance checks for helper agents, test-impact hints after edits, and repair hints for malformed tool calls. Long foreground commands now move to the background instead of being killed, sub-agents and compaction fall back to the active model when the chosen one is unavailable, and background commands are stopped before any slow teardown when the app quits.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.70.0
+- @kenkaiiii/gg-agent@5.70.0
+- @kenkaiiii/gg-core@5.70.0
+
+## 5.69.0
+
+### Minor Changes
+
+- Add cold prompt-cache detection, engine-generated receipts for helper agent reports, prompt-injection warnings on untrusted tool output, idle shutdown and progress-aware timeouts for MCP servers, instant interrupt of running tools on steering, smarter truncation notes, a hardened persistent shell, and a catastrophic-command guard that also catches Windows backslash paths.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.69.0
+- @kenkaiiii/gg-agent@5.69.0
+- @kenkaiiii/gg-core@5.69.0
+
+## 5.68.1
+
+### Patch Changes
+
+- Improve prompt-cache reuse in image-heavy conversations by pruning older images in batches, add content-free cache diagnostics, and speed up Motion source checks with bounded parallel browser pages.
+  - @kenkaiiii/gg-ai@5.68.1
+  - @kenkaiiii/gg-agent@5.68.1
+  - @kenkaiiii/gg-core@5.68.1
+
+## 5.68.0
+
+### Minor Changes
+
+- Add keep-awake while the agent works, user/project stream rules, soft ask_user deadlines with late answers, shell/package/destructive-git threat guards, and plan-step compaction policy
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.68.0
+- @kenkaiiii/gg-agent@5.68.0
+- @kenkaiiii/gg-core@5.68.0
+
+## 5.67.1
+
+### Patch Changes
+
+- Fix Autopilot review: list the files changed this turn, keep the corpus warning on the verdict line, frame reviews as machine reviews, and stop unrecognized read-only checks from leaving verified work stuck Unverified.
+  - @kenkaiiii/gg-ai@5.67.1
+  - @kenkaiiii/gg-agent@5.67.1
+  - @kenkaiiii/gg-core@5.67.1
+
+## 5.67.0
+
+### Minor Changes
+
+- GG Motion now screens every render for harmful flashing (WCAG 2.3.1, more than three flashes a second), reports audio loudness and true peak instead of a bare pass/fail, and asks a few plain-language questions before starting a new video from an open prompt.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.67.0
+- @kenkaiiii/gg-agent@5.67.0
+- @kenkaiiii/gg-core@5.67.0
+
+## 5.66.4
+
+### Patch Changes
+
+- Project discovery no longer lists folders the user never worked in. A hidden folder, or a folder inside one, is never inferred as a projects root, so tool folders like `<repo>/.gg` stop filling the picker with their `uploads`, `plans`, `skills` and PR worktrees; roots configured in settings are still always scanned. A GG Coder session store only counts once one of its sessions records a message (the rule `listRecentSessions` already used), so sessions that were started but never used no longer add projects or refresh a project's last-active time. The sub-agent worker now finishes writing its durable turn record before announcing the turn as done, so an adopting parent never sees a finished turn with no record behind it.
+  - @kenkaiiii/gg-ai@5.66.4
+  - @kenkaiiii/gg-agent@5.66.4
+  - @kenkaiiii/gg-core@5.66.4
+
+## 5.66.3
+
+### Patch Changes
+
+- 946c459: Close six gaps found in the ecosystem scan. Secret redaction now hides the whole password in URLs with no username (`redis://:pw@host`) or an `@` inside the password, both of which previously leaked. ChatGPT-login replies cut off at the output limit now report `max_tokens` (so the agent continues them) instead of passing as finished, a stream that ends early is retried instead of running a tool call with cut-off arguments, and reasoning that only led into a dropped call is no longer replayed. `write` now refuses to overwrite a file the model has only partly read (offset/limit or the 2000-line cap) and names the unread lines, and clearing, rewinding, branching or resuming a conversation makes the model re-read files before changing them. `bash` no longer runs a command whose Stop arrived during sandbox setup, and no longer hangs until the timeout when a command leaves a process running with `&`. Invisible characters are stripped from AGENTS.md/CLAUDE.md, skills, agent files and custom commands before they reach the model. The OS sandbox library is updated to 0.0.78, which fixes a Linux race that could leave a protected file unprotected.
+- Updated dependencies [946c459]
+  - @kenkaiiii/gg-ai@5.66.3
+  - @kenkaiiii/gg-agent@5.66.3
+  - @kenkaiiii/gg-core@5.66.3
+
+## 5.66.2
+
+### Patch Changes
+
+- Sub-agents that reach their time limit now answer from what they gathered instead of coming back empty. The independent Ideal reviewer gets its own 2-minute turn limit followed by the tool-free recovery turn, rather than being killed by the parent's wait with no verdict, and the recovery turn is capped at the plan-mode effort ceiling, since at full effort it could spend its 60 seconds thinking and return nothing. `motion_check` adds a `spot: true` mode that runs the layout audit on only the rendered frames inside the given windows (at most 240) and never counts as delivery verification, reuses a passing source audit while the project source is unchanged, lists every distinct error that fits the report instead of only the first 15, and names stale holds alongside the freezes it detected so a hold plan is fixed in one step.
+  - @kenkaiiii/gg-ai@5.66.2
+  - @kenkaiiii/gg-agent@5.66.2
+  - @kenkaiiii/gg-core@5.66.2
+
+## 5.66.1
+
+### Patch Changes
+
+- Updated dependencies [7dd643f]
+  - @kenkaiiii/gg-ai@5.66.1
+  - @kenkaiiii/gg-agent@5.66.1
+  - @kenkaiiii/gg-core@5.66.1
+
+## 5.66.0
+
+### Minor Changes
+
+- Add GG Motion, the desktop app's video workspace: it plans, designs and renders MP4 videos from a prompt, using bundled fonts, music, sound effects, a style library and 3D, and designs every video from a shared motion-language guide rather than fixed templates. Motion is still a work in progress; `max` thinking gives the best results. Replace Claude Sonnet 5 with Claude Sonnet 5.5 (same 1M context and 128K output, now with `xhigh`) as the Anthropic default and compaction model. Sub-agent turns that stop on a loop error now fail instead of passing the child's mid-task narration off as its answer, and the `read` tool's error explains that `offset` takes one line number, not a range.
+- 331e868: Replace GPT-6 Sol with GPT-6.1 Sol (`gpt-6.1-sol`, released 2026-09-29). It keeps Sol's shape — 1.05M context on the public Responses API, 272K on the ChatGPT OAuth/Codex route, 128K output, text+image input, $2/$10 per MTok (cached input $0.10) — but now starts at `low` effort, matching OpenAI's Codex catalog. It runs the full ladder up to `ultra`, where it gets the proactive async-subagent orchestration prompt.
+
+  GPT-6.1 Sol is the new OpenAI default (registry, CLI, benchmarks), and GPT-6 Luna stays the fast subagent model. The login hub, footer names, README, and the "not in catalog" error hint now say GPT-6.1 Sol. `gpt-6-sol` is retired: a saved session still on it falls back to the provider default on next start. GPT-6 ids with a point release (`gpt-6.1-*`) now get the Codex responses-lite transport and the six-rung effort ladder; a bare `gpt-6-` prefix check would have missed them.
+
+### Patch Changes
+
+- Updated dependencies
+- Updated dependencies [331e868]
+  - @kenkaiiii/gg-ai@5.66.0
+  - @kenkaiiii/gg-core@5.66.0
+  - @kenkaiiii/gg-agent@5.66.0
+
+## 5.65.1
+
+### Patch Changes
+
+- Expose in-flight LSP call counts on the language-server pool and speed up the ACP and background-process test suites.
+  - @kenkaiiii/gg-ai@5.65.1
+  - @kenkaiiii/gg-agent@5.65.1
+  - @kenkaiiii/gg-core@5.65.1
+
+## 5.65.0
+
+### Minor Changes
+
+- Add Kimi K2.8 Preview (Kimi sign-in), DeepSeek V4.1 Flash with image input, Sakana Fugu Max, and Qwen3.8 Max as the OpenRouter default; retire DeepSeek V4 Flash ids; refresh expired OAuth credentials reached through model storage keys; stop `git status` preludes from re-arming the verification gate.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.65.0
+- @kenkaiiii/gg-agent@5.65.0
+- @kenkaiiii/gg-core@5.65.0
+
+## 5.64.3
+
+### Patch Changes
+
+- Stop the stream stall watchdog from killing large tool-call edits and long silent thinking: 5min idle budget inside an open tool call, 10min/15min silent-thinking idle/hard caps, thinking-aware non-streaming fallback cap, and visible retries after a long failed attempt.
+  - @kenkaiiii/gg-ai@5.64.3
+  - @kenkaiiii/gg-agent@5.64.3
+  - @kenkaiiii/gg-core@5.64.3
+
+## 5.64.2
+
+### Patch Changes
+
+- Fix redaction marking objects shared by siblings as `[CIRCULAR]`, which corrupted `ask_user` frames with several yes/no questions and blanked the desktop app.
+  - @kenkaiiii/gg-ai@5.64.2
+  - @kenkaiiii/gg-agent@5.64.2
+  - @kenkaiiii/gg-core@5.64.2
+
 ## 5.64.1
 
 ### Patch Changes

@@ -16,10 +16,17 @@ vi.mock("./agent", () => ({
 }));
 
 import { listModels } from "./agent";
+import { playSound } from "./sounds";
 import { useAgentEvents, type AgentEventsDeps } from "./useAgentEvents";
+import { createLiveTextStore } from "./live-text";
 import type { Item } from "./App";
 import type { AgentState, SidecarEvent } from "./agent";
 import type { LiveToolEntry } from "./LiveToolPanel";
+import { collectFloorAgents, type CritterGroup } from "./CritterFloor";
+import { collectWorldAgents, goalViewFor } from "./goal-world-agents";
+import { buildFarm } from "./goal-farm-map";
+import { createFarmWorld, stepFarm, syncFarm } from "./goal-farm-sim";
+import { EMPTY_TALLY, floorPhase, tallyGoal } from "./goal-progress";
 
 const ev = (type: string, data: Record<string, unknown> = {}): SidecarEvent =>
   ({ type, data }) as SidecarEvent;
@@ -87,7 +94,7 @@ function setup(
     setState,
     setTasks: noop as unknown as AgentEventsDeps["setTasks"],
     setProjectTasks: noop as unknown as AgentEventsDeps["setProjectTasks"],
-    setStatus: noop as unknown as AgentEventsDeps["setStatus"],
+    setStatus: vi.fn<AgentEventsDeps["setStatus"]>(),
     setRunning,
     setLiveToolFeed,
     setTokens,
@@ -112,6 +119,7 @@ function setup(
     planReviewPathRef: { current: null },
     pendingPlanTotalRef: { current: null },
     stickToBottomRef: { current: true },
+    liveText: createLiveTextStore(),
   };
 
   const hook = renderHook(() => useAgentEvents(deps));
@@ -154,7 +162,71 @@ describe("useAgentEvents", () => {
     expect(deps.planDoneRef.current).toEqual(new Set([1, 2]));
   });
 
+  it("reports how each run ended, with its turns and tokens, for the goal finish card", () => {
+    const { hook, deps } = setup();
+    const onRunEnd = vi.fn<NonNullable<AgentEventsDeps["onRunEnd"]>>();
+    deps.onRunEnd = onRunEnd;
+    hook.rerender();
+    act(() => hook.result.current.handleEvent(ev("run_start", {})));
+    act(() => hook.result.current.handleEvent(ev("turn_end", { usage: { outputTokens: 300 } })));
+    act(() => hook.result.current.handleEvent(ev("turn_end", { usage: { outputTokens: 200 } })));
+    act(() => hook.result.current.handleEvent(ev("run_end", {})));
+    expect(onRunEnd).toHaveBeenLastCalledWith(
+      expect.objectContaining({ turns: 2, outputTokens: 500, outcome: "done" }),
+    );
+    act(() => hook.result.current.handleEvent(ev("run_start", {})));
+    act(() => hook.result.current.handleEvent(ev("run_end", { cancelled: true })));
+    expect(onRunEnd).toHaveBeenLastCalledWith(
+      expect.objectContaining({ turns: 0, outcome: "cancelled" }),
+    );
+  });
+
   beforeEach(() => vi.clearAllMocks());
+
+  describe("run-end sounds", () => {
+    const sounds = (): unknown[] => vi.mocked(playSound).mock.calls.map(([s]) => s);
+
+    it("plays done for a clean run", () => {
+      const { hook } = setup();
+      act(() => hook.result.current.handleEvent(ev("run_start", {})));
+      act(() => hook.result.current.handleEvent(ev("run_end", { failed: false })));
+      expect(sounds()).toEqual(["done"]);
+    });
+
+    it("plays error, not done, when the agent errored but the run settled", () => {
+      // The loop yields an error frame and returns, so run_end says failed:false.
+      const { hook } = setup();
+      act(() => hook.result.current.handleEvent(ev("run_start", {})));
+      act(() => hook.result.current.handleEvent(ev("error", { headline: "Provider error" })));
+      act(() => hook.result.current.handleEvent(ev("run_end", { failed: false })));
+      expect(sounds()).toEqual(["error"]);
+      // The next clean run is "done" again.
+      act(() => hook.result.current.handleEvent(ev("run_start", {})));
+      act(() => hook.result.current.handleEvent(ev("run_end", { failed: false })));
+      expect(sounds()).toEqual(["error", "done"]);
+    });
+
+    it("plays error for a failed run", () => {
+      const { hook } = setup();
+      act(() => hook.result.current.handleEvent(ev("run_start", {})));
+      act(() => hook.result.current.handleEvent(ev("run_end", { failed: true })));
+      expect(sounds()).toEqual(["error"]);
+    });
+
+    it("stays silent on a cancel, even after an error frame", () => {
+      const { hook } = setup();
+      act(() => hook.result.current.handleEvent(ev("run_start", {})));
+      act(() => hook.result.current.handleEvent(ev("error", { headline: "Aborted" })));
+      act(() => hook.result.current.handleEvent(ev("run_end", { cancelled: true })));
+      expect(sounds()).toEqual([]);
+    });
+
+    it("sounds an error that lands outside any run at once", () => {
+      const { hook } = setup();
+      act(() => hook.result.current.handleEvent(ev("error", { headline: "Compaction failed" })));
+      expect(sounds()).toEqual(["error"]);
+    });
+  });
 
   describe("queued pill lifecycle", () => {
     it("removes the cancelled duplicate, not the identical message still pending", () => {
@@ -459,6 +531,24 @@ describe("useAgentEvents", () => {
     expect(getItems()).toEqual([]);
   });
 
+  it("drops the aborted draft and shows a notice when a stream rule fires", () => {
+    const { hook, getItems } = setup();
+
+    act(() => {
+      hook.result.current.handleEvent(ev("text_delta", { text: "TODO: later" }));
+      hook.result.current.handleEvent(
+        ev("stream_rule_triggered", { rules: ["no-todo"], source: "text" }),
+      );
+    });
+
+    expect(getItems()).toEqual([
+      expect.objectContaining({
+        kind: "info",
+        text: 'Rule "no-todo" caught the reply mid-stream — retrying',
+      }),
+    ]);
+  });
+
   it("completes the notice when messages were compacted", () => {
     const { hook, getItems } = setup();
 
@@ -507,6 +597,64 @@ describe("useAgentEvents", () => {
     act(() => hook.result.current.handleEvent(ev("run_end", { cancelled: true })));
     expect(getState()).toMatchObject({ running: false, runState: "idle" });
     expect(setRunning).toHaveBeenLastCalledWith(false);
+  });
+
+  it("restores the empty-session welcome state after cancelling then starting a new session", () => {
+    const { hook, deps, getItems, pushUserItem } = setup();
+    pushUserItem("Stop this run", false);
+    act(() => {
+      hook.result.current.handleEvent(ev("run_start"));
+      hook.result.current.handleEvent(ev("run_cancelling"));
+      hook.result.current.handleEvent(ev("run_end", { cancelled: true }));
+    });
+    expect(deps.setStatus).toHaveBeenLastCalledWith("cancelled");
+    expect(getItems()).toHaveLength(1);
+
+    act(() => hook.result.current.handleEvent(ev("session_reset")));
+
+    expect(getItems()).toEqual([]);
+    expect(deps.setStatus).toHaveBeenLastCalledWith("ready");
+    expect(deps.setDoneStatus).toHaveBeenLastCalledWith(null);
+  });
+
+  describe("cold-cache notice status", () => {
+    const expired = {
+      sessionId: "old",
+      provider: "anthropic",
+      ttlMs: 300_000,
+      confidence: "documented",
+      ttlSource: "test",
+      lastRequestAt: 1,
+      expiresAt: 300_001,
+      expired: true,
+      reason: "idle",
+      prefixTokens: 358_000,
+      minTokens: 40_000,
+      notable: true,
+      estimatedExtraCostUsd: null,
+    } as unknown as NonNullable<AgentState["cacheExpiry"]>;
+
+    it("clears the previous chat's status when a fresh session starts", () => {
+      const { hook, getState } = setup(() => false, { cacheExpiry: expired });
+
+      act(() => hook.result.current.handleEvent(ev("session_reset")));
+
+      expect(getState()?.cacheExpiry).toBeNull();
+    });
+
+    it("applies live cache_expiry pushes, including null", () => {
+      const { hook, getState } = setup();
+
+      act(() =>
+        hook.result.current.handleEvent({ type: "cache_expiry", data: expired } as SidecarEvent),
+      );
+      expect(getState()?.cacheExpiry).toEqual(expired);
+
+      act(() =>
+        hook.result.current.handleEvent({ type: "cache_expiry", data: null } as SidecarEvent),
+      );
+      expect(getState()?.cacheExpiry).toBeNull();
+    });
   });
 
   it("refreshes branch and uncommitted-file count from workspace extras", () => {
@@ -563,6 +711,44 @@ describe("useAgentEvents", () => {
     items = getItems();
     expect(items).toHaveLength(1);
     expect(items[0]).toMatchObject({ kind: "assistant", text: "Hello world" });
+  });
+
+  it("grows a streaming reply in the live-text store, not the transcript, until it ends", () => {
+    vi.useFakeTimers();
+    try {
+      const { hook, deps, getItems } = setup();
+      act(() => hook.result.current.handleEvent(ev("text_delta", { text: "Hello" })));
+      const before = getItems();
+      const id = before[0]?.id ?? -1;
+
+      // Mid-stream flushes reach only the live-text store: the transcript
+      // array (and so the whole App) is untouched while the reply grows.
+      act(() => {
+        hook.result.current.handleEvent(ev("text_delta", { text: " there" }));
+        vi.advanceTimersByTime(100);
+        hook.result.current.handleEvent(ev("text_delta", { text: " world" }));
+        vi.advanceTimersByTime(100);
+      });
+      expect(getItems()).toBe(before);
+      expect(deps.liveText.get(id)).toBe("Hello there world");
+
+      // The end of the stream writes the final text into the transcript once
+      // and releases the store entry.
+      act(() => hook.result.current.endStreamingText());
+      expect(getItems()[0]).toMatchObject({ kind: "assistant", text: "Hello there world" });
+      expect(deps.liveText.get(id)).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases a streaming reply's live text when the session resets", () => {
+    const { hook, deps, getItems } = setup();
+    act(() => hook.result.current.handleEvent(ev("text_delta", { text: "Hello" })));
+    const id = getItems()[0]?.id ?? -1;
+    act(() => hook.result.current.handleEvent(ev("session_reset")));
+    expect(getItems()).toEqual([]);
+    expect(deps.liveText.get(id)).toBeUndefined();
   });
 
   it("keeps raw diagnostics out of chat without interrupting plan progress", () => {
@@ -842,6 +1028,10 @@ describe("useAgentEvents", () => {
           headline: "Anthropic usage limit reached.",
           message: "Your Anthropic usage is finished. It resets at 12:50 PM.",
           guidance: "Try again once it's back. Your conversation is preserved.",
+          reason: "usage_limit",
+          resetsAt: 1_800_000_000,
+          occurredAt: 1_799_000_000_000,
+          provider: "anthropic",
         }),
       );
     });
@@ -852,6 +1042,10 @@ describe("useAgentEvents", () => {
       headline: "Anthropic usage limit reached.",
       message: "Your Anthropic usage is finished. It resets at 12:50 PM.",
       guidance: "Try again once it's back. Your conversation is preserved.",
+      reason: "usage_limit",
+      resetsAt: 1_800_000_000,
+      occurredAt: 1_799_000_000_000,
+      provider: "anthropic",
     });
   });
 
@@ -882,6 +1076,29 @@ describe("useAgentEvents", () => {
     });
     feed = getLiveToolFeed();
     expect(feed[0]).toMatchObject({ toolCallId: "t1", status: "done" });
+  });
+
+  it("keeps an image placeholder until its own generate_image call ends", () => {
+    const { hook, getItems } = setup();
+    act(() => {
+      hook.result.current.handleEvent(
+        ev("tool_call_start", {
+          toolCallId: "g1",
+          name: "generate_image",
+          args: { prompt: "a cat" },
+        }),
+      );
+      hook.result.current.handleEvent(
+        ev("tool_call_start", { toolCallId: "r1", name: "read", args: { file_path: "a.ts" } }),
+      );
+      hook.result.current.handleEvent(ev("tool_call_end", { toolCallId: "r1", isError: false }));
+    });
+    expect(getItems().filter((it) => it.kind === "generating_image")).toHaveLength(1);
+
+    act(() => {
+      hook.result.current.handleEvent(ev("tool_call_end", { toolCallId: "g1", isError: false }));
+    });
+    expect(getItems().filter((it) => it.kind === "generating_image")).toHaveLength(0);
   });
 
   it("turn_end accumulates output tokens across turns", () => {
@@ -953,27 +1170,45 @@ describe("useAgentEvents", () => {
     expect(getState()).toMatchObject({ kenModel: "claude-opus-5-5", kenModelOverride: false });
   });
 
-  it("plan_exit opens the human review modal when autopilot is off", () => {
-    const { hook, getPlanReview } = setup(() => false, { autopilot: false });
-    act(() => {
-      hook.result.current.handleEvent(
-        ev("plan_exit", { planPath: "/tmp/p.md", content: "# Plan" }),
-      );
-    });
-    expect(getPlanReview()).toBe("# Plan");
-  });
+  it.each([false, true])(
+    "plan_exit stashes the plan but waits for the sidecar to open the box (autopilot %s)",
+    (autopilot) => {
+      const { hook, getPlanReview, deps } = setup(() => false, { autopilot });
+      act(() => {
+        hook.result.current.handleEvent(
+          ev("plan_exit", { planPath: "/tmp/p.md", content: "# Plan" }),
+        );
+      });
+      // Opening here let Accept land while the submitting run was still
+      // finishing — the sidecar refused it and the plan sat in limbo.
+      expect(getPlanReview()).toBeNull();
+      expect(deps.planReviewPathRef.current).toBe("/tmp/p.md");
+    },
+  );
 
-  it("plan_exit hides the human review modal when autopilot is on", () => {
+  it("plan_review opens the human review box, even with autopilot on", () => {
     const { hook, getPlanReview, deps } = setup(() => false, { autopilot: true });
     act(() => {
       hook.result.current.handleEvent(
-        ev("plan_exit", { planPath: "/tmp/p.md", content: "# Plan" }),
+        ev("plan_review", { planPath: "/tmp/q.md", content: "# Plan Q" }),
       );
     });
-    // The content/path are still stashed for Ken auto-review + auto-accept step
-    // counting, but the human overlay stays hidden while autopilot owns review.
-    expect(getPlanReview()).toBeNull();
-    expect(deps.planReviewPathRef.current).toBe("/tmp/p.md");
+    expect(getPlanReview()).toBe("# Plan Q");
+    expect(deps.planReviewPathRef.current).toBe("/tmp/q.md");
+  });
+
+  it("ready re-opens the review box for a plan still waiting after a reconnect", () => {
+    const { hook, getPlanReview, deps } = setup();
+    act(() => {
+      hook.result.current.handleEvent(
+        ev("ready", {
+          running: false,
+          pendingPlan: { planPath: "/tmp/r.md", content: "# Plan R" },
+        }),
+      );
+    });
+    expect(getPlanReview()).toBe("# Plan R");
+    expect(deps.planReviewPathRef.current).toBe("/tmp/r.md");
   });
 
   it("autopilot_plan_accepted seeds the plan step count and pushes the marker", () => {
@@ -1024,7 +1259,7 @@ describe("useAgentEvents", () => {
     const { hook, getPlanReview } = setup();
     act(() => {
       hook.result.current.handleEvent(
-        ev("plan_exit", { planPath: "/tmp/p.md", content: "# Plan" }),
+        ev("plan_review", { planPath: "/tmp/p.md", content: "# Plan" }),
       );
     });
     expect(getPlanReview()).toBe("# Plan");
@@ -1159,6 +1394,135 @@ describe("useAgentEvents", () => {
     expect(groups[1]?.kind === "subagent_group" ? groups[1].agents : []).toMatchObject([
       { toolCallId: "new-agent", status: "starting" },
     ]);
+  });
+});
+
+describe("goal start to workers on the farm", () => {
+  it("opens Workers when the goal starts, and walks each spawned worker to its work", async () => {
+    // The whole chain after "Start the goal now", from the sidecar's events:
+    // goal_state flips the window to Workers (the chat stays one switch
+    // away), and every worker GG Goals spawns becomes a critter at the
+    // station for the tool it's using.
+    const goal = { id: "g-1", name: "Ship it", needsKickoff: false, phase: "briefing" as const };
+    const { hook, getItems, getState } = setup(() => false, { goal });
+    expect(goalViewFor(getState()?.goal, null).view).toBeNull();
+
+    act(() => hook.result.current.handleEvent(ev("goal_state", { id: "g-1", phase: "active" })));
+    expect(goalViewFor(getState()?.goal, null)).toEqual({ activeGoalId: "g-1", view: "workers" });
+    expect(goalViewFor(getState()?.goal, "g-1").view).toBe("chat");
+    // Another goal's event changes nothing.
+    act(() =>
+      hook.result.current.handleEvent(ev("goal_state", { id: "other", phase: "briefing" })),
+    );
+    expect(getState()?.goal?.phase).toBe("active");
+    // Pausing and resuming show on the goal.
+    act(() =>
+      hook.result.current.handleEvent(
+        ev("goal_state", { id: "g-1", phase: "active", paused: true }),
+      ),
+    );
+    expect(getState()?.goal?.paused).toBe(true);
+    act(() =>
+      hook.result.current.handleEvent(
+        ev("goal_state", { id: "g-1", phase: "active", paused: false }),
+      ),
+    );
+    expect(getState()?.goal?.paused).toBe(false);
+
+    const worker = (id: string, name: string, activity: string) => ({
+      agent_id: id,
+      task_name: name,
+      state: "running",
+      started_at: 1,
+      updated_at: 2,
+      elapsed_ms: 10,
+      turn_count: 1,
+      tool_use_count: 1,
+      token_usage: { input: 0, output: 0 },
+      // The worker's current tool, as SubAgentManager reports it.
+      current_activity: activity,
+    });
+    act(() => {
+      hook.result.current.handleEvent(
+        ev("subagent_state", worker("w-read", "Map the code", "read: src/auth.ts")),
+      );
+      hook.result.current.handleEvent(
+        ev("subagent_state", worker("w-edit", "Fix login", "edit: src/login.ts")),
+      );
+      hook.result.current.handleEvent(
+        ev("subagent_state", worker("w-run", "Run tests", "bash: pnpm test")),
+      );
+    });
+    await flushSubagents();
+
+    const groups = getItems().filter(
+      (item): item is Extract<Item, { kind: "subagent_group" }> & CritterGroup =>
+        item.kind === "subagent_group",
+    );
+    const workers = collectFloorAgents(groups);
+    expect(workers.map((w) => w.activity)).toEqual([
+      "read: src/auth.ts",
+      "edit: src/login.ts",
+      "bash: pnpm test",
+    ]);
+
+    const agents = collectWorldAgents({
+      running: true,
+      liveTools: [],
+      waitingOnUser: false,
+      workers,
+    });
+    expect(agents.slice(1).map((a) => [a.kind, a.status])).toEqual([
+      ["read", "working"],
+      ["edit", "working"],
+      ["run", "working"],
+    ]);
+    const world = createFarmWorld(buildFarm(), () => 0.5);
+    for (let t = 0; t <= 40_000; t += 100) {
+      syncFarm(world, agents, t);
+      stepFarm(world, t);
+    }
+    const stations = workers.map((w) => world.actors.get(w.key)?.station);
+    expect(stations).toEqual(["bookcase", "workbench", "machine"]);
+
+    // One finishes ("completed": its task is done, kept for a follow-up). The
+    // same events that drive the open Workers view drop it at once: it walks
+    // off the farm and the header counts one fewer working, one done.
+    act(() => {
+      hook.result.current.handleEvent(
+        ev("subagent_state", {
+          ...worker("w-read", "Map the code", "read: src/auth.ts"),
+          state: "completed",
+        }),
+      );
+    });
+    await flushSubagents();
+    const after = collectFloorAgents(
+      getItems().filter(
+        (item): item is Extract<Item, { kind: "subagent_group" }> & CritterGroup =>
+          item.kind === "subagent_group",
+      ),
+    );
+    const tally = tallyGoal(
+      tallyGoal(
+        EMPTY_TALLY,
+        workers.map((w) => ({ key: w.key, phase: floorPhase(w.status) })),
+      ),
+      after.map((w) => ({ key: w.key, phase: floorPhase(w.status) })),
+    );
+    expect([tally.working, tally.done]).toEqual([2, 1]);
+    const next = collectWorldAgents({
+      running: true,
+      liveTools: [],
+      waitingOnUser: false,
+      workers: after,
+    });
+    for (let t = 40_100; t <= 80_000; t += 100) {
+      syncFarm(world, next, t);
+      stepFarm(world, t);
+    }
+    expect(world.actors.has(workers[0]?.key ?? "")).toBe(false);
+    expect(world.actors.get(workers[1]?.key ?? "")?.state).toBe("working");
   });
 });
 

@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
+import { statSync } from "node:fs";
 import path from "node:path";
 import type { Message, Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
 import { getAppPaths } from "@kenkaiiii/gg-core";
@@ -8,7 +9,9 @@ import { mcpServersForAgent, type AgentDefinition } from "./agents.js";
 import { SubAgentStore, type PersistedSubAgentRecord } from "./subagent-store.js";
 import { SessionManager } from "./session-manager.js";
 import { log } from "./logger.js";
+import { withContextFiles } from "./context-files.js";
 import type { AgentNotificationQueue } from "./agent-notifications.js";
+import type { AcceptanceCheck } from "./acceptance-checks.js";
 import {
   clearTurnRecord,
   readTurnRecord,
@@ -17,10 +20,10 @@ import {
 import {
   boundSubAgentOutput,
   childSubAgentEnv,
-  childThinkingLevel,
   resolveSubAgentCliEntry,
   selectSubAgent,
   subAgentCacheKey,
+  subAgentThinkingLevel,
   type SubAgentTokenUsage,
   SUB_AGENT_MAX_STDERR_CHARS,
   SUB_AGENT_TIMEOUT_MS,
@@ -41,27 +44,70 @@ export interface SubAgentSnapshot {
   tool_use_count: number;
   token_usage: SubAgentTokenUsage;
   output?: string;
+  /**
+   * Engine-built receipt of the last turn's tool calls plus any paths the
+   * report names that the child never opened. Kept apart from `output` so
+   * wait()'s head truncation can never cut it and output parsers (the ideal
+   * reviewer) see the child's prose unchanged.
+   */
+  receipt?: string;
+  /**
+   * One-line verdict of the parent's acceptance checks for the last turn
+   * (`2/3 passed, 1 unverified`); the per-check lines ride in `receipt`.
+   */
+  acceptance?: string;
   error?: string;
   agent_name?: string;
   provider?: string;
   model?: string;
   child_session_id?: string;
   child_session_path?: string;
+  /** Folder the child works in, when it isn't the parent's cwd. */
+  cwd?: string;
   collected?: boolean;
   recovered?: boolean;
 }
 
+/** A provider and model for spawned children (GG Goals' "Critters" pick). */
+export interface ChildModelPick {
+  provider: Provider;
+  model: string;
+}
+
 export interface SubAgentManagerOptions {
   cwd: string;
+  /**
+   * Other folders a child may be started in (the parent's extra workspace
+   * roots). A child's `cwd` must be the parent's cwd, one of these, or inside
+   * one of them; anything else is refused. Read at spawn time.
+   */
+  getWorkspaceRoots?: () => readonly string[];
+  /**
+   * Start each child with those roots too (less its own folder), so it can
+   * read and change all of them, not just the folder it works in.
+   */
+  shareWorkspaceRoots?: boolean;
+  /**
+   * The agent a child is when the spawn names none. Unset, such a child runs
+   * with no agent prompt and the full tool set (GG Coder's default). GG Goals
+   * sets its builder, so no worker ever runs outside its team's rules.
+   */
+  defaultAgent?: string;
   agents: AgentDefinition[];
   getProvider: () => Provider;
   getModel: () => string;
-  getThinkingLevel: () => ThinkingLevel | undefined;
+  /**
+   * The provider and model children run on when their agent names no model of
+   * its own (GG Goals' "Critters" pick). Undefined: the parent's. Read at
+   * spawn time, so a change applies to the next worker started.
+   */
+  getChildModel?: () => ChildModelPick | undefined;
+  getThinkingLevel?: () => ThinkingLevel | undefined;
   getCacheKey?: () => string | undefined;
   getBaseUrl?: () => string | undefined;
   /** Optional per-model concurrency cap (subagentMaxPerModel setting). Counted
-   *  against the RESOLVED child model — read-only agents may run on the fast
-   *  model, so they count under that model, not the parent's. Only ever
+   *  against the RESOLVED child model — an agent pinned to its own model id
+   *  counts under that model, not the parent's. Only ever
    *  reduces concurrency below the global ACTIVE_LIMIT. */
   getMaxPerModel?: () => number | undefined;
   onState?: (snapshot: SubAgentSnapshot) => void;
@@ -93,7 +139,8 @@ interface WorkerRecord extends SubAgentSnapshot {
   turnResolvers: Set<() => void>;
 }
 
-const ACTIVE_LIMIT = 8;
+/** Children that may be starting or running at once. */
+export const ACTIVE_LIMIT = 8;
 const RETAINED_WORKER_LIMIT = 8;
 const SNAPSHOT_LIMIT = 20;
 /**
@@ -157,6 +204,8 @@ export class SubAgentManager {
   private readonly listeners = new Set<(snapshot: SubAgentSnapshot) => void>();
   private shuttingDown = false;
   private shutdownPromise?: Promise<void>;
+  /** Background retention started by `hydrate`; never rejects. */
+  private retention: Promise<void> = Promise.resolve();
   private readonly store: SubAgentStore;
   private readonly sessionRootDir: string;
   private parentSessionId?: string;
@@ -168,6 +217,11 @@ export class SubAgentManager {
   private persistScheduled = false;
 
   /** Agent definitions `spawn` resolves names against — the delegation roster. */
+  /** The agent a child is when its spawn names none (see SubAgentManagerOptions.defaultAgent). */
+  get defaultAgent(): string | undefined {
+    return this.options.defaultAgent;
+  }
+
   get agents(): readonly AgentDefinition[] {
     return this.options.agents;
   }
@@ -217,17 +271,30 @@ export class SubAgentManager {
     this.queuePersist();
     await this.waitForPersistence();
     await this.settleAdoptableTurns(adoptable);
-    const referencedChildSessions = await this.store.listChildSessionPaths();
-    await new SessionManager(this.sessionRootDir)
-      .pruneOldSessions({
-        maxAgeDays: 30,
-        keepPaths: referencedChildSessions,
-      })
-      .catch((error) => {
-        log("WARN", "subagent", "Failed to prune old subagent sessions", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      });
+    // Retention is housekeeping, not restore: it walks every child session on
+    // disk, so it runs after hydrate returns instead of holding up readiness
+    // (hydrate is awaited by session initialize, i.e. every window open).
+    this.retention = this.store
+      .listChildSessionPaths()
+      .then((referencedChildSessions) =>
+        new SessionManager(this.sessionRootDir).pruneOldSessions({
+          maxAgeDays: 30,
+          keepPaths: referencedChildSessions,
+        }),
+      )
+      .then(
+        () => undefined,
+        (error: unknown) => {
+          log("WARN", "subagent", "Failed to prune old subagent sessions", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        },
+      );
+  }
+
+  /** Resolves once the retention pass the last `hydrate` started has finished. */
+  async waitForRetention(): Promise<void> {
+    await this.retention;
   }
 
   /**
@@ -276,6 +343,7 @@ export class SubAgentManager {
       ...snapshot,
       state: record.status === "completed" ? "completed" : record.status,
       output: record.output,
+      receipt: record.receipt,
       error:
         record.status === "completed"
           ? undefined
@@ -338,14 +406,26 @@ export class SubAgentManager {
 
   /** Explicit per-spawn overrides. Used by harness-owned children (the
    * independent Ideal reviewer): a read-only tool list and/or a forced model —
-   * bypassing agent-definition routing entirely. */
+   * bypassing agent-definition routing entirely — and a shorter turn time
+   * limit, after which the child answers from what it has gathered. */
   async spawn(
     taskName: string,
     task: string,
     agentName?: string,
-    overrides?: { model?: string; tools?: readonly string[] },
+    overrides?: {
+      model?: string;
+      tools?: readonly string[];
+      turnTimeoutMs?: number;
+      checks?: readonly AcceptanceCheck[];
+      /** Folder the child works in; defaults to the parent's cwd. */
+      cwd?: string;
+      /** Files the parent already read, handed over in the brief (see withContextFiles). */
+      contextFiles?: readonly string[];
+    },
   ): Promise<SubAgentSnapshot> {
     this.assertAvailable();
+    agentName ??= this.options.defaultAgent;
+    const childCwd = this.resolveChildCwd(overrides?.cwd);
     if (!taskName.trim()) throw new Error("task_name is required");
     if ([...this.workers.values()].some((worker) => worker.task_name === taskName)) {
       throw new Error(`An agent named "${taskName}" already exists`);
@@ -354,14 +434,26 @@ export class SubAgentManager {
       throw new Error(`At most ${ACTIVE_LIMIT} agents may run at once`);
 
     this.reapExcessIdle();
-    const provider = this.options.getProvider();
+    const pick = this.options.getChildModel?.();
+    const parentProvider = this.options.getProvider();
+    const provider = pick?.provider ?? parentProvider;
     const parentModel = this.options.getModel();
-    const base = selectSubAgent(this.options.agents, agentName, provider, parentModel);
+    const parentThinkingLevel = this.options.getThinkingLevel?.();
+    const base = selectSubAgent(
+      this.options.agents,
+      agentName,
+      provider,
+      pick?.model ?? parentModel,
+      parentThinkingLevel,
+    );
+    const model = overrides?.model ?? base.model;
     const selection = {
       agentDef: base.agentDef,
       provider: base.provider,
       parentModel: base.parentModel,
-      model: overrides?.model ?? base.model,
+      model,
+      // Resolve against the actual child model, including harness overrides.
+      thinkingLevel: subAgentThinkingLevel(provider, model, parentThinkingLevel),
       tools: overrides?.tools ?? base.agentDef?.tools ?? [],
     };
     if (agentName && !selection.agentDef) {
@@ -374,7 +466,7 @@ export class SubAgentManager {
 
     const now = Date.now();
     const agentId = this.createId();
-    const child = this.spawnWorkerProcess();
+    const child = this.spawnWorkerProcess(childCwd);
     const record: WorkerRecord = {
       agent_id: agentId,
       task_name: taskName,
@@ -388,6 +480,7 @@ export class SubAgentManager {
       agent_name: selection.agentDef?.name,
       provider,
       model: selection.model,
+      ...(childCwd !== this.options.cwd ? { cwd: childCwd } : {}),
       collected: false,
       process: child,
       requests: new Map(),
@@ -406,14 +499,20 @@ export class SubAgentManager {
         options: {
           provider,
           model: selection.model,
-          fallbackModel: selection.model === parentModel ? undefined : parentModel,
-          cwd: this.options.cwd,
+          // The parent's model is only a fallback on the parent's provider.
+          fallbackModel:
+            selection.model === parentModel || provider !== parentProvider
+              ? undefined
+              : parentModel,
+          cwd: childCwd,
+          additionalRoots: this.sharedRoots(childCwd),
           baseUrl: this.options.getBaseUrl?.(),
           // Composed, not replaced — the child keeps its Tools section, project
           // context and Environment facts alongside its agent body.
           agentPrompt: selection.agentDef?.systemPrompt,
           agentContext: selection.agentDef?.context,
-          thinkingLevel: childThinkingLevel(this.options.getThinkingLevel()),
+          thinkingLevel: selection.thinkingLevel,
+          parentThinkingLevel,
           allowedTools: selection.tools.length ? [...selection.tools] : undefined,
           // Without this, an allow-listed child connects NO MCP servers — even
           // when its `tools:` frontmatter names `mcp__<server>__<tool>`.
@@ -426,6 +525,7 @@ export class SubAgentManager {
             selection.agentDef?.name ?? "default",
           ),
           sessionRootDir: this.sessionRootDir,
+          turnTimeoutMs: overrides?.turnTimeoutMs,
         },
       });
       record.child_session_id =
@@ -437,7 +537,8 @@ export class SubAgentManager {
           : undefined;
       this.publish(record);
       await this.waitForPersistence();
-      await this.request(record, "start", { task });
+      const brief = await withContextFiles(task, overrides?.contextFiles ?? [], childCwd);
+      await this.request(record, "start", { task: brief, checks: overrides?.checks ?? [] });
       record.state = "running";
       record.updated_at = Date.now();
       this.publish(record);
@@ -457,7 +558,11 @@ export class SubAgentManager {
     return Number(result.queued ?? 0);
   }
 
-  async followup(agentId: string, task: string): Promise<SubAgentSnapshot> {
+  async followup(
+    agentId: string,
+    task: string,
+    checks: readonly AcceptanceCheck[] = [],
+  ): Promise<SubAgentSnapshot> {
     this.assertAvailable();
     let worker = this.workers.get(agentId);
     if (!worker) {
@@ -474,9 +579,18 @@ export class SubAgentManager {
     clearTimeout(worker.idleTimer);
     worker.taskOutput = "";
     worker.output = undefined;
+    worker.receipt = undefined;
+    worker.acceptance = undefined;
     worker.error = undefined;
     worker.collected = false;
-    await this.request(worker, "followup", { task });
+    // Roots are fixed at initialize, so a folder attached since (a goal's new
+    // context) would stay out of reach of this worker's write tool. Send the
+    // current ones; the worker adds any it doesn't have yet.
+    await this.request(worker, "followup", {
+      task,
+      checks,
+      additionalRoots: this.sharedRoots(worker.cwd ?? this.options.cwd),
+    });
     worker.state = "running";
     worker.updated_at = Date.now();
     this.publish(worker);
@@ -615,6 +729,9 @@ export class SubAgentManager {
       ).then(() => undefined);
     }
     await this.shutdownPromise;
+    // Let a running retention pass finish so teardown (and test temp-dir
+    // removal) never races its file deletions.
+    await this.retention;
   }
 
   /** Synchronous process-exit fallback: terminate detached process groups immediately. */
@@ -642,12 +759,61 @@ export class SubAgentManager {
     this.queuePersist();
   }
 
-  private spawnWorkerProcess(): ChildProcess {
+  /**
+   * The folder a new child works in: the parent's cwd by default, otherwise a
+   * folder already in the parent's workspace. Never wider than the parent.
+   */
+  private resolveChildCwd(requested: string | undefined): string {
+    if (!requested) return this.options.cwd;
+    if (!path.isAbsolute(requested)) {
+      throw new Error(`cwd must be an absolute path: ${requested}`);
+    }
+    const target = path.resolve(requested);
+    const roots = [this.options.cwd, ...(this.options.getWorkspaceRoots?.() ?? [])].map((root) =>
+      path.resolve(root),
+    );
+    const inside = roots.some((root) => {
+      const relative = path.relative(root, target);
+      return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+    });
+    if (!inside) {
+      throw new Error(
+        `cwd is outside this session's workspace: ${target}. Use one of: ${roots.join(", ")}`,
+      );
+    }
+    // A missing folder would only surface as an opaque spawn ENOENT.
+    let isDirectory: boolean;
+    try {
+      isDirectory = statSync(target).isDirectory();
+    } catch {
+      isDirectory = false;
+    }
+    if (!isDirectory) throw new Error(`cwd is not an existing folder: ${target}`);
+    return target;
+  }
+
+  /**
+   * The parent's extra roots a child also gets (see shareWorkspaceRoots),
+   * less the folder it works in and any root that folder already covers.
+   * Undefined when the parent doesn't share them.
+   */
+  private sharedRoots(childCwd: string): string[] | undefined {
+    if (!this.options.shareWorkspaceRoots) return undefined;
+    const roots = (this.options.getWorkspaceRoots?.() ?? [])
+      .map((root) => path.resolve(root))
+      .filter((root) => {
+        const relative = path.relative(childCwd, root);
+        return relative.startsWith("..") || path.isAbsolute(relative);
+      });
+    return roots.length > 0 ? roots : undefined;
+  }
+
+  private spawnWorkerProcess(cwd: string): ChildProcess {
     return spawn(
       process.execPath,
       [this.options.workerEntry ?? resolveSubAgentCliEntry(), "--subagent-worker"],
       {
-        cwd: this.options.cwd,
+        cwd,
         stdio: ["pipe", "pipe", "pipe"],
         env: childSubAgentEnv(),
         detached: process.platform !== "win32",
@@ -665,15 +831,20 @@ export class SubAgentManager {
     const provider = (snapshot.provider as Provider | undefined) ?? this.options.getProvider();
     const model = snapshot.model ?? this.options.getModel();
     const parentModel = this.options.getModel();
+    const parentThinkingLevel = this.options.getThinkingLevel?.();
     this.assertModelCapacity(model);
     const childSessionPath = this.assertChildSessionPath(snapshot.child_session_path);
-    const child = this.spawnWorkerProcess();
+    // Wake it where it was working; re-checked, since the workspace may have
+    // changed since it was started.
+    const childCwd = this.resolveChildCwd(snapshot.cwd);
+    const child = this.spawnWorkerProcess(childCwd);
     const worker: WorkerRecord = {
       ...snapshot,
       state: "starting",
       updated_at: Date.now(),
       current_activity: undefined,
       output: undefined,
+      receipt: undefined,
       error: undefined,
       collected: false,
       recovered: false,
@@ -694,11 +865,13 @@ export class SubAgentManager {
           provider,
           model,
           fallbackModel: model === parentModel ? undefined : parentModel,
-          cwd: this.options.cwd,
+          cwd: childCwd,
+          additionalRoots: this.sharedRoots(childCwd),
           baseUrl: this.options.getBaseUrl?.(),
           agentPrompt: agentDef?.systemPrompt,
           agentContext: agentDef?.context,
-          thinkingLevel: childThinkingLevel(this.options.getThinkingLevel()),
+          thinkingLevel: subAgentThinkingLevel(provider, model, parentThinkingLevel),
+          parentThinkingLevel,
           allowedTools: agentDef?.tools.length ? agentDef.tools : undefined,
           allowedMcpServers: agentDef?.tools.length
             ? mcpServersForAgent(agentDef.tools)
@@ -814,6 +987,8 @@ export class SubAgentManager {
             ? "interrupted"
             : "failed";
       worker.output = boundSubAgentOutput(String(frame.output ?? worker.taskOutput));
+      worker.receipt = typeof frame.receipt === "string" ? frame.receipt : undefined;
+      worker.acceptance = typeof frame.acceptance === "string" ? frame.acceptance : undefined;
       worker.error = frame.error ? String(frame.error) : undefined;
       if (typeof frame.model === "string") worker.model = frame.model;
       worker.current_activity = undefined;
@@ -840,6 +1015,7 @@ export class SubAgentManager {
       worker.agent_id,
       `Child agent "${worker.task_name}" (${worker.agent_id}) is ${worker.state} after ` +
         `${worker.turn_count} turn(s)${digest ? `: ${digest}` : ""}. ` +
+        `${worker.acceptance ? `Acceptance checks: ${worker.acceptance}. ` : ""}` +
         `Collect its full output with wait_agent agent_ids ["${worker.agent_id}"].`,
       { terminal: true },
     );
@@ -850,14 +1026,12 @@ export class SubAgentManager {
     command: string,
     payload: Record<string, unknown> = {},
   ): Promise<Record<string, unknown>> {
-    if (!worker.process.stdin?.writable)
-      return Promise.reject(new Error("Subagent worker is closed"));
+    const stdin = worker.process.stdin;
+    if (!stdin?.writable) return Promise.reject(new Error("Subagent worker is closed"));
     const requestId = `${worker.agent_id}-${++worker.requestSequence}`;
     return new Promise((resolve, reject) => {
       worker.requests.set(requestId, { resolve, reject });
-      worker.process.stdin!.write(
-        `${JSON.stringify({ request_id: requestId, command, ...payload })}\n`,
-      );
+      stdin.write(`${JSON.stringify({ request_id: requestId, command, ...payload })}\n`);
     });
   }
 
@@ -873,8 +1047,10 @@ export class SubAgentManager {
     const snapshot = this.snapshot(worker);
     this.snapshots.delete(worker.agent_id);
     this.snapshots.set(worker.agent_id, snapshot);
-    while (this.snapshots.size > SNAPSHOT_LIMIT)
-      this.snapshots.delete(this.snapshots.keys().next().value!);
+    for (const id of this.snapshots.keys()) {
+      if (this.snapshots.size <= SNAPSHOT_LIMIT) break;
+      this.snapshots.delete(id);
+    }
     this.options.onState?.(snapshot);
     for (const listener of this.listeners) listener(snapshot);
     if (persist) this.queuePersist();
@@ -893,12 +1069,15 @@ export class SubAgentManager {
       tool_use_count: worker.tool_use_count,
       token_usage: { ...worker.token_usage },
       output: worker.output,
+      receipt: worker.receipt,
+      ...(worker.acceptance !== undefined && { acceptance: worker.acceptance }),
       error: worker.error,
       agent_name: worker.agent_name,
       provider: worker.provider,
       model: worker.model,
       child_session_id: worker.child_session_id,
       child_session_path: worker.child_session_path,
+      ...(worker.cwd !== undefined && { cwd: worker.cwd }),
       collected: worker.collected,
       recovered: worker.recovered,
     };
@@ -1014,7 +1193,9 @@ export class SubAgentManager {
     const idle = [...this.workers.values()]
       .filter((worker) => this.isTerminal(worker.state))
       .sort((a, b) => a.updated_at - b.updated_at);
-    while (idle.length > RETAINED_WORKER_LIMIT) void this.close(idle.shift()!, true);
+    for (const worker of idle.slice(0, Math.max(0, idle.length - RETAINED_WORKER_LIMIT))) {
+      void this.close(worker, true);
+    }
   }
 
   private fail(worker: WorkerRecord, error: unknown, kill = true): void {

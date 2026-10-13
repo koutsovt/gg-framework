@@ -1,11 +1,24 @@
-import type { ReactNode } from "react";
-import { openProjectPath, openUrl, type WorkspaceMode, type GitHubCI } from "./agent";
+import type { ReactNode, Ref } from "react";
+import {
+  openProjectPath,
+  openUrl,
+  workspaceProductName,
+  type WorkspaceMode,
+  type GitHubCI,
+} from "./agent";
 import { CIIndicator } from "./CIIndicator";
+import { ProjectHealthBadge } from "./ProjectHealthBadge";
+import type { ProjectHealth } from "./project-health";
 import { projectAccent } from "./projectAccent";
+import { formatWorkspaceTitle, pluralize } from "./workspace-title";
 
 interface WorkspaceHeaderProps {
+  /** The header element: a Goal's world sits behind it and keeps clear of it. */
+  ref?: Ref<HTMLDivElement>;
   workspaceMode: WorkspaceMode;
   cwd?: string;
+  /** A Goal window: titled with the goal's name instead of its folder slug. */
+  goalName?: string | null;
   gitBranch?: string | null;
   gitDirtyFileCount?: number;
   /** Open issue/PR counts for the project's GitHub origin (null = unknown/hidden). */
@@ -14,6 +27,10 @@ interface WorkspaceHeaderProps {
   /** Origin repo's web URL — makes the issue/PR chips clickable. */
   gitHubRepoUrl?: string | null;
   gitHubCI?: GitHubCI | null;
+  /** Project Health score; null hides the badge (non-code mode, no repo, first scan pending). */
+  projectHealth?: ProjectHealth | null;
+  /** Sends a Project Health review prompt; false when it couldn't be sent. */
+  onReviewHealth?: (prompt: string, label: string) => boolean;
   /** Extra workspace roots added with /add-dir. */
   additionalRoots?: string[];
   navHidden: boolean;
@@ -22,50 +39,28 @@ interface WorkspaceHeaderProps {
   children: ReactNode;
 }
 
-function pluralize(count: number, singular: string, plural: string): string {
-  return `${count} ${count === 1 ? singular : plural}`;
-}
-
-export function formatWorkspaceTitle(
-  cwd: string | undefined,
-  gitBranch: string | null | undefined,
-  fallback: string,
-  gitDirtyFileCount = 0,
-  gitHubIssues: number | null = null,
-  gitHubPRs: number | null = null,
-  additionalRoots: string[] = [],
-): string {
-  const directory = cwd?.split(/[\\/]/).filter(Boolean).pop();
-  if (!directory) return fallback;
-  const segments = [directory];
-  if (additionalRoots.length > 0)
-    segments.push(`+${pluralize(additionalRoots.length, "root", "roots")}`);
-  if (gitBranch) segments.push(`⎇ ${gitBranch}`);
-  if (gitDirtyFileCount > 0) segments.push(`${gitDirtyFileCount} uncommitted`);
-  if (gitHubIssues !== null && gitHubIssues > 0)
-    segments.push(pluralize(gitHubIssues, "issue", "issues"));
-  if (gitHubPRs !== null && gitHubPRs > 0) segments.push(pluralize(gitHubPRs, "PR", "PRs"));
-  return segments.join(" │ ");
-}
-
 /** Shared code/chat titlebar and collapsible workspace navigation. */
 export function WorkspaceHeader({
+  ref,
   workspaceMode,
   cwd,
+  goalName = null,
   gitBranch,
   gitDirtyFileCount = 0,
   gitHubIssues = null,
   gitHubPRs = null,
   gitHubRepoUrl = null,
   gitHubCI = null,
+  projectHealth = null,
+  onReviewHealth,
   additionalRoots = [],
   navHidden,
   onToggleNav,
   stripExtras,
   children,
 }: WorkspaceHeaderProps): React.ReactElement {
-  const fallbackTitle = workspaceMode === "chat" ? "GG Chat" : "GG Coder";
-  const directory = cwd?.split(/[\\/]/).filter(Boolean).pop();
+  const fallbackTitle = workspaceProductName(workspaceMode, goalName !== null);
+  const directory = goalName ?? cwd?.split(/[\\/]/).filter(Boolean).pop();
   // Stable per-project colour, so a wall of identical dark windows becomes
   // identifiable at a glance. Published as a CSS variable (not just inlined on
   // the one rule that uses it) so descendants can opt in later.
@@ -73,6 +68,7 @@ export function WorkspaceHeader({
 
   return (
     <div
+      ref={ref}
       className="chat-head"
       style={accent ? ({ "--project-accent": accent } as React.CSSProperties) : undefined}
     >
@@ -102,6 +98,14 @@ export function WorkspaceHeader({
               >
                 {directory}
               </button>
+              {projectHealth && (
+                <>
+                  <span className="chat-head-sep" aria-hidden="true" data-tauri-drag-region>
+                    {"│"}
+                  </span>
+                  <ProjectHealthBadge health={projectHealth} onReview={onReviewHealth} />
+                </>
+              )}
               {gitBranch && (
                 <>
                   <span className="chat-head-sep" aria-hidden="true" data-tauri-drag-region>
@@ -143,11 +147,17 @@ export function WorkspaceHeader({
                     {"│"}
                   </span>
                   <span
-                    className="chat-head-dirty"
+                    className="chat-head-dirty chat-head-uncommitted"
                     data-tauri-drag-region
                     title={`${gitDirtyFileCount} file${gitDirtyFileCount === 1 ? "" : "s"} not committed`}
                   >
-                    {`${gitDirtyFileCount} uncommitted`}
+                    {gitDirtyFileCount}
+                    {/* Its own element so narrow windows can drop the word and
+                        keep the count (App.css). It carries the drag attribute
+                        too: Tauri drags only from the element that has it. */}
+                    <span className="chat-head-uncommitted-label" data-tauri-drag-region>
+                      {" uncommitted"}
+                    </span>
                   </span>
                 </>
               )}

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { theme } from "./theme";
 import { Modal } from "./Modal";
+import { ModalDismissButton, useModalEmbedState } from "./modal-embed";
 import { Badge } from "./Badge";
 import {
   getSettings,
@@ -12,8 +13,9 @@ import {
 } from "./agent";
 import { toast } from "./toast";
 import { SoundButton } from "./SoundButton";
-import { MemesButton } from "./MemesButton";
-import { GgUiButton } from "./GgUiButton";
+import { HomeBackgroundButton } from "./HomeBackgroundButton";
+import { KeepAwakeButton } from "./KeepAwakeButton";
+import { SettingsSection } from "./settings-section";
 
 interface Props {
   onClose: () => void;
@@ -22,7 +24,11 @@ interface Props {
 }
 
 export function SettingsModal({ onClose, onSaved }: Props): React.ReactElement {
+  const embedded = useModalEmbedState() === "embed";
   const [projectsRoot, setProjectsRoot] = useState("");
+  // What's on disk, so the page saves only a real change and can put the
+  // field back after an empty entry or a failed save.
+  const [savedRoot, setSavedRoot] = useState("");
   const [busy, setBusy] = useState(false);
   const [permissions, setPermissions] = useState<PermissionsStatus | null>(null);
 
@@ -30,7 +36,9 @@ export function SettingsModal({ onClose, onSaved }: Props): React.ReactElement {
     // Native (Rust) read — no sidecar wait needed.
     void getSettings()
       .then((s) => {
-        if (s) setProjectsRoot(s.projectsRoot);
+        if (!s) return;
+        setProjectsRoot(s.projectsRoot);
+        setSavedRoot(s.projectsRoot);
       })
       .catch(() => {});
   }, []);
@@ -48,7 +56,35 @@ export function SettingsModal({ onClose, onSaved }: Props): React.ReactElement {
 
   async function browse(): Promise<void> {
     const picked = await open({ directory: true, multiple: false, title: "Projects folder" });
-    if (typeof picked === "string") setProjectsRoot(picked);
+    if (typeof picked !== "string") return;
+    setProjectsRoot(picked);
+    if (embedded) void persist(picked);
+  }
+
+  /**
+   * The Settings page has no Save: like every other setting there, the folder
+   * saves as soon as it's chosen (Browse) or the field is left. An empty entry
+   * is never saved; the field goes back to the saved folder.
+   */
+  async function persist(value: string): Promise<void> {
+    const root = value.trim();
+    if (!root) {
+      setProjectsRoot(savedRoot);
+      return;
+    }
+    if (root === savedRoot || busy) return;
+    setBusy(true);
+    try {
+      await saveSettings(root);
+      setSavedRoot(root);
+      setProjectsRoot(root);
+      onSaved?.(root);
+    } catch (e) {
+      setProjectsRoot(savedRoot);
+      toast(`Couldn't save: ${e instanceof Error ? e.message : String(e)}`, "error");
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function save(): Promise<void> {
@@ -68,59 +104,86 @@ export function SettingsModal({ onClose, onSaved }: Props): React.ReactElement {
   }
 
   return (
-    <Modal title="Settings" onClose={onClose}>
-      {permissions?.applicable && (
-        <>
-          <div className="modal-label" style={{ color: theme.textMuted }}>
-            Permissions
-          </div>
-          <div className="modal-row">
-            <button
-              className="modal-btn"
-              onClick={() => void openPermissionsSettings()}
-              disabled={permissions.granted}
-            >
-              {permissions.granted ? "Permissions granted" : "Grant Permissions…"}
-            </button>
-            <Badge color={permissions.granted ? theme.success : theme.textMuted}>
-              {permissions.granted ? "Granted" : "Not granted"}
-            </Badge>
-          </div>
-        </>
-      )}
-      <div className="modal-label" style={{ color: theme.textMuted }}>
-        Effects
-      </div>
-      <div className="modal-row">
-        <SoundButton variant="settings" />
-        <MemesButton variant="settings" />
-        <GgUiButton />
-      </div>
-      <div className="modal-label" style={{ color: theme.textMuted }}>
-        Project folder
-      </div>
-      <div className="modal-hint" style={{ color: theme.textDim }}>
-        New projects are created inside this folder.
-      </div>
-      <div className="modal-row">
-        <input
-          className="modal-input"
-          style={{ color: theme.text, background: theme.inputBackground }}
-          value={projectsRoot}
-          placeholder="/Users/you/gg-projects"
-          onChange={(e) => setProjectsRoot(e.target.value)}
-        />
-        <button className="modal-btn" onClick={() => void browse()}>
-          {"Browse\u2026"}
-        </button>
-      </div>
-      <div className="modal-actions">
-        <button className="modal-btn" onClick={onClose}>
-          Cancel
-        </button>
-        <button className="modal-btn primary" disabled={busy} onClick={() => void save()}>
-          {busy ? "Saving\u2026" : "Save"}
-        </button>
+    <Modal title={embedded ? "General" : "Settings"} onClose={onClose}>
+      {/* Columns only on the Settings screen; in the dialog they are
+          transparent (see .settings-cols in App.css). */}
+      <div className="settings-cols">
+        <div className="settings-col">
+          {permissions?.applicable && (
+            <SettingsSection title="Permissions" description="Full Disk Access for GG Coder.">
+              <div className="modal-row">
+                <button
+                  className="modal-btn"
+                  onClick={() => void openPermissionsSettings()}
+                  disabled={permissions.granted}
+                >
+                  {permissions.granted ? "Permissions granted" : "Grant Permissions…"}
+                </button>
+                <Badge color={permissions.granted ? theme.success : theme.textMuted}>
+                  {permissions.granted ? "Granted" : "Not granted"}
+                </Badge>
+              </div>
+            </SettingsSection>
+          )}
+          <SettingsSection
+            title="Effects"
+            description="Sounds, and the home screen's moving background."
+          >
+            <div className="modal-row">
+              <SoundButton variant="settings" />
+              <HomeBackgroundButton />
+            </div>
+          </SettingsSection>
+          <SettingsSection
+            title="Power"
+            description="Stop your computer sleeping mid-task. The screen can still turn off."
+          >
+            <div className="modal-row">
+              <KeepAwakeButton />
+            </div>
+          </SettingsSection>
+        </div>
+        <div className="settings-col">
+          <SettingsSection
+            title="Project folder"
+            description="Where new projects are created."
+            dialogHint={
+              <div className="modal-hint" style={{ color: theme.textDim }}>
+                New projects are created inside this folder.
+              </div>
+            }
+          >
+            <div className="modal-row">
+              <input
+                className="modal-input"
+                style={{ color: theme.text, background: theme.inputBackground }}
+                value={projectsRoot}
+                placeholder="/Users/you/gg-projects"
+                onChange={(e) => setProjectsRoot(e.target.value)}
+                onBlur={embedded ? (e) => void persist(e.currentTarget.value) : undefined}
+                onKeyDown={
+                  embedded
+                    ? (e) => {
+                        if (e.key === "Enter") e.currentTarget.blur();
+                      }
+                    : undefined
+                }
+              />
+              <button className="modal-btn" onClick={() => void browse()}>
+                {"Browse\u2026"}
+              </button>
+            </div>
+          </SettingsSection>
+          {/* The dialog saves on Save; the page saves as you go (see persist). */}
+          {!embedded && (
+            <div className="modal-actions">
+              <ModalDismissButton onClick={onClose}>Cancel</ModalDismissButton>
+              <button className="modal-btn primary" disabled={busy} onClick={() => void save()}>
+                {busy ? "Saving\u2026" : "Save"}
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     </Modal>
   );

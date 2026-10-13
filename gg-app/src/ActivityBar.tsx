@@ -4,6 +4,9 @@ import { ThinkingOrb } from "thinking-orbs";
 import { theme } from "./theme";
 import { ShimmerText } from "./ShimmerText";
 import { outcomePhrase } from "./activity-copy";
+import { GgFace } from "./GgFace";
+import type { GgFaceMood } from "./gg-face";
+import { useMotionLevel } from "./window-motion";
 
 // Braille rotation spinner — the native language of CLI coding tools (ora,
 // npm, cargo). Smooth, monospace, and unmistakably "ours" rather than the
@@ -48,7 +51,7 @@ function pickReadyPhrase(exclude?: string): string {
   return pool[Math.floor(Math.random() * pool.length)] ?? "Ready for work";
 }
 
-function formatElapsed(ms: number): string {
+export function formatElapsed(ms: number): string {
   const s = Math.round(ms / 1000);
   if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);
@@ -70,6 +73,13 @@ interface Props {
   activity?: TaskActivity;
   /** Cancellation was requested and is awaiting provider settlement. */
   cancelling?: boolean;
+  /**
+   * When the current run began, kept by the caller (which is never hidden).
+   * The bar sits inside the chat, which a goal's Workers view hides; its own
+   * effects re-run when the chat comes back, so a start it took itself would
+   * restart from zero every time.
+   */
+  runStartedAt?: number | null;
   /** Accumulated output tokens for the current/just-finished run. */
   tokens: number;
   /** Done-status phrase shown when a run just finished (e.g. "Brewed up a response in 12s"). */
@@ -105,7 +115,7 @@ function ToolsToggle({
 }): React.ReactElement {
   return (
     <button
-      className="nav-toggle tools-toggle"
+      className="nav-toggle tools-toggle dissolve-in"
       title={hidden ? "Show tool panel" : "Hide tool panel"}
       aria-label={hidden ? "Show tool panel" : "Hide tool panel"}
       onClick={onToggle}
@@ -169,10 +179,26 @@ const SHORT_LABELS: Record<string, string> = {
   "Cancellation failed · task still running": "Stop failed",
 };
 
+/**
+ * GG Coder's face for a settled status. Picked from the same tone as the text,
+ * so the face's glow always matches the words beside it: green → happy, red →
+ * shocked, amber → sad when stopped, curious when it needs you, worried
+ * otherwise (unverified, cut short, reconnecting), and ready when idle.
+ */
+export function ggMoodFor(activity: TaskActivity | undefined, tone: string): GgFaceMood {
+  if (tone === theme.success) return "happy";
+  if (tone === theme.error) return "shocked";
+  if (tone !== theme.warning) return "ready";
+  if (activity?.phase === "stopped") return "sad";
+  if (activity?.phase === "attention") return "curious";
+  return "worried";
+}
+
 /** The existing animated row now represents a whole task, including Ken's review. */
 export function ActivityBar({
   running,
   activity,
+  runStartedAt = null,
   cancelling = false,
   tokens,
   doneStatus,
@@ -193,16 +219,23 @@ export function ActivityBar({
     (hasActivity ? activity.phase === "working" || activity.phase === "reviewing" : running);
   const bareIdle = !active && !hasActivity && !doneStatus;
   const startedAt = activity?.startedAt;
+  const motion = useMotionLevel();
   useEffect(() => {
     if (bareIdle) setReadyPhrase((cur) => pickReadyPhrase(cur));
   }, [bareIdle]);
   useEffect(() => {
-    if (!active) return;
-    setFallbackStart(startedAt ?? Date.now());
+    if (active) setFallbackStart(startedAt ?? runStartedAt ?? Date.now());
+  }, [active, startedAt, runStartedAt]);
+  // The elapsed clock keeps counting in a visible background window (it's
+  // status, not decoration); a hidden window skips the ticks and catches up
+  // the moment it's shown.
+  const clockLive = active && motion !== "off";
+  useEffect(() => {
+    if (!clockLive) return;
     setNow(Date.now());
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
-  }, [active, startedAt]);
+  }, [clockLive]);
 
   const showToolsToggle =
     Boolean(onToggleTools) && (hasToolFeed || toolsHidden || hasActivity || Boolean(doneStatus));
@@ -255,17 +288,12 @@ export function ActivityBar({
                 state="listening"
                 size={20}
                 theme="dark"
+                paused={motion !== "full"}
                 aria-hidden="true"
                 style={{ flexShrink: 0 }}
               />
             ) : (
-              <span
-                className="statusrow-icon"
-                aria-hidden="true"
-                style={{ color: bareIdle ? theme.accent : tone }}
-              >
-                {bareIdle ? "\u276f" : activity?.phase === "done" ? "\u2713" : "\u2022"}
-              </span>
+              <GgFace mood={ggMoodFor(activity, tone)} size={21} />
             )}
             {/* Remount only the label when its meaning changes. Timer/token
                 updates must not restart the reveal or the running orb. */}
@@ -285,7 +313,7 @@ export function ActivityBar({
             )}
           </span>
           {(active || hasActivity) && !starting && (
-            <span className="activity-meta">
+            <span className="activity-meta dissolve-in">
               {formatElapsed(elapsed)}
               {totalTokens > 0 && (
                 <span className="activity-token-count" title="Output tokens">
@@ -296,7 +324,7 @@ export function ActivityBar({
           )}
         </div>
         {active && planTotal > 0 && planDone < planTotal && (
-          <span className="plan-steps-running">
+          <span className="plan-steps-running dissolve-in">
             <span className="plan-steps-badge">
               <span style={{ color: theme.textMuted }}>Plan</span>{" "}
               <span style={{ color: theme.textMuted }}>
@@ -311,7 +339,7 @@ export function ActivityBar({
           )}
           {canCancel && (
             <button
-              className="cancel"
+              className="cancel dissolve-in"
               style={{ color: cancelling ? theme.textMuted : theme.error }}
               onClick={onCancel}
               disabled={cancelling}

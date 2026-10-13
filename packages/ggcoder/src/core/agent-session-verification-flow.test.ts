@@ -19,6 +19,7 @@ import type { AgentSession } from "./agent-session.js";
 import type { ProcessManager } from "./process-manager.js";
 import { buildKenAutopilotContext } from "./ken-context.js";
 import type { VerificationEvidence } from "./verification-evidence.js";
+import { createBashTool, REVIEW_REJECTED_BEFORE_START } from "../tools/bash.js";
 
 interface FlowInternals {
   sessionPath: string;
@@ -172,6 +173,76 @@ const artifactBuild =
   "import fs from 'node:fs'; fs.mkdirSync('dist', {recursive:true}); fs.writeFileSync('dist/app.js', 'generated');\n";
 
 describe("verification gate flow", () => {
+  it.each([
+    { review: true, result: `Exit code: 1\n${REVIEW_REJECTED_BEFORE_START}` },
+    { review: false, result: REVIEW_REJECTED_BEFORE_START },
+  ])(
+    "never treats check output or another execution mode as a review rejection: %j",
+    async ({ review, result }) => {
+      const { internal } = await makeSession();
+      await simulateToolCall(internal, "edit", { file_path: "subject.mjs" });
+      await simulateToolCall(internal, "bash", { command: "npm run check", review }, result);
+      expect(internal.getVerificationEvidence()).toContainEqual(
+        expect.objectContaining({ command: "npm run check", status: "failed" }),
+      );
+      expect(internal.getVerificationProblem()).toContain("failed");
+    },
+  );
+
+  it.each([false, true])(
+    "treats a rejected review as not-run without clearing actual failures (prior failure=%s)",
+    async (priorFailure) => {
+      await prepareBuildProject(artifactBuild);
+      const { internal } = await makeSession();
+      await simulateToolCall(internal, "edit", { file_path: "subject.mjs" });
+      if (priorFailure) {
+        await fs.writeFile(path.join(tmpProject, "subject.mjs"), "export const value = 2;\n");
+        await runRealCheck(internal, "npm run check");
+      }
+      const tool = createBashTool(tmpProject, internal.processManager);
+      const invoke = async (command: string): Promise<void> => {
+        const toolCallId = `review-${command}`;
+        const args = { command, review: true };
+        await internal.trackHookEvent({
+          type: "tool_call_start",
+          toolCallId,
+          name: "bash",
+          args,
+        } as AgentEvent);
+        const result = await tool.execute(args, {
+          signal: new AbortController().signal,
+          toolCallId,
+        });
+        expect(typeof result).toBe("string");
+        if (typeof result !== "string") throw new Error("Expected string result");
+        await internal.trackHookEvent({
+          type: "tool_call_end",
+          toolCallId,
+          result,
+          isError: false,
+          durationMs: 1,
+        } as AgentEvent);
+      };
+      const rejected = "npm run check && git diff --check";
+      await invoke(rejected);
+      expect(internal.getVerificationEvidence()).toContainEqual(
+        expect.objectContaining({ command: rejected, status: "rejected" }),
+      );
+      expect(internal.getVerificationProblem()).not.toBeNull();
+
+      if (priorFailure) {
+        await runRealCheck(internal, "npm run build");
+        expect(internal.getVerificationProblem()).toContain("failed");
+      } else {
+        await invoke("npm run check");
+        expect(internal.getVerificationProblem()).toBeNull();
+        expect(internal.getVerificationEvidence()).toContainEqual(
+          expect.objectContaining({ command: "npm run check", status: "passed" }),
+        );
+      }
+    },
+  );
+
   it.each([true, false])(
     "keeps real check results out of the next read-only turn (passed=%s)",
     async (passed) => {
@@ -334,34 +405,45 @@ describe("verification gate flow", () => {
     );
   });
 
-  it("arms before the draft streams, then announces itself when it injects", async () => {
+  it("never forces another turn after an unverified edit, but still reports it", async () => {
     const { internal, events } = await makeSession();
 
-    // Work: one code edit, nothing run since.
     await simulateToolCall(internal, "edit", { file_path: "src/a.ts" });
 
-    // Arming must land on the tool call — i.e. BEFORE the model writes the
-    // candidate final answer — or the client has already painted the draft it
-    // is about to replace.
-    expect(events).toContain("hook_armed:verification:true");
-    expect(events.indexOf("hook_armed:verification:true")).toBe(0);
-
-    // The stop: the gate injects, and says so.
-    const followUp = await internal.getHookFollowUpMessages();
-    expect(followUp).not.toBeNull();
-    expect(String(followUp![0]!.content)).toContain("Run the project's verification");
-    expect(events).toEqual([
-      "hook_armed:verification:true",
-      "hook:verification",
-      // Disarm AFTER the notice: clients release held text on disarm, so the
-      // reverse order paints the draft and then deletes it.
-      "hook_armed:verification:false",
-    ]);
-
-    // One notice, one injection: the reviewed answer that follows streams live
-    // and is the only final answer the user sees.
+    // No hold, no notice, no injected turn: the first final answer is the answer.
     expect(await internal.getHookFollowUpMessages()).toBeNull();
-    expect(events.filter((e) => e === "hook:verification")).toHaveLength(1);
+    expect(events).toEqual([]);
+    // Evidence stays honest for run status and autopilot.
+    expect(internal.getVerificationProblem()).toContain("Unverified");
+  });
+
+  it("does not count a code write refused in plan mode as an unverified change", async () => {
+    const { internal } = await makeSession();
+    await session?.setPlanMode(true);
+
+    await simulateToolCall(
+      internal,
+      "write",
+      { file_path: "src/a.ts" },
+      "Error: write is restricted in plan mode. You can only write to .gg/plans/. Got: src/a.ts",
+    );
+
+    expect(internal.getVerificationProblem()).toBeNull();
+  });
+
+  it("tracks every file of a multi-file edit as needing verification", async () => {
+    const { internal } = await makeSession();
+
+    // The `files` form carries no top-level file_path; missing it would let a
+    // multi-file change skip verification entirely.
+    await simulateToolCall(internal, "edit", {
+      files: [
+        { file_path: "src/a.ts", edits: [] },
+        { file_path: "src/b.ts", edits: [] },
+      ],
+    });
+
+    expect(internal.getVerificationProblem()).toContain("Unverified");
   });
 
   it("stays silent end to end when the run verified its own edit", async () => {
@@ -370,12 +452,12 @@ describe("verification gate flow", () => {
     await simulateToolCall(internal, "edit", { file_path: "src/a.ts" });
     await simulateToolCall(internal, "bash", { command: "cd pkg && npm test" });
 
-    // Disarmed by the verification, so no draft is ever held back.
-    expect(events).toEqual(["hook_armed:verification:true", "hook_armed:verification:false"]);
+    expect(events).toEqual([]);
+    expect(internal.getVerificationProblem()).toBeNull();
     expect(await internal.getHookFollowUpMessages()).toBeNull();
   });
 
-  it("accepts the transcript's format-check chain and only requests an internal test review", async () => {
+  it("accepts the transcript's format-check chain and never asks for a test-edit review", async () => {
     const { internal } = await makeSession();
     const notices: Record<string, unknown>[] = [];
     internal.eventBus.on("hook", (data) => notices.push(data));
@@ -385,36 +467,14 @@ describe("verification gate flow", () => {
       command: "pnpm check && pnpm lint && pnpm format:check && pnpm test",
     });
     expect(internal.getVerificationProblem()).toBeNull();
-    const followUp = await internal.getHookFollowUpMessages();
-    expect(followUp).toHaveLength(1);
-    expect(String(followUp![0]!.content)).toContain("review them internally");
-    expect(String(followUp![0]!.content)).toContain("task outcome");
-    expect(String(followUp![0]!.content)).not.toContain("Run the project's verification");
-    expect(notices).toEqual([{ kind: "verification", verificationReason: "check_review" }]);
     expect(await internal.getHookFollowUpMessages()).toBeNull();
+    expect(notices).toEqual([]);
   });
 
-  it("combines test review with verification and does not interrupt the corrected final again", async () => {
-    const { internal, events } = await makeSession();
-    await simulateToolCall(internal, "edit", { file_path: "src/a.test.ts" });
-    const followUp = await internal.getHookFollowUpMessages();
-    expect(followUp).toHaveLength(2);
-    expect(String(followUp![1]!.content)).toContain("src/a.test.ts");
-    await simulateToolCall(internal, "bash", { command: "pnpm test" });
-    expect(internal.getVerificationProblem()).toBeNull();
-    expect(await internal.getHookFollowUpMessages()).toBeNull();
-    expect(events.filter((e) => e === "hook:verification")).toHaveLength(1);
-  });
-
-  it("counts a check piped through a tail limiter, so a question turn is never hijacked", async () => {
+  it("counts a check piped through a tail limiter as passing evidence", async () => {
     const { internal, events } = await makeSession();
 
     await simulateToolCall(internal, "edit", { file_path: "src/a.ts" });
-    // The agent-habit shape that caused the real-world incident: green suite,
-    // output piped through tail. Pre-pipefail this was rejected as evidence,
-    // the gate stayed armed past the turn, and the NEXT turn — a plain user
-    // question — had its draft held, discarded, and replaced by the hook
-    // notice. With pipefail + the limiter rule it is ordinary passing evidence.
     await simulateToolCall(
       internal,
       "bash",
@@ -424,7 +484,7 @@ describe("verification gate flow", () => {
 
     expect(internal.getVerificationProblem()).toBeNull();
     expect(await internal.getHookFollowUpMessages()).toBeNull();
-    expect(events).toEqual(["hook_armed:verification:true", "hook_armed:verification:false"]);
+    expect(events).toEqual([]);
   });
 
   it("still rejects piped checks whose stages can transform results", async () => {
@@ -436,6 +496,37 @@ describe("verification gate flow", () => {
       { command: "pnpm test | grep -q 'all passed'" },
       "Exit code: 0",
     );
+    expect(internal.getVerificationProblem()).toContain("Unverified");
+  });
+
+  // Haiku 5.5 runs (2026-10-09) ended "Unverified" on passing suites written as
+  // `cat …; npm test | grep …` or `npm test && git diff --stat`. Real processes,
+  // real exit codes: they count when they pass, and a grep that merely matches
+  // nothing is never recorded as a failed check.
+  it.each([
+    "cat subject.mjs; npm run check 2>&1 | grep -E 'pass|fail'",
+    "npm run check && git status --short",
+    "ls && npm run check 2>&1 | tail -3",
+  ])("verifies a real passing check with read-only commands around it: %s", async (command) => {
+    await prepareBuildProject(artifactBuild);
+    execFileSync("git", ["add", "."], { cwd: tmpProject });
+    const { internal } = await makeSession();
+    await simulateToolCall(internal, "edit", { file_path: "subject.mjs" });
+
+    // processManager runs commands through resolveShell, i.e. bash -o pipefail.
+    await runRealCheck(internal, command);
+
+    expect(internal.getVerificationProblem()).toBeNull();
+  });
+
+  it("never counts a real failing check piped through grep as verified", async () => {
+    await prepareBuildProject(artifactBuild);
+    await fs.writeFile(path.join(tmpProject, "subject.mjs"), "export const value = 2;\n");
+    const { internal } = await makeSession();
+    await simulateToolCall(internal, "edit", { file_path: "subject.mjs" });
+
+    await runRealCheck(internal, "npm run check 2>&1 | grep -c fail");
+
     expect(internal.getVerificationProblem()).toContain("Unverified");
   });
 
@@ -577,6 +668,18 @@ describe("verification gate flow", () => {
     expect(digest).not.toContain("background or persistent commands are not bounded evidence");
   });
 
+  it.each([
+    "git status --short && git diff --stat",
+    "rm -r scratch.html && git status --short && echo CLEAN",
+  ])("does not demand verification after ordinary shell work: %s", async (command) => {
+    const { internal } = await makeSession();
+    execFileSync("git", ["init", "--quiet"], { cwd: tmpProject });
+    await fs.writeFile(path.join(tmpProject, "subject.mjs"), "export const value = 1;\n");
+    await simulateToolCall(internal, "bash", { command });
+    expect(internal.getVerificationProblem()).toBeNull();
+    expect(internal.getVerificationEvidence()).toEqual([]);
+  });
+
   it("persists unresolved verification and requires fresh evidence after resuming", async () => {
     const { internal } = await makeSession(false);
     await simulateToolCall(internal, "edit", { file_path: "subject.ts" });
@@ -595,16 +698,18 @@ describe("verification gate flow", () => {
     const { VERIFICATION_HOOK_NOTICE_TEXT } = await import("../ui/app-items.js");
     expect(VERIFICATION_HOOK_NOTICE_TEXT).toContain("verification");
 
-    const appEvents = await fs.readFile(
-      path.join(__dirname, "..", "..", "..", "..", "gg-app", "src", "useAgentEvents.ts"),
+    const hookNotice = await fs.readFile(
+      path.join(__dirname, "..", "..", "..", "..", "gg-app", "src", "HookNotice.tsx"),
       "utf-8",
     );
-    const presentation = appEvents.slice(
-      appEvents.indexOf("HOOK_PRESENTATION"),
-      appEvents.indexOf("function formatElapsed"),
+    const start = hookNotice.indexOf("export const HOOK_LINES");
+    expect(start).toBeGreaterThan(-1);
+    const presentation = hookNotice.slice(
+      start,
+      hookNotice.indexOf("export function describeHook"),
     );
     for (const kind of ["ideal", "verification", "loop_break", "regrounding"]) {
-      expect(presentation).toContain(`${kind}: {`);
+      expect(presentation).toContain(`${kind}: [`);
     }
   });
 
@@ -618,27 +723,37 @@ describe("verification gate flow", () => {
     expect(await internal.getHookFollowUpMessages()).toBeNull();
   });
 
-  it("answers later question turns instead of re-hijacking them with the verification hook", async () => {
-    // The live incident, replayed against the real session: code edited, the
-    // check the agent actually ran did not count as evidence, and EVERY later
-    // prompt — plain questions included — was answered by "Hook engaged"
-    // plus a verification status instead of the user's question.
+  it("never hijacks a work or question turn, even when a check did not count", async () => {
     const { internal, events } = await makeSession();
 
     await simulateToolCall(internal, "edit", { file_path: "src/a.ts" });
-    // `make test` is a real check the evidence classifier cannot vouch for:
-    // green output, exit 0 — but not bounded evidence.
+    // `make test` is a real check the evidence classifier cannot vouch for.
     await simulateToolCall(internal, "bash", { command: "make test" });
     expect(internal.getVerificationProblem()).toContain("Unverified");
-    // The work turn gets its one demand, as designed.
-    expect(await internal.getHookFollowUpMessages()).not.toBeNull();
+    expect(await internal.getHookFollowUpMessages()).toBeNull();
 
-    // The next user prompt: a new run with no edits. The inherited debt must
-    // NOT re-arm — no hold, no notice, the answer streams untouched.
-    const before = events.length;
     (internal as unknown as { verificationGate: { beginRun(): void } }).verificationGate.beginRun();
     expect(await internal.getHookFollowUpMessages()).toBeNull();
-    expect(events.length).toBe(before);
+    expect(events).toEqual([]);
+  });
+
+  it.each([
+    ["an unrecognized check", { command: "npx biome ci ." }],
+    ["an unrecognized package check script", { command: "npm run check:local-discovery" }],
+    ["a persistent-shell check", { command: "pnpm test", persist: true }],
+  ])("does not re-open verified work when %s runs after a passing check", async (_label, args) => {
+    // The live incident: edit, `tsc --noEmit` passes, then `biome ci` runs
+    // last. Neither its start nor its end can produce evidence, yet the
+    // start flagged the workspace unknown and nothing ever cleared it — every
+    // later run ended Unverified and autopilot silently refused to review.
+    const { internal } = await makeSession();
+    await simulateToolCall(internal, "edit", { file_path: "src/a.ts" });
+    await simulateToolCall(internal, "bash", { command: "npx tsc --noEmit -p apps/web" });
+    expect(internal.getVerificationProblem()).toBeNull();
+
+    await simulateToolCall(internal, "bash", args);
+
+    expect(internal.getVerificationProblem()).toBeNull();
   });
 
   it("records neither pass nor failure for persistent-shell checks, however they exit", async () => {

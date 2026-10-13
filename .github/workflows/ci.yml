@@ -34,9 +34,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # pnpm version comes from package.json's packageManager field.
       - uses: pnpm/action-setup@v6
-        with:
-          version: 10
 
       - uses: actions/setup-node@v7
         with:
@@ -45,6 +44,20 @@ jobs:
 
       - name: Install
         run: pnpm install --frozen-lockfile
+
+      # ripgrep is optional at runtime, but grep-parity.test.ts only compares
+      # the rg path against the in-process scanner when `rg` is on PATH. None of
+      # the runner images ship it, so without this the parity suite skipped on
+      # every OS and proved nothing.
+      - name: Install ripgrep (grep parity test)
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get install -y --no-install-recommends ripgrep ;;
+            macOS) HOMEBREW_NO_AUTO_UPDATE=1 brew install ripgrep ;;
+            Windows) choco install ripgrep -y --no-progress ;;
+          esac
+          rg --version
 
       # `shell: bash` on EVERY multi-line step is load-bearing, not cosmetic.
       # On Windows the default shell is PowerShell, which does not abort a
@@ -73,6 +86,14 @@ jobs:
           node bench/size-gate.mjs --only dist:ggcoder
           node bench/startup-gate.mjs
 
+      # Lint and formatting are OS-independent, so one leg is enough.
+      - name: Lint + format check
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          pnpm lint
+          pnpm format:check
+
       - name: Typecheck
         shell: bash
         run: |
@@ -87,6 +108,40 @@ jobs:
           pnpm --filter @kenkaiiii/gg-ai test
           pnpm --filter @kenkaiiii/gg-agent test
           pnpm --filter @kenkaiiii/gg-core test
+
+      # Motion's media regressions decode real clips on every OS. CI-only
+      # provisioning is intentional; never skip these tests when a tool is absent.
+      - name: Ensure FFmpeg and ffprobe for Motion media tests
+        shell: bash
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            case "$RUNNER_OS" in
+              Linux)
+                sudo apt-get update
+                sudo apt-get install -y --no-install-recommends ffmpeg
+                ;;
+              macOS) HOMEBREW_NO_AUTO_UPDATE=1 brew install ffmpeg ;;
+              Windows)
+                # The Chocolatey community feed intermittently 504s; retry
+                # with backoff, and still fail the step if every attempt fails.
+                for attempt in 1 2 3 4; do
+                  if choco install ffmpeg --version=8.0.1 -y --no-progress; then
+                    break
+                  fi
+                  if [ "$attempt" -eq 4 ]; then
+                    echo "choco install ffmpeg failed after $attempt attempts" >&2
+                    exit 1
+                  fi
+                  delay=$((attempt * 30))
+                  echo "choco install ffmpeg failed (attempt $attempt); retrying in ${delay}s" >&2
+                  sleep "$delay"
+                done
+                ;;
+              *) echo "Unsupported media-test runner: $RUNNER_OS" >&2; exit 1 ;;
+            esac
+          fi
+          ffmpeg -version
+          ffprobe -version
 
       # Blocking on every OS, Windows included. This started as a 72-failure
       # Windows backlog that had been invisible because the default PowerShell
@@ -115,9 +170,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # pnpm version comes from package.json's packageManager field.
       - uses: pnpm/action-setup@v6
-        with:
-          version: 10
 
       - uses: actions/setup-node@v7
         with:
@@ -125,6 +179,8 @@ jobs:
           cache: pnpm
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       # Both `cargo test` and the Windows packaged build compile the same large
       # Tauri dependency tree; without a cache the packaged smoke would rebuild
@@ -178,6 +234,18 @@ jobs:
 
       - name: Frontend platform-class test
         run: pnpm --filter gg-app test
+
+      - name: Rust format check
+        if: runner.os == 'Linux'
+        working-directory: gg-app/src-tauri
+        shell: bash
+        run: cargo fmt --check
+
+      # Every OS: lib.rs has Windows- and macOS-only code paths.
+      - name: Rust lint (clippy)
+        working-directory: gg-app/src-tauri
+        shell: bash
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Rust unit tests (path + window-chrome resolution)
         working-directory: gg-app/src-tauri

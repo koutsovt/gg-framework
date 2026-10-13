@@ -3,6 +3,7 @@ import { ThinkingOrb } from "thinking-orbs";
 import { theme } from "./theme";
 import { formatTokenCount } from "./ActivityBar";
 import { ShimmerText } from "./ShimmerText";
+import { useMotionLevel } from "./window-motion";
 
 function formatElapsed(ms: number): string {
   const s = Math.round(ms / 1000);
@@ -46,13 +47,17 @@ export function KenActivityBar({
   // it + the start timestamps, mirroring the ActivityBar's live-tick approach
   // without reading a ref during render.
   const [now, setNow] = useState(() => Date.now());
+  const motion = useMotionLevel();
 
+  // Hidden windows skip the ticks and catch up the moment they're shown.
   useEffect(() => {
+    if (motion === "off") return;
+    setNow(Date.now());
     const tick = setInterval(() => setNow(Date.now()), 250);
     return () => {
       clearInterval(tick);
     };
-  }, []);
+  }, [motion]);
 
   const elapsed = runStartTs ? now - runStartTs : 0;
   const liveThinkingDelta = isThinking && thinkingStartTs ? now - thinkingStartTs : 0;
@@ -70,7 +75,7 @@ export function KenActivityBar({
   if (thinkingLabel) meta.push({ text: thinkingLabel, thinking: true });
 
   return (
-    <div className="statusrow running ken-statusrow" style={{ color: theme.textMuted }}>
+    <div className="statusrow running ken-statusrow dissolve-in" style={{ color: theme.textMuted }}>
       <span className="statusrow-left">
         {/* Tint the canvas alpha with Ken's existing color; the package has no color prop. */}
         <svg width="0" height="0" aria-hidden="true" style={{ position: "absolute" }}>
@@ -86,6 +91,7 @@ export function KenActivityBar({
           state="listening"
           size={20}
           theme="dark"
+          paused={motion !== "full"}
           aria-hidden="true"
           style={{ flexShrink: 0, filter: `url(#${orbTintId})` }}
         />

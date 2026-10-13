@@ -3,11 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
 import type { AgentDefinition } from "./agents.js";
 import { buildSubAgentCompletionFollowUp, SubAgentManager } from "./subagent-manager.js";
 import { SubAgentStore, type PersistedSubAgentRecord } from "./subagent-store.js";
 import { readTurnRecord, writeTurnRecord } from "./subagent-turn-record.js";
 import { AgentNotificationQueue } from "./agent-notifications.js";
+import { getSupportedThinkingLevels } from "./thinking-level.js";
 
 const workerEntry = fileURLToPath(
   new URL("../tools/__fixtures__/fake-subagent-worker.mjs", import.meta.url),
@@ -17,7 +19,7 @@ const agents: AgentDefinition[] = [
     name: "fake",
     description: "Fake test worker",
     tools: ["read"],
-    // Explicit cheap tier — the only way an agent opts out of the parent model.
+    // Legacy `fast` now behaves exactly like `inherit`.
     model: "fast",
     systemPrompt: "fake",
     source: "bundled",
@@ -42,15 +44,26 @@ function manager(
     maxPerModel?: number;
     notifications?: AgentNotificationQueue;
     adoptionPollMs?: number;
+    provider?: Provider;
+    model?: string;
+    getThinkingLevel?: () => ThinkingLevel | undefined;
+    workspaceRoots?: string[];
+    shareWorkspaceRoots?: boolean;
+    defaultAgent?: string;
+    childModel?: { provider: Provider; model: string };
   } = {},
 ) {
   const instance = new SubAgentManager({
     notifications: options.notifications,
     cwd: options.cwd ?? process.cwd(),
+    getWorkspaceRoots: () => options.workspaceRoots ?? [],
+    shareWorkspaceRoots: options.shareWorkspaceRoots,
+    defaultAgent: options.defaultAgent,
+    getChildModel: () => options.childModel,
     agents: options.agentDefs ?? agents,
-    getProvider: () => "openai",
-    getModel: () => "gpt-6-sol",
-    getThinkingLevel: () => "ultra",
+    getProvider: () => options.provider ?? "openai",
+    getModel: () => options.model ?? "gpt-6.1-sol",
+    getThinkingLevel: options.getThinkingLevel,
     getCacheKey: () => "parent-cache",
     getMaxPerModel: () => options.maxPerModel,
     workerEntry,
@@ -77,6 +90,127 @@ afterEach(async () => {
 });
 
 describe("SubAgentManager", () => {
+  it("runs children on the goal's critter model, even on another provider", async () => {
+    const instance = manager({
+      provider: "openai",
+      model: "gpt-6.1-sol",
+      childModel: { provider: "anthropic", model: "claude-sonnet-5-5" },
+    });
+    const requestSpy = vi.spyOn(
+      instance as unknown as { request: (...args: unknown[]) => Promise<unknown> },
+      "request",
+    );
+    await instance.spawn("worker", "do it");
+    const initializeCall = requestSpy.mock.calls.find(([, command]) => command === "initialize");
+    const options = (initializeCall?.[2] as { options: Record<string, unknown> }).options;
+    expect(options).toMatchObject({ provider: "anthropic", model: "claude-sonnet-5-5" });
+    // The parent's model belongs to another provider, so it is no fallback.
+    expect(options.fallbackModel).toBeUndefined();
+  });
+
+  it("starts a child in a folder of the parent's workspace, and only there", async () => {
+    // GG Goals coordinates from its notes folder and sends each worker to the
+    // attached project it works on.
+    const home = await tempDir();
+    const project = await tempDir();
+    const outside = await tempDir();
+    await fs.mkdir(path.join(project, "src"));
+    const instance = manager({ cwd: home, workspaceRoots: [project] });
+    const requestSpy = vi.spyOn(
+      instance as unknown as { request: (...args: unknown[]) => Promise<unknown> },
+      "request",
+    );
+
+    const started = await instance.spawn("fixer", "fix it", undefined, {
+      cwd: path.join(project, "src"),
+    });
+    const initializeCall = requestSpy.mock.calls.find(([, command]) => command === "initialize");
+    expect(initializeCall?.[2]).toMatchObject({ options: { cwd: path.join(project, "src") } });
+    expect(started.cwd).toBe(path.join(project, "src"));
+
+    await expect(instance.spawn("stray", "x", undefined, { cwd: outside })).rejects.toThrow(
+      /outside this session's workspace/,
+    );
+    await expect(instance.spawn("relative", "x", undefined, { cwd: "src" })).rejects.toThrow(
+      /absolute path/,
+    );
+    await expect(
+      instance.spawn("missing", "x", undefined, { cwd: path.join(project, "nope") }),
+    ).rejects.toThrow(/not an existing folder/);
+    // No cwd: the parent's own folder, and nothing recorded.
+    const plain = await instance.spawn("plain", "x");
+    expect(plain.cwd).toBeUndefined();
+  });
+
+  it("gives a child the parent's other roots too when they're shared, less its own folder", async () => {
+    // GG Goals' workers reach every attached folder, not only the one they work in.
+    const home = await tempDir();
+    const site = await tempDir();
+    const docs = await tempDir();
+    const optionsOf = async (share: boolean): Promise<Record<string, unknown>> => {
+      const instance = manager({
+        cwd: home,
+        workspaceRoots: [site, docs],
+        shareWorkspaceRoots: share,
+      });
+      const requestSpy = vi.spyOn(
+        instance as unknown as { request: (...args: unknown[]) => Promise<unknown> },
+        "request",
+      );
+      await instance.spawn("w", "x", undefined, { cwd: site });
+      const call = requestSpy.mock.calls.find(([, command]) => command === "initialize");
+      return (call?.[2] as { options: Record<string, unknown> }).options;
+    };
+    expect((await optionsOf(true)).additionalRoots).toEqual([path.resolve(docs)]);
+    // Not shared (GG Coder): the child gets only its own folder, as before.
+    expect((await optionsOf(false)).additionalRoots).toBeUndefined();
+  });
+
+  it("sends a follow-up the roots attached since the child started", async () => {
+    // Live goal: a website folder attached mid-goal stayed blocked for the
+    // resumed worker's write tool, so it edited through the shell instead.
+    const home = await tempDir();
+    const site = await tempDir();
+    const web = await tempDir();
+    const roots = [site];
+    const instance = manager({ cwd: home, workspaceRoots: roots, shareWorkspaceRoots: true });
+    const requestSpy = vi.spyOn(
+      instance as unknown as { request: (...args: unknown[]) => Promise<unknown> },
+      "request",
+    );
+    const child = await instance.spawn("w", "fast", "fake", { cwd: site });
+    await instance.wait([child.agent_id], "all", 1_000);
+
+    roots.push(web);
+    await instance.followup(child.agent_id, "fast");
+    const call = requestSpy.mock.calls.find(([, command]) => command === "followup");
+    expect(call?.[2]).toMatchObject({ additionalRoots: [path.resolve(web)] });
+  });
+
+  it("starts a child that names no agent as the default agent, when there is one", async () => {
+    // Live run: GG Goals left out `agent` and the worker ran with GG Coder's
+    // generic prompt instead of its team's rules.
+    const spawnAs = async (defaultAgent?: string): Promise<Record<string, unknown>> => {
+      const instance = manager({ defaultAgent });
+      const requestSpy = vi.spyOn(
+        instance as unknown as { request: (...args: unknown[]) => Promise<unknown> },
+        "request",
+      );
+      const started = await instance.spawn("w", "x");
+      const call = requestSpy.mock.calls.find(([, command]) => command === "initialize");
+      return {
+        ...(call?.[2] as { options: Record<string, unknown> }).options,
+        name: started.agent_name,
+      };
+    };
+    const named = await spawnAs("fake");
+    expect(named.name).toBe("fake");
+    expect(named.agentPrompt).toBe("fake");
+    const plain = await spawnAs(undefined);
+    expect(plain.name).toBeUndefined();
+    expect(plain.agentPrompt).toBeUndefined();
+  });
+
   it("applies explicit spawn overrides for harness-owned children", async () => {
     const instance = manager();
     const requestSpy = vi.spyOn(
@@ -87,18 +221,21 @@ describe("SubAgentManager", () => {
     );
 
     // The independent Ideal reviewer: read-only tools, forced ACTIVE model —
-    // agent-definition routing ("fake" would use the fast model) is bypassed.
+    // agent-definition routing is bypassed —
+    // and its own shorter time limit, which the worker enforces.
     await instance.spawn("reviewer", "review the work", undefined, {
-      model: "gpt-6-sol",
+      model: "gpt-6.1-sol",
       tools: ["read", "grep", "find", "ls"],
+      turnTimeoutMs: 120_000,
     });
 
     const initializeCall = requestSpy.mock.calls.find(([, command]) => command === "initialize");
     expect(initializeCall?.[2]).toMatchObject({
       options: {
-        model: "gpt-6-sol",
+        model: "gpt-6.1-sol",
         allowedTools: ["read", "grep", "find", "ls"],
-        promptCacheKey: "parent-cache:subagent:gpt-6-sol:default",
+        promptCacheKey: "parent-cache:subagent:gpt-6.1-sol:default",
+        turnTimeoutMs: 120_000,
       },
     });
   });
@@ -117,23 +254,112 @@ describe("SubAgentManager", () => {
     const initializeCall = requestSpy.mock.calls.find(([, command]) => command === "initialize");
     expect(initializeCall?.[2]).toMatchObject({
       options: {
-        model: "gpt-6-luna",
-        promptCacheKey: "parent-cache:subagent:gpt-6-luna:fake",
+        model: "gpt-6.1-sol",
+        promptCacheKey: "parent-cache:subagent:gpt-6.1-sol:fake",
       },
+    });
+  });
+
+  it.each([
+    ["legacy fast", "fake"],
+    ["inheriting", "inheritor"],
+    ["unnamed", undefined],
+  ])("runs the %s child on the parent model with inherited Ultra", async (_label, agentName) => {
+    // Neither legacy fast nor an unnamed child may silently downgrade
+    // the parent's model or reasoning selection.
+    const inheriting: AgentDefinition = {
+      name: "inheritor",
+      description: "Inherits everything",
+      tools: ["read"],
+      systemPrompt: "fake",
+      source: "bundled",
+    };
+    const instance = manager({
+      agentDefs: [...agents, inheriting],
+      getThinkingLevel: () => "ultra",
+    });
+    const requestSpy = vi.spyOn(
+      instance as unknown as {
+        request: (...args: unknown[]) => Promise<unknown>;
+      },
+      "request",
+    );
+
+    await instance.spawn("ultra-child", "fast", agentName);
+
+    const initializeCall = requestSpy.mock.calls.find(([, command]) => command === "initialize");
+    expect(initializeCall?.[2]).toMatchObject({
+      options: { model: "gpt-6.1-sol", fallbackModel: undefined, thinkingLevel: "ultra" },
+    });
+  });
+
+  it("reads current parent reasoning on each spawn and retains it for fallback", async () => {
+    let thinking: ThinkingLevel | undefined = "ultra";
+    const instance = manager({ getThinkingLevel: () => thinking });
+    const requestSpy = vi.spyOn(
+      instance as unknown as { request: (...args: unknown[]) => Promise<unknown> },
+      "request",
+    );
+    await instance.spawn("pinned", "fast", undefined, { model: "gpt-6-luna" });
+    thinking = "high";
+    await instance.spawn("high", "fast");
+    thinking = undefined;
+    await instance.spawn("off", "fast");
+    const initializeCalls = requestSpy.mock.calls.filter(([, command]) => command === "initialize");
+    expect(initializeCalls[0]?.[2]).toMatchObject({
+      options: { thinkingLevel: "max", parentThinkingLevel: "ultra", fallbackModel: "gpt-6.1-sol" },
+    });
+    expect(initializeCalls[1]?.[2]).toMatchObject({
+      options: { thinkingLevel: "high", parentThinkingLevel: "high" },
+    });
+    // JSON omits undefined fields; neither the child nor fallback should enable thinking.
+    expect(initializeCalls[2]?.[2]).toMatchObject({
+      options: { thinkingLevel: undefined, parentThinkingLevel: undefined },
+    });
+  });
+
+  it("uses the lowest thinking level of an overridden model, not the agent's own", async () => {
+    // The reviewer forces a model at spawn time; its rung must come from THAT
+    // model's ladder.
+    const instance = manager({ provider: "anthropic", model: "claude-opus-5-5" });
+    const requestSpy = vi.spyOn(
+      instance as unknown as {
+        request: (...args: unknown[]) => Promise<unknown>;
+      },
+      "request",
+    );
+
+    await instance.spawn("override-child", "fast", "fake", { model: "claude-retired-model" });
+
+    const parentLowest = getSupportedThinkingLevels("anthropic", "claude-opus-5-5")[0];
+    const overrideLowest = getSupportedThinkingLevels("anthropic", "claude-retired-model")[0];
+    // The ladders must differ, or this test could not tell the two apart.
+    expect(overrideLowest).not.toBe(parentLowest);
+    const initializeCall = requestSpy.mock.calls.find(([, command]) => command === "initialize");
+    expect(initializeCall?.[2]).toMatchObject({
+      options: { model: "claude-retired-model", thinkingLevel: overrideLowest },
     });
   });
 
   it("returns after launch and overlaps eight child turns", async () => {
     const instance = manager();
+    // "hold" turns run until released, so all eight are provably still active
+    // when the ninth spawn hits the cap. A timed turn raced process startup:
+    // on a loaded runner the first child finished before the last one
+    // launched, which freed a slot for the ninth.
     const children = await Promise.all(
-      [1, 2, 3, 4, 5, 6, 7, 8].map((number) => instance.spawn(`task-${number}`, "slow", "fake")),
+      [1, 2, 3, 4, 5, 6, 7, 8].map((number) => instance.spawn(`task-${number}`, "hold", "fake")),
     );
     // Returning every child in the running state proves spawn resolves on the
     // start acknowledgement rather than waiting for the turn to complete.
     // Avoid a wall-clock threshold here: process startup is scheduler-dependent
     // under the full parallel workspace suite.
     expect(children.every((child) => child.state === "running")).toBe(true);
-    await expect(instance.spawn("ninth", "slow", "fake")).rejects.toThrow("At most 8");
+    await expect(instance.spawn("ninth", "hold", "fake")).rejects.toThrow("At most 8");
+    // A queued message releases each held turn.
+    for (const child of children) {
+      expect(await instance.sendMessage(child.agent_id, "release")).toBe(1);
+    }
     const result = await instance.wait(
       children.map((child) => child.agent_id),
       "all",
@@ -147,6 +373,29 @@ describe("SubAgentManager", () => {
       cacheRead: 20,
       cacheWrite: 5,
     });
+  });
+
+  it("holds the limit and unique names when a batch starts children together", async () => {
+    const instance = manager();
+    // spawn_agent's batch form starts every task at once with allSettled; the
+    // limit and name checks must still see the siblings started in the same tick.
+    const names = ["a", "b", "c", "d", "e", "f", "g", "a", "h", "i"];
+    const settled = await Promise.allSettled(
+      names.map((name) => instance.spawn(name, "hold", "fake")),
+    );
+
+    const started = settled.filter((result) => result.status === "fulfilled");
+    const refused = settled.flatMap((result) =>
+      result.status === "rejected" ? [String(result.reason)] : [],
+    );
+    expect(started).toHaveLength(8);
+    expect(refused).toEqual([
+      expect.stringContaining('An agent named "a" already exists'),
+      expect.stringContaining("At most 8"),
+    ]);
+    for (const result of started) {
+      expect(await instance.sendMessage(result.value.agent_id, "release")).toBe(1);
+    }
   });
 
   it("pushes a bounded completion notification without waiting", async () => {
@@ -164,6 +413,38 @@ describe("SubAgentManager", () => {
     expect(drained[0]!.text).toContain("completed");
     expect(drained[0]!.text).toContain("wait_agent");
     expect(drained[0]!.text.length).toBeLessThanOrEqual(512);
+  });
+
+  it("sends acceptance checks with the turn and surfaces the verdict", async () => {
+    const notifications = new AgentNotificationQueue();
+    const instance = manager({ notifications });
+    const checks = [
+      { type: "file_exists" as const, target: "a.ts" },
+      { type: "command_passed" as const, target: "pnpm test" },
+    ];
+
+    const child = await instance.spawn("checked", "fast", "fake", { checks });
+    const agent = (await instance.wait([child.agent_id], "all", 1_000)).agents[0]!;
+    expect(agent.acceptance).toBe("0/2 passed");
+    expect(notifications.drain()[0]!.text).toContain("Acceptance checks: 0/2 passed.");
+
+    // A follow-up without checks clears the previous turn's verdict.
+    await instance.followup(child.agent_id, "fast");
+    const next = (await instance.wait([child.agent_id], "all", 1_000)).agents[0]!;
+    expect(next.acceptance).toBeUndefined();
+  });
+
+  it("carries the child's receipt in wait() payloads, after a truncated output", async () => {
+    const instance = manager();
+    const child = await instance.spawn("receipt-child", "x".repeat(40_000), "fake");
+    const waited = await instance.wait([child.agent_id], "all", 1_000);
+    const agent = waited.agents[0]!;
+    expect(agent.state).toBe("completed");
+    expect(agent.output).toContain("[output truncated at");
+    expect(agent.receipt).toBe("Receipt (1 call): read a.ts");
+    // Rendered after `output` in the wait_agent JSON the parent reads.
+    const keys = Object.keys(agent);
+    expect(keys.indexOf("receipt")).toBe(keys.indexOf("output") + 1);
   });
 
   it("waits for any, times out, steers, interrupts, and reuses context", async () => {
@@ -185,8 +466,16 @@ describe("SubAgentManager", () => {
   });
 
   it("enforces the per-model cap against the resolved child model", async () => {
-    // The "fake" agent declares model: fast (gpt-6-luna); an agent with no
-    // model policy inherits the parent model (gpt-6-sol).
+    // The "pinned" agent declares its own model id (gpt-6-luna); an agent with
+    // no model policy inherits the parent model (gpt-6.1-sol).
+    const pinnedAgent: AgentDefinition = {
+      name: "pinned",
+      description: "Pinned to its own model",
+      tools: ["read"],
+      model: "gpt-6-luna",
+      systemPrompt: "fake",
+      source: "project",
+    };
     const shellAgent: AgentDefinition = {
       name: "sheller",
       description: "Shell-capable worker",
@@ -194,19 +483,19 @@ describe("SubAgentManager", () => {
       systemPrompt: "fake",
       source: "bundled",
     };
-    const instance = manager({ agentDefs: [...agents, shellAgent], maxPerModel: 1 });
+    const instance = manager({ agentDefs: [pinnedAgent, shellAgent], maxPerModel: 1 });
 
-    const first = await instance.spawn("first-luna", "slow", "fake");
+    const first = await instance.spawn("first-luna", "slow", "pinned");
     expect(first.model).toBe("gpt-6-luna");
 
     // Same resolved model at the cap → rejected with the setting named.
-    await expect(instance.spawn("second-luna", "slow", "fake")).rejects.toThrow(
+    await expect(instance.spawn("second-luna", "slow", "pinned")).rejects.toThrow(
       "At most 1 agents may run at once on model gpt-6-luna (subagentMaxPerModel)",
     );
 
     // A different resolved model is unaffected by the luna cap.
     const other = await instance.spawn("parent-model", "slow", "sheller");
-    expect(other.model).toBe("gpt-6-sol");
+    expect(other.model).toBe("gpt-6.1-sol");
   });
 
   it("names the available agents when asked for one that does not exist", async () => {
@@ -288,6 +577,7 @@ describe("SubAgentManager", () => {
     await fs.mkdir(cwd, { recursive: true });
     const instance = manager({
       idleTimeoutMs: 5,
+      getThinkingLevel: () => "ultra",
       cwd,
       sessionRootDir,
       store: new SubAgentStore(path.join(root, "state")),
@@ -311,7 +601,7 @@ describe("SubAgentManager", () => {
     await instance.followup(child.agent_id, "late");
     const initialize = requestSpy.mock.calls.find(([, command]) => command === "initialize");
     expect(initialize?.[2]).toMatchObject({
-      options: { childSessionPath },
+      options: { childSessionPath, thinkingLevel: "ultra", parentThinkingLevel: "ultra" },
     });
     const resumed = await instance.wait([child.agent_id], "all", 500);
     expect(resumed.agents[0]).toMatchObject({ state: "completed", collected: true });
@@ -358,7 +648,7 @@ describe("SubAgentManager", () => {
       token_usage: { input: 2, output: 3 },
       agent_name: "fake",
       provider: "openai",
-      model: "gpt-6-sol",
+      model: "gpt-6.1-sol",
       child_session_id: "child-session",
       child_session_path: path.join(sessionRootDir, "project", "child.jsonl"),
       collected: false,
@@ -461,6 +751,8 @@ describe("SubAgentManager", () => {
     const instance = manager({ store, cwd, sessionRootDir });
 
     await instance.hydrate("current-parent");
+    // Retention runs after hydrate returns so it never delays window readiness.
+    await instance.waitForRetention();
 
     await expect(fs.stat(unreferencedSession)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(fs.stat(referencedSession)).resolves.toBeTruthy();
@@ -528,6 +820,7 @@ describe("durable turn-record adoption on hydrate", () => {
     await writeTurnRecord(childPath, {
       status: "completed",
       output: "orphan result",
+      receipt: "Receipt (2 calls): read src/a.ts ×2",
       model: "fast",
       turn_count: 4,
       token_usage: { input: 30, output: 8 },
@@ -546,6 +839,7 @@ describe("durable turn-record adoption on hydrate", () => {
     const snapshot = instance.list().find((s) => s.agent_id === "a1")!;
     expect(snapshot.state).toBe("completed");
     expect(snapshot.output).toBe("orphan result");
+    expect(snapshot.receipt).toBe("Receipt (2 calls): read src/a.ts ×2");
     expect(snapshot.error).toBeUndefined();
     expect(snapshot.turn_count).toBe(4);
     expect(snapshot.token_usage).toMatchObject({ input: 30, output: 8 });

@@ -91,7 +91,7 @@ describe("AgentSession built-in tool tiering", () => {
       const prompt = String(session.getMessages()[0]?.content ?? "");
 
       expect(live).toContain("tool_search");
-      expect(prompt).toContain("Available on demand (call `tool_search` to load):");
+      expect(prompt).toContain("On demand (call by name;");
 
       const deferredHere = DEFERRED_TOOL_NAMES.filter((name) => prompt.includes(`- **${name}**:`));
       expect(deferredHere.length).toBeGreaterThan(0);
@@ -99,11 +99,102 @@ describe("AgentSession built-in tool tiering", () => {
         expect(live, `${name} should not carry a schema`).not.toContain(name);
       }
       // Core tools are unaffected.
-      for (const name of ["read", "edit", "bash", "grep", "code_nav"]) {
+      for (const name of ["read", "edit", "bash", "grep"]) {
         expect(live).toContain(name);
       }
     } finally {
       await session.dispose();
+    }
+  }, 20_000);
+
+  it("keeps a session's chosen built-ins in the core set, in their original order", async () => {
+    // GG Goals orchestrates: tools it relies on must not need a tool_search turn.
+    const plain = await createSession();
+    const kept = await createSession({ coreTools: ["web_fetch", "find"] });
+    try {
+      const before = liveToolNames(plain);
+      const after = liveToolNames(kept);
+      expect(before).not.toContain("web_fetch");
+      expect(before).not.toContain("find");
+      expect(after).toContain("web_fetch");
+      expect(after).toContain("find");
+      // Everything else is unchanged and keeps its relative order.
+      expect(after.filter((name) => name !== "web_fetch" && name !== "find")).toEqual(before);
+      // Offered once, not also as a deferred catalog entry.
+      const prompt = String(kept.getMessages()[0]?.content ?? "");
+      expect(prompt).not.toContain("- **web_fetch**:");
+      expect(prompt).not.toContain("- **find**:");
+    } finally {
+      await plain.dispose();
+      await kept.dispose();
+    }
+  }, 20_000);
+
+  it("never creates .gg folders in a sub-agent worker's folder", async () => {
+    // Regression: GG Goals' workers left empty .gg/agents, commands and
+    // skills folders in the user's attached folders.
+    const worker = await createSession({ projectCustomization: true, subagentWorker: true });
+    try {
+      await expect(fs.stat(path.join(tempProject, ".gg"))).rejects.toThrow();
+    } finally {
+      await worker.dispose();
+    }
+    const owner = await createSession({ projectCustomization: true });
+    try {
+      expect((await fs.stat(path.join(tempProject, ".gg", "skills"))).isDirectory()).toBe(true);
+    } finally {
+      await owner.dispose();
+    }
+  }, 20_000);
+
+  it("offers only a fixed sub-agent team when one is given, instead of discovering agents", async () => {
+    // GG Goals' workers are its own team, never GG Coder's or the user's.
+    const team = [
+      {
+        name: "goal-builder",
+        description: "Makes changes.",
+        tools: ["read", "write"],
+        model: "inherit",
+        systemPrompt: "Build.",
+        source: "bundled" as const,
+      },
+    ];
+    const plain = await createSession({ coreTools: ["spawn_agent"], globalSubagents: true });
+    const goals = await createSession({ coreTools: ["spawn_agent"], subAgents: team });
+    const spawnDescription = (session: unknown): string =>
+      (session as { tools: { name: string; description: string }[] }).tools.find(
+        (t) => t.name === "spawn_agent",
+      )?.description ?? "";
+    try {
+      expect(spawnDescription(goals)).toContain("- goal-builder: Makes changes.");
+      expect(spawnDescription(goals)).not.toContain("- bee:");
+      expect(spawnDescription(plain)).toContain("- bee:");
+      expect(spawnDescription(plain)).not.toContain("goal-builder");
+    } finally {
+      await plain.dispose();
+      await goals.dispose();
+    }
+  }, 20_000);
+
+  it("leaves out a session's withheld tools entirely, keeping the rest and their tiering", async () => {
+    // GG Goals never edits or runs anything: it never has those tools, so it
+    // can't reach for a shell to look around.
+    const plain = await createSession();
+    const without = ["edit", "write", "bash", "ui_adopt"];
+    const goals = await createSession({ withoutTools: without });
+    try {
+      const before = liveToolNames(plain);
+      const after = liveToolNames(goals);
+      for (const name of without) expect(after).not.toContain(name);
+      expect(after).toEqual(before.filter((name) => !without.includes(name)));
+      expect(after).toContain("tool_search");
+      // Not offered on demand either.
+      const prompt = String(goals.getMessages()[0]?.content ?? "");
+      expect(prompt).not.toContain("- **ui_adopt**:");
+      expect(String(plain.getMessages()[0]?.content ?? "")).toContain("- **ui_adopt**:");
+    } finally {
+      await plain.dispose();
+      await goals.dispose();
     }
   }, 20_000);
 
@@ -126,6 +217,89 @@ describe("AgentSession built-in tool tiering", () => {
         .find((tool) => tool.name === "ui_registry")!
         .execute({ action: "motion" }, context);
       expect(JSON.parse(String(result)).kind).toBe("animation-api");
+    } finally {
+      await session.dispose();
+    }
+  }, 20_000);
+
+  it("loads wait_agent as soon as spawn_agent succeeds, skipping the tool_search turn", async () => {
+    // spawn_agent only exists when an agent is defined.
+    await fs.mkdir(path.join(tempHome, ".gg", "agents"), { recursive: true });
+    await fs.writeFile(
+      path.join(tempHome, ".gg", "agents", "owl.md"),
+      "---\nname: owl\ndescription: Read-only helper\ntools: read\n---\nYou read code.\n",
+    );
+    const session = await createSession({ globalSubagents: true });
+    try {
+      const tools = (session as unknown as { tools: AgentTool[] }).tools;
+      expect(liveToolNames(session)).not.toContain("wait_agent");
+      // spawn_agent is deferred too; the agent loop loads it on first call.
+      expect(liveToolNames(session)).not.toContain("spawn_agent");
+      const resolve = (
+        session as unknown as { promoteDeferredBuiltin(name: string): AgentTool | undefined }
+      ).promoteDeferredBuiltin.bind(session);
+      const spawn = resolve("spawn_agent")!;
+      expect(liveToolNames(session).at(-1)).toBe("spawn_agent");
+      expect(tools.at(-1)).toBe(spawn);
+      const context = { signal: new AbortController().signal, toolCallId: "spawn-promote-test" };
+      const subAgents = (
+        session as unknown as { subAgentManager: { spawn: (...a: unknown[]) => Promise<unknown> } }
+      ).subAgentManager;
+      const spawnSpy = vi.spyOn(subAgents, "spawn");
+
+      // A spawn that starts nothing fails and must not change the tool list.
+      spawnSpy.mockRejectedValueOnce(new Error("At most 8 agents may run at once"));
+      await expect(
+        spawn.execute({ tasks: [{ task_name: "x", task: "y" }] }, context),
+      ).rejects.toThrow(/No agent started/);
+      expect(liveToolNames(session)).not.toContain("wait_agent");
+
+      const before = liveToolNames(session);
+      spawnSpy.mockResolvedValue({ agent_id: "abcd1234", task_name: "scan", state: "running" });
+      await spawn.execute({ tasks: [{ task_name: "scan", task: "look" }] }, context);
+
+      const after = liveToolNames(session);
+      // Appended once, after every existing tool, so the cached prefix holds.
+      expect(after.slice(0, before.length)).toEqual(before);
+      expect(after.filter((name) => name === "wait_agent")).toEqual(["wait_agent"]);
+      await spawn.execute({ tasks: [{ task_name: "scan2", task: "look" }] }, context);
+      expect(liveToolNames(session)).toEqual(after);
+      // The prompt index stops advertising it once it carries its own schema.
+      const index = (
+        session as unknown as { deferredToolNamesForPrompt(live: string[]): string[] }
+      ).deferredToolNamesForPrompt(after);
+      expect(index).not.toContain("wait_agent");
+    } finally {
+      await session.dispose();
+    }
+  }, 20_000);
+
+  it("loads a deferred built-in called by name, and the task tools once bash backgrounds", async () => {
+    const session = await createSession();
+    try {
+      const resolve = (
+        session as unknown as { promoteDeferredBuiltin(name: string): AgentTool | undefined }
+      ).promoteDeferredBuiltin.bind(session);
+      const before = liveToolNames(session);
+      expect(before).not.toContain("find");
+      expect(before).not.toContain("task_output");
+
+      expect(resolve("find")?.name).toBe("find");
+      expect(resolve("not_a_tool")).toBeUndefined();
+      expect(liveToolNames(session)).toEqual([...before, "find"]);
+
+      const tools = (session as unknown as { tools: AgentTool[] }).tools;
+      const bash = tools.find((tool) => tool.name === "bash");
+      const context = { signal: new AbortController().signal, toolCallId: "bg-promote-test" };
+      await bash?.execute({ command: "true" }, context);
+      expect(liveToolNames(session)).not.toContain("task_output");
+      const bg = await bash?.execute({ command: "true", run_in_background: true }, context);
+      const id = /id="([^"]+)"/.exec(String(bg))?.[1];
+      expect(liveToolNames(session).slice(-3)).toEqual(["task_output", "task_send", "task_stop"]);
+      if (id) {
+        const output = tools.find((tool) => tool.name === "task_output");
+        await output?.execute({ id, wait_ms: 5_000 }, context);
+      }
     } finally {
       await session.dispose();
     }

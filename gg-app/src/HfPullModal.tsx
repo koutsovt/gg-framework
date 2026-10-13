@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { theme } from "./theme";
 import { Modal } from "./Modal";
+import { ModalDismissButton } from "./modal-embed";
 import { ListSkeleton } from "./Skeleton";
 import {
   hfPull,
@@ -167,7 +168,7 @@ export function HfPullModal({ onClose }: Props): React.ReactElement {
           )}
 
           {!searching && results && results.length === 0 && !searchError && (
-            <div className="hf-empty" style={{ color: theme.textDim }}>
+            <div className="hf-empty" style={{ color: theme.textMuted }}>
               No GGUF models matched. Try a shorter search.
             </div>
           )}
@@ -281,9 +282,9 @@ export function HfPullModal({ onClose }: Props): React.ReactElement {
             Download another
           </button>
         )}
-        <button className="modal-btn" onClick={onClose}>
+        <ModalDismissButton onClick={onClose}>
           {done ? "Done" : installing ? "Hide" : "Close"}
-        </button>
+        </ModalDismissButton>
       </div>
     </Modal>
   );

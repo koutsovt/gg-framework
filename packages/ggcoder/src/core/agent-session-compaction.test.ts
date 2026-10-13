@@ -262,6 +262,39 @@ describe("AgentSession compaction persistence", () => {
   }, 15_000);
 });
 
+/** A 150k-char read superseded by a later read of the same file. */
+function supersededReadHistory(): Message[] {
+  return [
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_call", id: "old-read", name: "read", args: { file_path: "src/a.ts" } },
+      ],
+    },
+    {
+      role: "tool",
+      content: [{ type: "tool_result", toolCallId: "old-read", content: "x".repeat(150_000) }],
+    },
+    { role: "user", content: "turn 2" },
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_call", id: "new-read", name: "read", args: { file_path: "src/a.ts" } },
+      ],
+    },
+    { role: "tool", content: [{ type: "tool_result", toolCallId: "new-read", content: "fresh" }] },
+    {
+      role: "assistant",
+      content: [{ type: "tool_call", id: "latest", name: "grep", args: { pattern: "x" } }],
+    },
+    {
+      role: "tool",
+      content: [{ type: "tool_result", toolCallId: "latest", content: "latest evidence" }],
+    },
+    { role: "user", content: "turn 3" },
+  ];
+}
+
 describe("AgentSession stale tool-output pruning", () => {
   it("stubs superseded reads in-place during the pre-step transform", async () => {
     shouldCompactMock.mockReturnValue(false);
@@ -305,7 +338,11 @@ describe("AgentSession stale tool-output pruning", () => {
         },
         { role: "user", content: "turn 3" },
       );
-      capturedMessages = await options.transformContext!(messages, { pendingMessages: [] });
+      // Big enough context for pruning to pay for the cache rewrite.
+      capturedMessages = await options.transformContext!(messages, {
+        usage: { inputTokens: 180_000, outputTokens: 500 },
+        pendingMessages: [],
+      });
       yield { type: "agent_done" };
     });
 
@@ -329,6 +366,45 @@ describe("AgentSession stale tool-output pruning", () => {
     expect(oldRead?.content).toContain("superseded by a newer read");
     expect(newRead?.content).toBe("fresh");
     expect(compactMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves tool output alone while the context is far below the compaction limit", async () => {
+    // Live goal at 117k of a 1M window: each prune freed ~20k tokens but
+    // re-sent 70–100k uncached, so a small context must not be pruned.
+    shouldCompactMock.mockReturnValue(false);
+    let capturedMessages: Message[] = [];
+
+    agentLoopMock.mockImplementation(async function* (
+      messages: Message[],
+      options: {
+        transformContext?: (m: Message[], o: TransformContextOptions) => Promise<Message[]>;
+      },
+    ) {
+      messages.push(...supersededReadHistory());
+      capturedMessages = await options.transformContext!(messages, {
+        usage: { inputTokens: 1_000, outputTokens: 100 },
+        pendingMessages: [],
+      });
+      yield { type: "agent_done" };
+    });
+
+    const { AgentSession } = await import("./agent-session.js");
+    const session = new AgentSession({
+      provider: "anthropic",
+      model: "claude-test",
+      cwd: tmpProject,
+      systemPrompt: "system prompt",
+      transient: true,
+    });
+    await session.initialize();
+    await session.prompt("small context");
+    await session.dispose();
+
+    const oldRead = capturedMessages
+      .filter((msg) => msg.role === "tool")
+      .flatMap((msg) => (Array.isArray(msg.content) ? msg.content : []))
+      .find((r) => r.type === "tool_result" && r.toolCallId === "old-read");
+    expect(oldRead?.content).toBe("x".repeat(150_000));
   });
 
   it("discards the turn's provider usage after a prune so freed tokens defer compaction", async () => {
@@ -453,6 +529,58 @@ describe("AgentSession post-turn compaction", () => {
     // compaction's promise tracking.
     await session.prompt("next turn");
     expect(compactMock).toHaveBeenCalledTimes(1);
+    await session.dispose();
+  });
+
+  it("newSession() waits for a background compaction so it can't restore the old history", async () => {
+    // Accepting a plan resets into a fresh session. A post-turn compaction
+    // still running at that moment used to land afterwards and swap the whole
+    // planning conversation back in, dropping the approved plan.
+    let overThreshold = false;
+    let releaseCompaction: (() => void) | undefined;
+    let compactFinished = false;
+    shouldCompactMock.mockImplementation(() => overThreshold);
+    compactMock.mockImplementation(async () => {
+      await new Promise<void>((resolve) => {
+        releaseCompaction = resolve;
+      });
+      overThreshold = false;
+      compactFinished = true;
+      return compactionResult([
+        { role: "system", content: "system prompt" },
+        { role: "user", content: "[compacted planning history]" },
+      ] as Message[]);
+    });
+    agentLoopMock.mockImplementation(async function* (messages: Message[]) {
+      messages.push({ role: "assistant", content: "plan submitted" });
+      overThreshold = true;
+      yield { type: "agent_done" };
+    });
+
+    const { AgentSession } = await import("./agent-session.js");
+    const session = new AgentSession({
+      provider: "anthropic",
+      model: "claude-test",
+      cwd: tmpProject,
+      systemPrompt: "system prompt",
+      transient: true,
+    });
+    await session.initialize();
+    await session.prompt("plan the thing");
+    await vi.waitFor(() => expect(releaseCompaction).toBeDefined());
+
+    const reset = session.newSession(true);
+    // Let the reset get going while the compaction is still parked, then
+    // release it and let both settle.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    releaseCompaction?.();
+    await reset;
+    await vi.waitFor(() => expect(compactFinished).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const texts = session.getMessages().map((message) => JSON.stringify(message.content));
+    expect(texts.some((text) => text.includes("compacted planning history"))).toBe(false);
+    expect(session.getMessages().filter((message) => message.role !== "system")).toHaveLength(0);
     await session.dispose();
   });
 

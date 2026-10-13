@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 import { render, screen } from "@testing-library/react";
 import { theme } from "./theme";
-import { INITIAL_ACTIVITY } from "./task-activity";
+import { INITIAL_ACTIVITY, type TaskActivity, type TaskPhase } from "./task-activity";
 import { describe, expect, it, vi } from "vitest";
-import { ActivityBar } from "./ActivityBar";
+import { ActivityBar, ggMoodFor } from "./ActivityBar";
 
 const baseProps = {
   running: true,
@@ -235,5 +235,95 @@ describe("ActivityBar cancellation state", () => {
     expect((button as HTMLButtonElement).disabled).toBe(true);
     expect(button.textContent).toContain("Stopping…");
     expect(screen.getByRole("status")).toBeTruthy();
+  });
+});
+
+describe("ActivityBar robot face", () => {
+  const settled = (
+    phase: TaskPhase,
+    label: string,
+    extra: Partial<TaskActivity> = {},
+  ): TaskActivity => ({
+    ...INITIAL_ACTIVITY,
+    phase,
+    label,
+    startedAt: 1,
+    endedAt: 2,
+    ...extra,
+  });
+
+  it.each([
+    ["done", settled("done", "Done · checks passed"), "happy"],
+    ["stopped", settled("stopped", "Stopped · unfinished"), "sad"],
+    ["review capped", settled("stopped", "Paused · review limit reached"), "sad"],
+    ["needs you", settled("attention", "Your decision needed"), "curious"],
+    ["not verified", settled("unverified", "Verification incomplete"), "worried"],
+    ["cut short", settled("unverified", "Response incomplete"), "worried"],
+    ["checks failed", settled("failed", "Checks failed"), "shocked"],
+    ["task failed", settled("failed", "Task failed"), "shocked"],
+  ] as const)("%s shows the %s robot instead of a dot", (_name, activity, mood) => {
+    const { container } = render(
+      <ActivityBar {...baseProps} running={false} activity={activity} />,
+    );
+    const face = container.querySelector(".gg-face");
+    expect(face?.classList.contains(`gg-face-${mood}`)).toBe(true);
+    expect(face?.getAttribute("aria-hidden")).toBe("true");
+    expect(container.querySelector(".statusrow-icon")).toBeNull();
+  });
+
+  it("is the ready robot when idle and gives way to the orb while working", () => {
+    const { container, rerender } = render(<ActivityBar {...baseProps} running={false} />);
+    expect(container.querySelector(".gg-face-ready")).not.toBeNull();
+    rerender(<ActivityBar {...baseProps} />);
+    expect(container.querySelector(".gg-face")).toBeNull();
+  });
+});
+
+describe("ggMoodFor", () => {
+  it.each([
+    [theme.success, "done", "happy"],
+    [theme.error, "failed", "shocked"],
+    [theme.warning, "stopped", "sad"],
+    [theme.warning, "attention", "curious"],
+    [theme.warning, "unverified", "worried"],
+    [theme.warning, "working", "worried"],
+    [theme.textMuted, "idle", "ready"],
+  ] as const)("tone %s, phase %s → %s", (tone, phase, mood) => {
+    expect(ggMoodFor({ ...INITIAL_ACTIVITY, phase }, tone)).toBe(mood);
+  });
+});
+
+describe("ActivityBar timer", () => {
+  it("keeps counting from the run's start when the chat is hidden and shown again", async () => {
+    // Regression: going to a goal's Workers view and back restarted the timer
+    // at 0s, because the bar took a fresh start when its effects re-ran.
+    const { Activity } = await import("react");
+    const { act } = await import("@testing-library/react");
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(100_000);
+      const startedAt = 100_000;
+      const view = (shown: boolean) => (
+        <Activity mode={shown ? "visible" : "hidden"}>
+          <ActivityBar {...baseProps} runStartedAt={startedAt} />
+        </Activity>
+      );
+      const { rerender, container } = render(view(true));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(24_000);
+      });
+      expect(container.textContent).toContain("24s");
+      rerender(view(false));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      rerender(view(true));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      expect(container.textContent).toContain("30s");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -4,6 +4,7 @@
 //   - invoke("agent_state" | "agent_prompt" | "agent_cancel")
 //   - listen("agent-event")  ← forwarded SSE frames
 import { invoke } from "@tauri-apps/api/core";
+import type { ChatErrorData } from "./chat-error";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { error as logError, info as logInfo } from "@tauri-apps/plugin-log";
 
@@ -88,8 +89,17 @@ export interface BackgroundTask {
   exitCode: number | null;
 }
 
-export type WorkspaceMode = "code" | "chat";
+export type WorkspaceMode = "code" | "chat" | "motion";
 export type ChatAgentId = "general" | "therapist" | "research";
+
+/**
+ * Product name shown when a window has no project context to title it. A Goal
+ * window is a code-mode session whose agent is GG Goals.
+ */
+export function workspaceProductName(mode: WorkspaceMode, isGoal = false): string {
+  if (isGoal) return "GG Goals";
+  return mode === "chat" ? "GG Chat" : mode === "motion" ? "GG Motion" : "GG Coder";
+}
 
 export type MemoryCategory =
   "identity" | "preference" | "project" | "relationship" | "health" | "other";
@@ -171,6 +181,9 @@ export interface AgentState {
   gitHubRepoUrl?: string | null;
   /** GitHub Actions for the current commit; null when no runs are available. */
   gitHubCI?: GitHubCI | null;
+  /** Raw Project Health from the sidecar (code mode); validate with
+   *  `parseProjectHealth` before use. null until the first scan lands. */
+  projectHealth?: unknown;
   /** Extra workspace roots added with /add-dir. Absent on older sidecars. */
   additionalRoots?: string[];
   /** True when the active model can accept native video input. */
@@ -187,6 +200,32 @@ export interface AgentState {
   kenModelOverride?: boolean;
   /** Live background tasks (footer indicator). */
   tasks?: BackgroundTask[];
+  /** Set when this window is a Goal's coordinator; null/absent otherwise. */
+  goal?: GoalStateInfo | null;
+  /** Questions still waiting on the user (validate with `parseOpenAskPrompts`). */
+  openAskPrompts?: unknown;
+  /** Cold-prompt-cache status (sidecar /state + `cache_expiry` event). Null when
+   *  the route has no known cache TTL or the chat is empty; absent on older sidecars. */
+  cacheExpiry?: CacheExpiryStatus | null;
+}
+
+/** Mirrors ggcoder `core/cache-expiry.ts` CacheExpiryStatus. */
+export interface CacheExpiryStatus {
+  sessionId?: string;
+  provider: string;
+  ttlMs: number;
+  confidence: "expired" | "may_be_cold";
+  ttlSource: string;
+  lastRequestAt: number | null;
+  expiresAt: number | null;
+  expired: boolean;
+  reason: "idle" | "age_unknown" | "identity_changed" | null;
+  /** Tokens the next request re-reads at full price. */
+  prefixTokens: number;
+  minTokens: number;
+  /** expired AND prefixTokens >= minTokens. */
+  notable: boolean;
+  estimatedExtraCostUsd: number | null;
 }
 
 /** A project task from the ~/.gg-tasks store (the agent's `tasks` tool). */
@@ -211,12 +250,20 @@ export async function listTasks(): Promise<ProjectTask[]> {
 
 /** Run a single task end-to-end in its own fresh session. */
 export async function runTask(id: string): Promise<void> {
-  await invoke("agent_run_tasks", { id, all: false });
+  try {
+    await invoke("agent_run_tasks", { id, all: false });
+  } catch (e) {
+    await logError(`agent_run_tasks failed: ${String(e)}`);
+  }
 }
 
 /** Run every pending task sequentially (a fresh session each), in order. */
 export async function runAllTasks(): Promise<void> {
-  await invoke("agent_run_tasks", { id: null, all: true });
+  try {
+    await invoke("agent_run_tasks", { id: null, all: true });
+  } catch (e) {
+    await logError(`agent_run_tasks failed: ${String(e)}`);
+  }
 }
 
 /** Delete a task by id. Returns the remaining tasks. */
@@ -227,6 +274,120 @@ export async function deleteTask(id: string): Promise<ProjectTask[]> {
   } catch (e) {
     await logError(`agent_delete_task failed: ${String(e)}`);
     return [];
+  }
+}
+
+/** Mirrors ggcoder `core/checklist-store.ts` ChecklistStatus. */
+export type ChecklistStatus = "not-run" | "not-applicable" | "due" | "passed" | "needs-work";
+
+/** One project health-checklist item joined with its recorded result (ChecklistRow). */
+export interface ChecklistEntry {
+  id: string;
+  group: string;
+  title: string;
+  description: string;
+  check: string;
+  skill: string | null;
+  setupCommand: string | null;
+  status: ChecklistStatus;
+  checkedAt: string | null;
+  commit: string | null;
+  uncommittedChanges: boolean;
+  result: "pass" | "issues" | "not-applicable" | null;
+  summary: string | null;
+  findings: string[];
+  /** Findings the owner chose to leave as is; they don't block a pass. */
+  accepted?: string[];
+  evidence: string[];
+  /** Read-only setup observations, not an audit result. */
+  detection?: { summary: string; facts: string[] } | null;
+  /** The instructions Check sends to the agent (built by the sidecar from the item). */
+  runPrompt: string | null;
+  /** The project's commit or working tree changed after this result was recorded. */
+  changedSinceCheck?: boolean;
+}
+
+export interface ChecklistSnapshot {
+  staleAfterDays: number;
+  items: ChecklistEntry[];
+  detectionWarnings?: string[];
+}
+
+function checklistObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function checklistStrings(value: unknown, maxLength: number): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length <= 10 &&
+    value.every((line) => typeof line === "string" && line.length <= maxLength)
+  );
+}
+function checklistEntry(value: unknown): value is ChecklistEntry {
+  if (!checklistObject(value)) return false;
+  const text = (key: string, max: number): boolean =>
+    typeof value[key] === "string" && value[key].length <= max;
+  const nullable = (key: string, max: number): boolean => value[key] === null || text(key, max);
+  const detection = value.detection;
+  return (
+    text("id", 80) &&
+    /^[a-z0-9-]+$/.test(String(value.id)) &&
+    text("group", 100) &&
+    text("title", 200) &&
+    text("description", 2000) &&
+    text("check", 5000) &&
+    nullable("skill", 100) &&
+    nullable("setupCommand", 100) &&
+    nullable("runPrompt", 16000) &&
+    ["not-run", "not-applicable", "due", "passed", "needs-work"].includes(String(value.status)) &&
+    [null, "pass", "issues", "not-applicable"].includes(value.result as string | null) &&
+    (value.checkedAt === null ||
+      (text("checkedAt", 40) && Number.isFinite(Date.parse(String(value.checkedAt))))) &&
+    (value.commit === null ||
+      (text("commit", 64) && /^[0-9a-f]{4,64}$/i.test(String(value.commit)))) &&
+    typeof value.uncommittedChanges === "boolean" &&
+    (value.changedSinceCheck === undefined || typeof value.changedSinceCheck === "boolean") &&
+    nullable("summary", 300) &&
+    checklistStrings(value.findings, 300) &&
+    (value.accepted === undefined || checklistStrings(value.accepted, 300)) &&
+    checklistStrings(value.evidence, 200) &&
+    (detection === undefined ||
+      detection === null ||
+      (checklistObject(detection) &&
+        typeof detection.summary === "string" &&
+        detection.summary.length <= 300 &&
+        checklistStrings(detection.facts, 300)))
+  );
+}
+
+/** Read the project health checklist. `null` when it can't be read. */
+export async function getChecklist(): Promise<ChecklistSnapshot | null> {
+  try {
+    await waitForReady();
+    const res: unknown = await invoke("agent_checklist");
+    if (
+      !checklistObject(res) ||
+      typeof res.staleAfterDays !== "number" ||
+      !Number.isFinite(res.staleAfterDays) ||
+      res.staleAfterDays < 1 ||
+      !Array.isArray(res.items) ||
+      res.items.length === 0 ||
+      res.items.length > 64 ||
+      !res.items.every(checklistEntry) ||
+      new Set(res.items.map((item) => item.id)).size !== res.items.length ||
+      (res.detectionWarnings !== undefined && !checklistStrings(res.detectionWarnings, 300))
+    ) {
+      await logError("agent_checklist returned an invalid snapshot");
+      return null;
+    }
+    return {
+      staleAfterDays: res.staleAfterDays,
+      items: res.items,
+      detectionWarnings: res.detectionWarnings ?? [],
+    };
+  } catch (e) {
+    await logError(`agent_checklist failed: ${String(e)}`);
+    return null;
   }
 }
 
@@ -368,6 +529,24 @@ export async function getProgress(): Promise<ProgressSnapshot> {
   return invoke<ProgressSnapshot>("agent_progress");
 }
 
+/** Non-2xx sidecar errors throw from the proxy; also reject a malformed body. */
+function keepAwakeEnabled(result: { enabled?: unknown; error?: unknown }): boolean {
+  if (typeof result.enabled === "boolean") return result.enabled;
+  throw new Error(typeof result.error === "string" ? result.error : "keep-awake request failed");
+}
+
+/** Whether the app keeps the computer from idle-sleeping while the agent works. */
+export async function getKeepAwake(): Promise<boolean> {
+  await waitForReady();
+  return keepAwakeEnabled(await invoke<{ enabled?: unknown }>("agent_keep_awake_get"));
+}
+
+/** Turn keep-awake on/off. Saved to ~/.gg/settings.json and applied live. */
+export async function setKeepAwake(enabled: boolean): Promise<boolean> {
+  await waitForReady();
+  return keepAwakeEnabled(await invoke<{ enabled?: unknown }>("agent_keep_awake_set", { enabled }));
+}
+
 export type SubscriptionUsageProvider = "anthropic" | "openai" | "moonshot";
 
 export interface SubscriptionUsageWindow {
@@ -485,6 +664,24 @@ export async function openProjectPath(path: string): Promise<void> {
   }
 }
 
+/**
+ * Open an in-memory chat image (a `data:<type>;base64,...` URL from a paste or
+ * attachment) in the default image viewer. It has no file of its own, so the
+ * app writes a copy into its cache folder and opens that.
+ */
+export async function openImageDataUrl(src: string): Promise<void> {
+  const match = /^data:([^;,]+);base64,(.+)$/s.exec(src);
+  if (!match) {
+    await logError("open_image_data skipped: not a base64 data URL");
+    return;
+  }
+  try {
+    await invoke("open_image_data", { mediaType: match[1], data: match[2] });
+  } catch (e) {
+    await logError(`open_image_data failed: ${String(e)}`);
+  }
+}
+
 export interface DroppedPathInfo {
   path: string;
   isDir: boolean;
@@ -537,6 +734,12 @@ export async function readDroppedFileAttachment(path: string): Promise<Attachmen
 export interface PromptMeta {
   kenSent?: boolean;
   enhancements?: PromptSegment[];
+  /** Fired by a `/schedule` timer, not typed — the sidecar uses the short
+   *  unattended ask_user deadline for this run. */
+  scheduled?: boolean;
+  /** Plan feedback from the review box: the sidecar revises the plan back in
+   *  read-only plan mode instead of with full write access. */
+  planRevision?: boolean;
 }
 
 export async function sendPrompt(
@@ -673,11 +876,15 @@ export async function setAutopilot(enabled: boolean): Promise<boolean> {
  * activity bar's "Plan Steps n/total" widget reads). Call this BEFORE sending
  * the "implement it now" prompt. `planPath` comes from the `plan_exit` event.
  */
+/** Accept the pending plan. Rejects when the sidecar refused it (a run still
+ *  finishing, or the plan couldn't be activated) — the caller must NOT send
+ *  the "implement it now" prompt then. */
 export async function acceptPlan(planPath: string | null): Promise<void> {
   try {
     await invoke("agent_accept_plan", { planPath });
   } catch (e) {
     await logError(`agent_accept_plan failed: ${String(e)}`);
+    throw e;
   }
 }
 
@@ -723,7 +930,7 @@ export interface HistoryEntry {
   task?: { title: string };
   /** Error row persisted by the sidecar's broadcastError. `scope` selects the
    *  live headline prefix (ken_error → "Ken: ", autopilot_error → "Autopilot: "). */
-  error?: { scope: string; headline: string; message?: string; guidance?: string };
+  error?: ChatErrorData & { scope: string; headline: string };
   /** Webview-copy info row marker (e.g. the video-capability warning). */
   infoKind?: "video_warning";
   /** Tool-produced images rendered inline (same as live `images` items),
@@ -953,9 +1160,14 @@ export interface RadioState {
   volume: number;
 }
 
-/** Read app-wide radio state (stations, playback, and volume). */
+/**
+ * Read app-wide radio state (stations, playback, and volume). Waits for the
+ * sidecar first: the titlebar button asks on mount, which at launch lands
+ * before the daemon is up and would otherwise fail with "daemon not ready".
+ */
 export async function getRadioState(): Promise<RadioState> {
   try {
+    await waitForReady();
     const res = await invoke<RadioState>("agent_radio_state");
     return {
       stations: res.stations ?? [],
@@ -1006,14 +1218,17 @@ export async function cancelQueued(id: string): Promise<boolean | null> {
   }
 }
 
-/** Stop a background task by id. Returns the sidecar's status message, if any. */
-export async function killTask(id: string): Promise<string | null> {
+/** Outcome of {@link killTask}: the sidecar's status message, or why it failed. */
+export type KillTaskResult = { ok: true; message: string | null } | { ok: false; error: string };
+
+/** Stop a background task by id. */
+export async function killTask(id: string): Promise<KillTaskResult> {
   try {
     const res = await invoke<{ message?: string }>("agent_kill_task", { id });
-    return res.message ?? null;
+    return { ok: true, message: res.message ?? null };
   } catch (e) {
     await logError(`agent_kill_task failed: ${String(e)}`);
-    return null;
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -1046,6 +1261,16 @@ export async function importTranscript(
   } catch (e) {
     await logError(`agent_import_transcript failed: ${String(e)}`);
     return { ok: false, error: String(e) };
+  }
+}
+
+/** Best-effort Anthropic prompt-cache prewarm before the user's next turn.
+ *  Fire-and-forget; the sidecar gates on provider, history size and cache TTL. */
+export async function prewarmCache(): Promise<void> {
+  try {
+    await invoke("agent_prewarm");
+  } catch (e) {
+    await logError(`agent_prewarm failed: ${String(e)}`);
   }
 }
 
@@ -1244,15 +1469,149 @@ export async function createProject(name: string): Promise<string> {
   return res.path;
 }
 
-/** Discover known projects (ggcoder + Claude Code + Codex), most recent first. */
+/**
+ * Discover known projects (ggcoder + Claude Code + Codex), most recent first.
+ * Throws on failure, so a failed load is never mistaken for "no projects".
+ */
 export async function listProjects(): Promise<DiscoveredProject[]> {
   try {
+    await waitForReady();
     const res = await invoke<{ projects: DiscoveredProject[] }>("agent_projects");
     return res.projects ?? [];
   } catch (e) {
     await logError(`agent_projects failed: ${String(e)}`);
-    return [];
+    throw e;
   }
+}
+
+/** The goal a window is coordinating, as reported by the sidecar's /state. */
+export interface GoalStateInfo {
+  id: string;
+  name: string;
+  /** True until the coordinator's automatic first reply has started. */
+  needsKickoff: boolean;
+  /** Briefing until the user starts the goal; active once the work begins. */
+  phase: "briefing" | "active";
+  /** Paused by the user: it doesn't carry on by itself until resumed. */
+  paused?: boolean;
+  /** Started, not paused, and cut off mid-work (the app closed): carry it on. */
+  needsResume?: boolean;
+  /** The user's standing instructions for the goal. */
+  instructions?: string;
+  /** The goal's attached folders and files. */
+  context?: GoalContextItem[];
+  /** The workers' ("critters'") pinned model; null: they follow GG Goals' model. */
+  critterModel?: string | null;
+}
+
+/** One attached context item; kind comes from the filesystem. */
+export interface GoalContextItem {
+  path: string;
+  kind: "folder" | "file";
+}
+
+/** Mirrors ggcoder `app-sidecar/goal-routes.ts` GoalSummary. */
+export interface GoalSummary {
+  id: string;
+  name: string;
+  goal: string;
+  context: GoalContextItem[];
+  /** The goal's folder: the coordinator session's cwd. */
+  path: string;
+  createdAt: string;
+  lastActiveMs: number;
+  lastActiveDisplay: string;
+  /** Newest session to resume; null starts the coordinator fresh. */
+  latestSessionPath: string | null;
+  /**
+   * Where the goal stands: briefing (not started), running (working right
+   * now), paused (by the user), interrupted (cut off mid-work: the app closed
+   * or it was stopped), or idle (started, not working). Absent from an older
+   * sidecar: treat as idle.
+   */
+  status?: "briefing" | "running" | "paused" | "interrupted" | "idle";
+}
+
+/** Every Goal, most recently active first. */
+export async function listGoals(): Promise<GoalSummary[]> {
+  try {
+    const res = await invoke<{ goals: GoalSummary[] }>("agent_goals");
+    return res.goals ?? [];
+  } catch (e) {
+    await logError(`agent_goals failed: ${String(e)}`);
+    throw e;
+  }
+}
+
+/** Create a Goal. Context entries are absolute folder or file paths. */
+export async function createGoal(input: {
+  name: string;
+  goal: string;
+  context: string[];
+  instructions?: string;
+}): Promise<GoalSummary> {
+  const res = await invoke<{ goal: GoalSummary }>("agent_create_goal", {
+    ...input,
+    instructions: input.instructions || null,
+  });
+  return res.goal;
+}
+
+/**
+ * Change this window's goal: its attached folders/files and/or its standing
+ * instructions (an empty string clears them). GG Goals picks the change up
+ * in the goal's next session. Refused while the goal is working.
+ */
+export async function updateGoal(change: {
+  context?: string[];
+  instructions?: string;
+}): Promise<{ context: GoalContextItem[]; instructions: string }> {
+  await waitForReady();
+  return invoke("agent_update_goal", {
+    context: change.context ?? null,
+    instructions: change.instructions ?? null,
+  });
+}
+
+/** Pause this window's goal: it stays put, even across restarts, until resumed. */
+export async function pauseGoal(): Promise<void> {
+  await waitForReady();
+  await invoke("agent_goal_pause");
+}
+
+/**
+ * Carry this window's goal on after a pause, or after the app closed while it
+ * was working. Safe to call any time: returns false when there's nothing to do.
+ */
+export async function resumeGoal(): Promise<boolean> {
+  await waitForReady();
+  const res = await invoke<{ resumed?: boolean }>("agent_goal_resume");
+  return res.resumed === true;
+}
+
+/**
+ * Pin the model this goal's workers run on, or clear it (null) so they follow
+ * GG Goals. Applies to the next worker started. Returns the effective pick.
+ */
+export async function setCritterModel(
+  model: string | null,
+): Promise<{ critterModel: string | null }> {
+  return invoke<{ critterModel: string | null }>("agent_set_critter_model", { model });
+}
+
+/** Delete a Goal: its folder and coordinator sessions. Attached context is untouched. */
+export async function deleteGoal(id: string): Promise<void> {
+  await invoke("agent_delete_goal", { id });
+}
+
+/**
+ * Start the coordinator's automatic first reply for this window's goal. Safe to
+ * call repeatedly: the sidecar starts it at most once per goal.
+ */
+export async function kickoffGoal(): Promise<boolean> {
+  await waitForReady();
+  const res = await invoke<{ started?: boolean }>("agent_goal_kickoff");
+  return res.started === true;
 }
 
 /**
@@ -1288,10 +1647,14 @@ export async function searchFiles(query: string): Promise<FileHit[]> {
   }
 }
 
-/** List the latest sessions for a project, one chat agent, or every chat agent. */
+/**
+ * List the latest sessions for a project, one chat agent, every chat agent
+ * (`"all"`), or GG Motion (`"motion"`). Throws on failure, so a failed load
+ * is never mistaken for "no sessions".
+ */
 export async function listSessions(
   cwd: string,
-  chatAgent?: ChatAgentId | "all",
+  chatAgent?: ChatAgentId | "all" | "motion",
 ): Promise<RecentSession[]> {
   try {
     const res = await invoke<{ sessions: RecentSession[] }>("agent_sessions", {
@@ -1301,7 +1664,7 @@ export async function listSessions(
     return res.sessions ?? [];
   } catch (e) {
     await logError(`agent_sessions failed: ${String(e)}`);
-    return [];
+    throw e;
   }
 }
 
@@ -1366,49 +1729,15 @@ export async function setupWindows(count: number): Promise<void> {
 }
 
 /** Open the dedicated, screen-centered "What's new" window (or refocus it if it's
- *  already open). Only the main window calls this, exactly once per update — see
- *  WhatsNewTrigger. */
-export async function openWhatsNewWindow(): Promise<void> {
+ *  already open). `hype` is the one-time post-update show (the main window's
+ *  WhatsNewModal trigger); `calm` is the home screen's "What's new" button. */
+export async function openWhatsNewWindow(mode: "hype" | "calm"): Promise<void> {
   try {
-    await invoke("open_whatsnew_window");
+    await invoke("open_whatsnew_window", { mode });
   } catch (e) {
     await logError(`open_whatsnew_window failed: ${String(e)}`);
     throw e;
   }
-}
-
-// ── Gaze focus (webcam eye/head tracking → window focus) ───────────
-
-/** Payload of the `gaze-target` event broadcast to every window. `target` is the
- *  window the gaze currently rests on (null off any window); `committed` is the
- *  window that currently holds focus. Each window paints a solid ring when it's
- *  `committed`, a soft highlight when it's the (un-committed) `target`. */
-export interface GazeTargetEvent {
-  target: string | null;
-  committed: string | null;
-}
-
-/** Map a normalized monitor point to a window. With `commit`, commit OS focus to
- *  the hit window. `committed` is the currently-focused window so the broadcast
- *  border persists. Always broadcasts `gaze-target`. Returns the hit label. */
-export async function gazeFocus(
-  nx: number,
-  ny: number,
-  commit: boolean,
-  committed: string | null,
-): Promise<string | null> {
-  try {
-    return await invoke<string | null>("gaze_focus", { nx, ny, commit, committed });
-  } catch (e) {
-    await logError(`gaze_focus failed: ${String(e)}`);
-    return null;
-  }
-}
-
-/** Subscribe THIS window to gaze-target broadcasts. Returns an unlisten fn. */
-export async function onGazeTarget(cb: (e: GazeTargetEvent) => void): Promise<() => void> {
-  const un = await appWindow.listen<GazeTargetEvent>("gaze-target", (e) => cb(e.payload));
-  return un;
 }
 
 // ── macOS menu-bar tray ────────────────────────────────────────────────────
@@ -1554,7 +1883,7 @@ function unwrapLocalState(res: LocalModelsState & { error?: string }): LocalMode
   return { endpoints: res.endpoints ?? [] };
 }
 
-/** Last scan's endpoints + models. Cheap — does not probe. */
+/** Last scan's endpoints + models. Cheap — does not probe. Throws on failure. */
 export async function getLocalModels(): Promise<LocalModelsState> {
   try {
     await waitForReady();
@@ -1562,7 +1891,7 @@ export async function getLocalModels(): Promise<LocalModelsState> {
     return unwrapLocalState(res);
   } catch (e) {
     await logError(`agent_local failed: ${String(e)}`);
-    return { endpoints: [] };
+    throw e;
   }
 }
 
@@ -1662,7 +1991,11 @@ export async function hfPullStatus(): Promise<HfPullState | null> {
 /** Cancel the running pull (no-op when none). Partial bytes are kept by Ollama. */
 export async function hfPullCancel(): Promise<void> {
   await waitForReady();
-  await invoke("agent_hf_pull_cancel");
+  try {
+    await invoke("agent_hf_pull_cancel");
+  } catch (e) {
+    await logError(`agent_hf_pull_cancel failed: ${String(e)}`);
+  }
 }
 
 // ── Telegram serve (remote control via Telegram) ───────────
@@ -1731,6 +2064,8 @@ export interface SteroidsStatus {
   version?: string;
   repos?: number;
   documents?: number;
+  /** Corpus size on disk as the CLI prints it, e.g. "2.0GB". */
+  diskSize?: string;
   path?: string;
   error?: string;
 }
@@ -1738,6 +2073,7 @@ export interface SteroidsStatus {
 /** Probe the `steroids` CLI. Never throws — an unreachable sidecar reads as "not installed". */
 export async function getSteroidsStatus(): Promise<SteroidsStatus> {
   try {
+    await waitForReady();
     return await invoke<SteroidsStatus>("agent_steroids_status");
   } catch (e) {
     await logError(`agent_steroids_status failed: ${String(e)}`);
@@ -1789,7 +2125,7 @@ export interface AddMcpResult {
 
 /** List configured MCP servers with live connection status + tool counts.
  *  `cwd` scopes the project servers to a specific project path (global servers
- *  always show); omit for the window's current project. */
+ *  always show); omit for the window's current project. Throws on failure. */
 export async function listMcpServers(cwd?: string): Promise<McpServerRow[]> {
   try {
     await waitForReady();
@@ -1799,7 +2135,7 @@ export async function listMcpServers(cwd?: string): Promise<McpServerRow[]> {
     return res.servers ?? [];
   } catch (e) {
     await logError(`agent_mcp_list failed: ${String(e)}`);
-    return [];
+    throw e;
   }
 }
 
@@ -1873,39 +2209,69 @@ export function subscribe(onEvent: (e: SidecarEvent) => void): () => void {
   return () => localSubscribers.delete(onEvent);
 }
 
-/** Wait until the sidecar reports a port (proves the agent is up). */
+/**
+ * Backstop for `waitForReady`. The Rust shell already ends a failed start with
+ * its real reason (via `sidecar_port` / `sidecar-error`) and waits up to 180s
+ * for a daemon that is slow to come up — first launch after an install or
+ * update can sit in macOS's Gatekeeper/XProtect scan for well over 30s.
+ */
+const READY_BACKSTOP_MS = 200_000;
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Wait until this window's agent session exists. Rejects with the concrete
+ * reason as soon as the shell reports the start failed (spawn failure, crash
+ * loop, session creation error) instead of a generic timeout.
+ */
 export async function waitForReady(): Promise<void> {
-  const immediate = await invoke<number | null>("sidecar_port").catch(() => null);
+  const immediate = await invoke<number | null>("sidecar_port").catch((error: unknown) => {
+    throw new Error(errorText(error));
+  });
   if (typeof immediate === "number") return;
   await new Promise<void>((resolve, reject) => {
     let settled = false;
-    let unlisten: (() => void) | undefined;
-    const timeout = setTimeout(() => {
-      if (!settled) {
-        clearInterval(poll);
-        unlisten?.();
-        reject(new Error("sidecar did not start in time"));
-      }
-    }, 30000);
-    const finish = (): void => {
+    const unlisteners: Array<() => void> = [];
+    const settle = (error?: string): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
       clearInterval(poll);
-      unlisten?.();
-      resolve();
+      for (const unlisten of unlisteners) unlisten();
+      if (error === undefined) resolve();
+      else reject(new Error(error));
     };
-    appWindow
-      .listen<number>("sidecar-ready", finish)
-      .then((u) => {
-        if (settled) u();
-        else unlisten = u;
-      })
-      .catch(() => {});
+    const timeout = setTimeout(
+      () => settle("The agent is taking too long to start."),
+      READY_BACKSTOP_MS,
+    );
+    const track = (pending: Promise<() => void>): void => {
+      pending
+        .then((unlisten) => {
+          if (settled) unlisten();
+          else unlisteners.push(unlisten);
+        })
+        .catch(() => {});
+    };
+    track(appWindow.listen<number>("sidecar-ready", () => settle()));
+    track(appWindow.listen<string>("sidecar-error", (event) => settle(String(event.payload))));
     const poll = setInterval(() => {
-      void invoke<number | null>("sidecar_port").then((p) => {
-        if (typeof p === "number") finish();
-      });
+      void invoke<number | null>("sidecar_port").then(
+        (port) => {
+          if (typeof port === "number") settle();
+        },
+        (error: unknown) => settle(errorText(error)),
+      );
     }, 500);
   });
+}
+
+/**
+ * Restart this window's failed agent start. If the shared daemon itself gave
+ * up, the shell respawns it with a fresh retry budget. Pair with re-hydrating.
+ */
+export async function retryWindowSession(): Promise<void> {
+  await invoke("retry_window_session");
 }

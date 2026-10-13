@@ -1,9 +1,28 @@
 // Core entry point
 export { stream, localWireModelId } from "./stream.js";
 
+// Embeddings + reranking (resolved through the same provider registry)
+export { embed, rerank } from "./embed.js";
+export type {
+  EmbedInputType,
+  EmbedOptions,
+  EmbedResult,
+  EmbedUsage,
+  RerankOptions,
+  RerankResponse,
+  RerankResult,
+  RerankUsage,
+  ProviderEmbedFn,
+  ProviderEmbedRequest,
+  ProviderEmbedResponse,
+  ProviderRerankFn,
+  ProviderRerankRequest,
+  ProviderRerankResponse,
+} from "./embed-types.js";
+
 // Provider registry
 export { providerRegistry } from "./provider-registry.js";
-export type { ProviderStreamFn, ProviderEntry } from "./provider-registry.js";
+export type { ProviderStreamFn, ProviderEntry, ProviderCapability } from "./provider-registry.js";
 
 // Types
 export type {
@@ -46,6 +65,9 @@ export type {
   StreamResponse,
   Usage,
   StreamOptions,
+  PreparedContext,
+  ProviderOptions,
+  OpenRouterProviderPreferences,
 } from "./types.js";
 
 // Classes
@@ -59,6 +81,8 @@ export {
   isHardBillingMessage,
 } from "./errors.js";
 export type { ErrorSource, FormattedError } from "./errors.js";
+export { formatChatError } from "./chat-error.js";
+export type { ChatErrorReason, FormattedChatError } from "./chat-error.js";
 export { classifyProviderError } from "./error-classification.js";
 export { REDACTION_MARKER, environmentSecrets, redactText, redactValue } from "./redaction.js";
 export type { RedactionOptions } from "./redaction.js";
@@ -83,9 +107,18 @@ export { resolveToolSchema } from "./utils/zod-to-json-schema.js";
 // Provider request transforms (exposed for request-building + verification)
 export {
   clampProviderContextImages,
+  dropInvalidToolCalls,
+  isValidToolCallName,
+  toolCallNameRuleFor,
+  TOOL_CALL_NAME_RULES,
   toAnthropicMessages,
   toOpenAIMessages,
 } from "./providers/transform.js";
+export type { ToolCallNameRule } from "./providers/transform.js";
+export { continuesTurn, opensTurn } from "./utils/turn-continuation.js";
+
+// Codex model family served with the Responses-Lite request shape
+export { usesResponsesLite } from "./providers/openai-codex.js";
 
 // Cache pre-warming (Anthropic — fires a max_tokens:1 warm-up to prime the KV cache)
 export { prewarmAnthropicCache } from "./providers/anthropic.js";
@@ -97,6 +130,8 @@ export {
   palsuThinking,
   palsuToolCall,
   palsuAssistantMessage,
+  palsuEmbedding,
+  palsuRerankScore,
 } from "./providers/palsu.js";
 export type {
   PalsuProviderHandle,
